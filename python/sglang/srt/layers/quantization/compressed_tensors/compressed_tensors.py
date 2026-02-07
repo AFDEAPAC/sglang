@@ -49,6 +49,7 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsW8A16Fp8,
     CompressedTensorsWNA16,
     CompressedTensorsWNA16MoE,
+    CompressedTensorsWNA16AiterMoE,
     CompressedTensorsWNA16TritonMoE,
     NPUCompressedTensorsW4A8Int8DynamicMoE,
     NPUCompressedTensorsW4A16Int4DynamicMoE,
@@ -65,11 +66,12 @@ from sglang.srt.layers.quantization.unquant import (
     UnquantizedFusedMoEMethod,
     UnquantizedLinearMethod,
 )
-from sglang.srt.utils import is_cuda, is_hip, is_npu
+from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip, is_npu
 
 _is_cuda = is_cuda()
 _is_npu = is_npu()
 _is_hip = is_hip()
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -679,7 +681,27 @@ class CompressedTensorsConfig(QuantizationConfig):
                     )
                     return CompressedTensorsMxInt4MoE(self)
                 elif _is_hip:
-                    logger.info_once("Using CompressedTensorsWNA16TritonMoE (ROCm)")
+                    _w4a16_config = self.target_scheme_map["Linear"].get(
+                        "weights"
+                    )
+                    _is_w4a16 = _w4a16_config and _w4a16_config.num_bits == 4
+                    _group_size = (
+                        _w4a16_config.group_size if _w4a16_config else -1
+                    )
+                    _is_flydsl_compatible = _group_size in (-1, 0, 32)
+                    if _use_aiter and _is_w4a16 and _is_flydsl_compatible:
+                        try:
+                            logger.info_once(
+                                "Using CompressedTensorsWNA16AiterMoE (ROCm + FlyDSL)"
+                            )
+                            return CompressedTensorsWNA16AiterMoE(self)
+                        except ValueError as e:
+                            logger.warning(
+                                f"FlyDSL W4A16 not available: {e}, falling back to Triton"
+                            )
+                    logger.info_once(
+                        "Using CompressedTensorsWNA16TritonMoE (ROCm)"
+                    )
                     return CompressedTensorsWNA16TritonMoE(self)
                 else:
                     logger.info_once("Using CompressedTensorsWNA16MarlinMoEMethod")

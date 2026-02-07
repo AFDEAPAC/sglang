@@ -34,6 +34,7 @@ if TYPE_CHECKING:
 __all__ = [
     "CompressedTensorsWNA16MoE",
     "CompressedTensorsWNA16TritonMoE",
+    "CompressedTensorsWNA16AiterMoE",
     "NPUCompressedTensorsW4A16Int4DynamicMoE",
 ]
 
@@ -468,6 +469,200 @@ class CompressedTensorsWNA16TritonMoE(CompressedTensorsWNA16MoE):
             block_shape=[0, self.group_size],
         )
         return self.runner.run(dispatch_output, quant_info)
+
+
+class CompressedTensorsWNA16AiterMoE(CompressedTensorsWNA16MoE):
+    """ROCm/HIP W4A16 MoE method using aiter/FlyDSL kernels.
+
+    Requirements:
+    - Only supports W4A16 (4-bit weights, bf16 activations)
+    - Supports per-row scale (group_size == -1) or group_size == 32
+    - Only supports SiLU activation
+    """
+
+    def __init__(self, quant_config, num_gpu_experts=-1):
+        super().__init__(quant_config, num_gpu_experts)
+        if self.group_size not in (-1, 0, 32):
+            raise ValueError(
+                f"FlyDSL W4A16 only supports per-row scale or group_size=32, "
+                f"got group_size={self.group_size}"
+            )
+        if self.num_bits != 4:
+            raise ValueError(
+                f"FlyDSL aiter path only supports W4A16 (4-bit weights), "
+                f"got num_bits={self.num_bits}"
+            )
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if getattr(layer, "is_aiter_converted", False):
+            return
+
+        import os
+        import sys as _sys
+
+        DSL2_ROOT = os.environ.get("DSL2_ROOT", "/opt/FlyDSL")
+        if DSL2_ROOT not in _sys.path:
+            _sys.path.insert(0, DSL2_ROOT)
+        from tests.utils import shuffle_weight as flydsl_shuffle
+        from tests.kernels.test_moe_gemm import (
+            _pack_shuffled_int8_to_packed_int4_no_perm,
+        )
+
+        _hybrid = os.environ.get("FLYDSL_W4A16_HYBRID", "").strip().lower()
+
+        def _unpack_gptq_int32_to_signed_int4(w_int32):
+            E = w_int32.shape[0]
+            w = w_int32.transpose(1, 2).contiguous()
+            N = w.shape[1]
+            K_div8 = w.shape[2]
+            K = K_div8 * 8
+            w_expanded = w.unsqueeze(-1).expand(E, N, K_div8, 8)
+            shifts = torch.arange(8, device=w.device) * 4
+            nibbles = ((w_expanded >> shifts) & 0xF).to(torch.int8)
+            nibbles = nibbles.reshape(E, N, K)
+            signed = nibbles.to(torch.int16) - 8
+            signed = signed.to(torch.int8)
+            return signed
+
+        def _gptq_int32_to_flydsl_packed(w_int32):
+            signed = _unpack_gptq_int32_to_signed_int4(w_int32)
+            E, N, K = signed.shape
+            shuffled = flydsl_shuffle(signed, layout=(16, 16))
+            packed = _pack_shuffled_int8_to_packed_int4_no_perm(shuffled)
+            return packed.view(E, N, K // 2)
+
+        def _gptq_int32_to_flydsl_bf16(w_int32, scale, group_size):
+            signed = _unpack_gptq_int32_to_signed_int4(w_int32)
+            E, N, K = signed.shape
+            w_bf16 = signed.to(torch.bfloat16)
+            del signed
+            if scale.dim() == 3 and scale.shape[1] > 1:
+                num_groups = scale.shape[1]
+                scale_expanded = scale.transpose(1, 2)
+                scale_expanded = scale_expanded.unsqueeze(-1).expand(
+                    E, N, num_groups, group_size
+                )
+                scale_expanded = scale_expanded.reshape(E, N, K).to(torch.bfloat16)
+                w_bf16 = w_bf16 * scale_expanded
+                del scale_expanded
+            else:
+                if scale.dim() == 3:
+                    s = scale.squeeze(1)
+                else:
+                    s = scale
+                w_bf16 = w_bf16 * s.unsqueeze(-1).to(torch.bfloat16)
+            shuffled = flydsl_shuffle(w_bf16, layout=(16, 16))
+            del w_bf16
+            return shuffled
+
+        def _convert_packed(layer_weight):
+            w = layer_weight.data
+            return torch.nn.Parameter(
+                _gptq_int32_to_flydsl_packed(w), requires_grad=False
+            )
+
+        def _convert_scale(scale_param):
+            s = scale_param.data
+            if self.group_size > 0 and s.dim() == 3 and s.shape[1] > 1:
+                s = s.contiguous()
+            elif s.dim() == 3 and s.shape[1] == 1:
+                s = s.squeeze(1)
+            return torch.nn.Parameter(s.contiguous(), requires_grad=False)
+
+        if _hybrid in ("w2_bf16", "w13_bf16"):
+            logger.info(
+                f"[FlyDSL] Hybrid mode enabled: FLYDSL_W4A16_HYBRID={_hybrid}"
+            )
+            if _hybrid == "w2_bf16":
+                layer.w13_weight_packed = _convert_packed(layer.w13_weight_packed)
+                layer.w13_weight_scale = _convert_scale(layer.w13_weight_scale)
+                w2_int32 = layer.w2_weight_packed.data
+                w2_scale = layer.w2_weight_scale.data
+                del layer.w2_weight_packed
+                torch.cuda.empty_cache()
+                w2_bf16 = _gptq_int32_to_flydsl_bf16(
+                    w2_int32, w2_scale, self.group_size
+                )
+                del w2_int32
+                layer.w2_weight_packed = torch.nn.Parameter(
+                    w2_bf16, requires_grad=False
+                )
+                del w2_bf16
+            else:
+                w13_int32 = layer.w13_weight_packed.data
+                w13_scale = layer.w13_weight_scale.data
+                del layer.w13_weight_packed
+                torch.cuda.empty_cache()
+                w13_bf16 = _gptq_int32_to_flydsl_bf16(
+                    w13_int32, w13_scale, self.group_size
+                )
+                del w13_int32
+                layer.w13_weight_packed = torch.nn.Parameter(
+                    w13_bf16, requires_grad=False
+                )
+                del w13_bf16
+                layer.w2_weight_packed = _convert_packed(layer.w2_weight_packed)
+                layer.w2_weight_scale = _convert_scale(layer.w2_weight_scale)
+
+            layer.w13_weight_packed.is_shuffled = True
+            layer.w2_weight_packed.is_shuffled = True
+            layer.is_aiter_converted = True
+            layer.is_hybrid = _hybrid
+        else:
+            layer.w13_weight_packed = _convert_packed(layer.w13_weight_packed)
+            layer.w2_weight_packed = _convert_packed(layer.w2_weight_packed)
+            layer.w13_weight_scale = _convert_scale(layer.w13_weight_scale)
+            layer.w2_weight_scale = _convert_scale(layer.w2_weight_scale)
+            layer.w13_weight_packed.is_shuffled = True
+            layer.w2_weight_packed.is_shuffled = True
+            layer.is_aiter_converted = True
+
+    def create_moe_runner(
+        self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
+    ):
+        self.moe_runner_config = moe_runner_config
+
+    def apply_weights(
+        self,
+        layer: torch.nn.Module,
+        dispatch_output: "StandardDispatchOutput",
+    ) -> "CombineInput":
+        from aiter import ActivationType, QuantType
+        from aiter.fused_moe import fused_moe
+        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+
+        assert (
+            self.moe_runner_config.activation == "silu"
+        ), "FlyDSL W4A16 only supports SiLU"
+
+        x = dispatch_output.hidden_states
+        topk_weights, topk_ids, _ = dispatch_output.topk_output
+        _hybrid = getattr(layer, "is_hybrid", None)
+
+        if _hybrid == "w13_bf16":
+            w1_scale = None
+            w2_scale = layer.w2_weight_scale
+        elif _hybrid == "w2_bf16":
+            w1_scale = layer.w13_weight_scale
+            w2_scale = None
+        else:
+            w1_scale = layer.w13_weight_scale
+            w2_scale = layer.w2_weight_scale
+
+        output = fused_moe(
+            x,
+            layer.w13_weight_packed,
+            layer.w2_weight_packed,
+            topk_weights,
+            topk_ids,
+            quant_type=QuantType.No,
+            w1_scale=w1_scale,
+            w2_scale=w2_scale,
+            a1_scale=None,
+            a2_scale=None,
+            activation=ActivationType.Silu,
+        )
+        return StandardCombineInput(hidden_states=output)
 
 
 class NPUCompressedTensorsW4A16Int4DynamicMoE(CompressedTensorsMoEScheme):
