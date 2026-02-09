@@ -1547,12 +1547,12 @@ class CompressedTensorsWNA16AiterMoEMethod(CompressedTensorsWNA16MoEMethod):
 
         # Convert scales for FlyDSL:
         #   per-row:   [E, 1, N] -> squeeze -> [E, N]
-        #   groupwise: [E, K//gs, N] -> transpose -> [E, N, K//gs]
+        #   groupwise: [E, K//gs, N] -> keep as-is (Opt 0: cache-friendly layout)
         w13_scale = layer.w13_weight_scale.data
         if self.group_size > 0 and w13_scale.dim() == 3 and w13_scale.shape[1] > 1:
-            # Groupwise: transpose [E, K//gs, N] -> [E, N, K//gs]
-            w13_scale = w13_scale.transpose(1, 2).contiguous()
-            logger.debug(f"[FlyDSL] w13_scale groupwise: {w13_scale.shape} (group_size={self.group_size})")
+            # Groupwise: keep [E, K//gs, N] layout (Opt 0: stride-1 access for adjacent threads)
+            w13_scale = w13_scale.contiguous()
+            logger.debug(f"[FlyDSL] w13_scale groupwise [E,K//gs,N]: {w13_scale.shape} (group_size={self.group_size})")
         elif w13_scale.dim() == 3 and w13_scale.shape[1] == 1:
             # Per-row: squeeze [E, 1, N] -> [E, N]
             w13_scale = w13_scale.squeeze(1)
@@ -1560,9 +1560,9 @@ class CompressedTensorsWNA16AiterMoEMethod(CompressedTensorsWNA16MoEMethod):
 
         w2_scale = layer.w2_weight_scale.data
         if self.group_size > 0 and w2_scale.dim() == 3 and w2_scale.shape[1] > 1:
-            # Groupwise: transpose [E, K//gs, N] -> [E, N, K//gs]
-            w2_scale = w2_scale.transpose(1, 2).contiguous()
-            logger.debug(f"[FlyDSL] w2_scale groupwise: {w2_scale.shape} (group_size={self.group_size})")
+            # Groupwise: keep [E, K//gs, N] layout (Opt 0: stride-1 access for adjacent threads)
+            w2_scale = w2_scale.contiguous()
+            logger.debug(f"[FlyDSL] w2_scale groupwise [E,K//gs,N]: {w2_scale.shape} (group_size={self.group_size})")
         elif w2_scale.dim() == 3 and w2_scale.shape[1] == 1:
             # Per-row: squeeze [E, 1, N] -> [E, N]
             w2_scale = w2_scale.squeeze(1)
