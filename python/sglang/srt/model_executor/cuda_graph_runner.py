@@ -362,8 +362,21 @@ class CudaGraphRunner:
 
         # Capture
         try:
+            orig_enable_torch_compile = False
+            if self.enable_torch_compile:
+                orig_enable_torch_compile = True
+                self.enable_torch_compile = False
+                orig_compile_bs = self.compile_bs
+                self.compile_bs = []
+
             with model_capture_mode():
                 self.capture()
+
+            self.enable_torch_compile = orig_enable_torch_compile
+            if orig_enable_torch_compile:
+                self.compile_bs = orig_compile_bs
+                set_torch_compile_config()
+
         except RuntimeError as e:
             raise Exception(
                 f"Capture cuda graph failed: {e}\n{CUDA_GRAPH_CAPTURE_FAILED_MSG}"
@@ -677,6 +690,18 @@ class CudaGraphRunner:
             lora_ids=lora_ids,
         )
         self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
+
+        if self.enable_torch_compile and (bs in self.compile_bs):
+            if not hasattr(self, "_compiled_forward"):
+                compiled_forward = torch.compile(forward)
+                for _ in range(2):
+                    compiled_forward(
+                        input_ids,
+                        forward_batch.positions,
+                        forward_batch,
+                    )
+                self._compiled_forward = compiled_forward
+            forward = self._compiled_forward
 
         if lora_ids is not None:
             self.model_runner.lora_manager.prepare_lora_batch(forward_batch)
