@@ -700,6 +700,7 @@ class ServerArgs:
         """
         Orchestrates the handling of various server arguments, ensuring proper configuration and validation.
         """
+        self._user_mem_fraction_static = self.mem_fraction_static
 
         # Normalize load balancing defaults early (before dummy-model short-circuit).
         self._handle_load_balance_method()
@@ -1884,7 +1885,7 @@ class ServerArgs:
         # AMD platforms backends
         if self.attention_backend == "aiter":
             if model_config.context_len > 8192:
-                self.mem_fraction_static *= 0.85
+                if self._user_mem_fraction_static is None: self.mem_fraction_static *= 0.85
 
         # Other platforms backends
         if (

@@ -150,8 +150,6 @@ class CompressedTensorsMoEMethod(FusedMoEMethodBase):
                     _is_w4a16 = _w4a16_config and _w4a16_config.num_bits == 4
                     _group_size = _w4a16_config.group_size if _w4a16_config else -1
                     _is_flydsl_compatible = _group_size in (-1, 0, 32)
-                    
-                    logger.info(f"[DEBUG] W4A16 check: _use_aiter={_use_aiter}, _is_w4a16={_is_w4a16}, group_size={_group_size}, _is_flydsl_compatible={_is_flydsl_compatible}")
                     if _use_aiter and _is_w4a16 and _is_flydsl_compatible:
                         try:
                             logger.info_once(
@@ -1500,14 +1498,15 @@ class CompressedTensorsWNA16AiterMoEMethod(CompressedTensorsWNA16MoEMethod):
         from tests.utils import shuffle_weight as flydsl_shuffle
         from tests.kernels.test_moe_gemm import _pack_shuffled_int8_to_packed_int4_no_perm
 
-        def _gptq_int32_to_flydsl_packed(w_int32):
-            """Convert GPTQ int32 [E, K//8, N] to FlyDSL shuffled packed int4 [E, N, K//2].
+        # Hybrid mode: one stage W4A16, the other bf16 dequanted
+        #   "w2_bf16"  -> w13 stays W4A16, w2 dequanted to bf16 (smaller memory increase)
+        #   "w13_bf16" -> w13 dequanted to bf16, w2 stays W4A16
+        _hybrid = os.environ.get("FLYDSL_W4A16_HYBRID", "").strip().lower()
 
-            Steps:
-            1. Unpack int32 to individual unsigned int4 values (as int8)
-            2. Convert unsigned [0,15] to signed [-8,7] by subtracting 8
-            3. Apply FlyDSL preshuffle (on individual int8 values)
-            4. Pack with FlyDSL's interleaved int4 packing
+        def _unpack_gptq_int32_to_signed_int4(w_int32):
+            """Unpack GPTQ int32 [E, K//8, N] to signed int4 values [E, N, K] (as int8).
+
+            Shared by both the packed-int4 and bf16-dequant paths.
             """
             E = w_int32.shape[0]
             # [E, K//8, N] -> transpose -> [E, N, K//8]
@@ -1525,6 +1524,18 @@ class CompressedTensorsWNA16AiterMoEMethod(CompressedTensorsWNA16MoEMethod):
             # Convert unsigned [0,15] to signed [-8,7]
             signed = nibbles.to(torch.int16) - 8
             signed = signed.to(torch.int8)  # [E, N, K] signed int4 as int8
+            return signed
+
+        def _gptq_int32_to_flydsl_packed(w_int32):
+            """Convert GPTQ int32 [E, K//8, N] to FlyDSL shuffled packed int4 [E, N, K//2].
+
+            Steps:
+            1. Unpack int32 to individual signed int4 values (as int8)
+            2. Apply FlyDSL preshuffle (on individual int8 values)
+            3. Pack with FlyDSL's interleaved int4 packing
+            """
+            signed = _unpack_gptq_int32_to_signed_int4(w_int32)
+            E, N, K = signed.shape
 
             # FlyDSL preshuffle (operates on individual values)
             shuffled = flydsl_shuffle(signed, layout=(16, 16))
@@ -1533,44 +1544,137 @@ class CompressedTensorsWNA16AiterMoEMethod(CompressedTensorsWNA16MoEMethod):
             packed = _pack_shuffled_int8_to_packed_int4_no_perm(shuffled)
             return packed.view(E, N, K // 2)
 
-        # Convert w13 weights
-        w13 = layer.w13_weight_packed.data
-        w13 = _gptq_int32_to_flydsl_packed(w13)
-        layer.w13_weight_packed = torch.nn.Parameter(w13, requires_grad=False)
-        logger.debug(f"[FlyDSL] w13 converted: {w13.shape} {w13.dtype}")
+        def _gptq_int32_to_flydsl_bf16(w_int32, scale, group_size):
+            """Convert GPTQ int32 [E, K//8, N] + groupwise scale to FlyDSL shuffled bf16 [E, N, K].
 
-        # Convert w2 weights
-        w2 = layer.w2_weight_packed.data
-        w2 = _gptq_int32_to_flydsl_packed(w2)
-        layer.w2_weight_packed = torch.nn.Parameter(w2, requires_grad=False)
-        logger.debug(f"[FlyDSL] w2 converted: {w2.shape} {w2.dtype}")
+            Steps (on GPU for speed):
+            1. Unpack int32 to individual signed int4 values (as int8)
+            2. Dequant: bf16_val = signed_int4 * scale_group (lossless for int4 range)
+            3. Apply FlyDSL preshuffle (on bf16 values)
+            """
+            device = w_int32.device
 
-        # Convert scales for FlyDSL:
-        #   per-row:   [E, 1, N] -> squeeze -> [E, N]
-        #   groupwise: [E, K//gs, N] -> keep as-is (Opt 0: cache-friendly layout)
-        w13_scale = layer.w13_weight_scale.data
-        if self.group_size > 0 and w13_scale.dim() == 3 and w13_scale.shape[1] > 1:
-            # Groupwise: keep [E, K//gs, N] layout (Opt 0: stride-1 access for adjacent threads)
-            w13_scale = w13_scale.contiguous()
-            logger.debug(f"[FlyDSL] w13_scale groupwise [E,K//gs,N]: {w13_scale.shape} (group_size={self.group_size})")
-        elif w13_scale.dim() == 3 and w13_scale.shape[1] == 1:
-            # Per-row: squeeze [E, 1, N] -> [E, N]
-            w13_scale = w13_scale.squeeze(1)
-        layer.w13_weight_scale = torch.nn.Parameter(w13_scale.contiguous(), requires_grad=False)
+            signed = _unpack_gptq_int32_to_signed_int4(w_int32)  # [E, N, K] as int8
+            E, N, K = signed.shape
 
-        w2_scale = layer.w2_weight_scale.data
-        if self.group_size > 0 and w2_scale.dim() == 3 and w2_scale.shape[1] > 1:
-            # Groupwise: keep [E, K//gs, N] layout (Opt 0: stride-1 access for adjacent threads)
-            w2_scale = w2_scale.contiguous()
-            logger.debug(f"[FlyDSL] w2_scale groupwise [E,K//gs,N]: {w2_scale.shape} (group_size={self.group_size})")
-        elif w2_scale.dim() == 3 and w2_scale.shape[1] == 1:
-            # Per-row: squeeze [E, 1, N] -> [E, N]
-            w2_scale = w2_scale.squeeze(1)
-        layer.w2_weight_scale = torch.nn.Parameter(w2_scale.contiguous(), requires_grad=False)
+            # Dequant: apply groupwise or per-row scale
+            # scale shape: [E, K//gs, N] (groupwise) or [E, 1, N] / [E, N] (per-row)
+            w_bf16 = signed.to(torch.bfloat16)
+            del signed  # free int8 copy
+            if scale.dim() == 3 and scale.shape[1] > 1:
+                # Groupwise scale: [E, K//gs, N] -> expand to [E, N, K]
+                num_groups = scale.shape[1]
+                scale_expanded = scale.transpose(1, 2)  # [E, N, num_groups]
+                scale_expanded = scale_expanded.unsqueeze(-1).expand(E, N, num_groups, group_size)
+                scale_expanded = scale_expanded.reshape(E, N, K).to(torch.bfloat16)
+                w_bf16 = w_bf16 * scale_expanded
+                del scale_expanded
+            else:
+                # Per-row scale: [E, 1, N] or [E, N]
+                if scale.dim() == 3:
+                    s = scale.squeeze(1)  # [E, N]
+                else:
+                    s = scale  # [E, N]
+                w_bf16 = w_bf16 * s.unsqueeze(-1).to(torch.bfloat16)  # [E, N, 1] broadcast
 
-        layer.w13_weight_packed.is_shuffled = True
-        layer.w2_weight_packed.is_shuffled = True
-        layer.is_aiter_converted = True
+            # FlyDSL preshuffle (operates on bf16 values)
+            shuffled = flydsl_shuffle(w_bf16, layout=(16, 16))
+            del w_bf16
+            return shuffled
+
+        if _hybrid in ("w2_bf16", "w13_bf16"):
+            # --- Hybrid W4A16/bf16 path ---
+            logger.info(f"[FlyDSL] Hybrid mode enabled: FLYDSL_W4A16_HYBRID={_hybrid}")
+
+            if _hybrid == "w2_bf16":
+                # w13 -> W4A16 packed int4 (same as default path)
+                w13 = layer.w13_weight_packed.data
+                w13 = _gptq_int32_to_flydsl_packed(w13)
+                layer.w13_weight_packed = torch.nn.Parameter(w13, requires_grad=False)
+
+                # w13 scales: keep groupwise (same as default path)
+                w13_scale = layer.w13_weight_scale.data
+                if self.group_size > 0 and w13_scale.dim() == 3 and w13_scale.shape[1] > 1:
+                    w13_scale = w13_scale.contiguous()
+                elif w13_scale.dim() == 3 and w13_scale.shape[1] == 1:
+                    w13_scale = w13_scale.squeeze(1)
+                layer.w13_weight_scale = torch.nn.Parameter(w13_scale.contiguous(), requires_grad=False)
+
+                # w2 -> bf16 dequant (scales baked in)
+                w2_int32 = layer.w2_weight_packed.data
+                w2_scale = layer.w2_weight_scale.data
+                del layer.w2_weight_packed
+                torch.cuda.empty_cache()
+                w2_bf16 = _gptq_int32_to_flydsl_bf16(w2_int32, w2_scale, self.group_size)
+                del w2_int32
+                layer.w2_weight_packed = torch.nn.Parameter(w2_bf16, requires_grad=False)
+                del w2_bf16
+
+            else:  # w13_bf16
+                # w13 -> bf16 dequant (scales baked in)
+                w13_int32 = layer.w13_weight_packed.data
+                w13_scale = layer.w13_weight_scale.data
+                del layer.w13_weight_packed
+                torch.cuda.empty_cache()
+                w13_bf16 = _gptq_int32_to_flydsl_bf16(w13_int32, w13_scale, self.group_size)
+                del w13_int32
+                layer.w13_weight_packed = torch.nn.Parameter(w13_bf16, requires_grad=False)
+                del w13_bf16
+
+                # w2 -> W4A16 packed int4 (same as default path)
+                w2 = layer.w2_weight_packed.data
+                w2 = _gptq_int32_to_flydsl_packed(w2)
+                layer.w2_weight_packed = torch.nn.Parameter(w2, requires_grad=False)
+
+                # w2 scales: keep groupwise (same as default path)
+                w2_scale = layer.w2_weight_scale.data
+                if self.group_size > 0 and w2_scale.dim() == 3 and w2_scale.shape[1] > 1:
+                    w2_scale = w2_scale.contiguous()
+                elif w2_scale.dim() == 3 and w2_scale.shape[1] == 1:
+                    w2_scale = w2_scale.squeeze(1)
+                layer.w2_weight_scale = torch.nn.Parameter(w2_scale.contiguous(), requires_grad=False)
+
+            layer.w13_weight_packed.is_shuffled = True
+            layer.w2_weight_packed.is_shuffled = True
+            layer.is_aiter_converted = True
+            layer.is_hybrid = _hybrid
+
+        else:
+            # --- Original W4A16 packed int4 path ---
+            # Convert w13 weights
+            w13 = layer.w13_weight_packed.data
+            w13 = _gptq_int32_to_flydsl_packed(w13)
+            layer.w13_weight_packed = torch.nn.Parameter(w13, requires_grad=False)
+
+            # Convert w2 weights
+            w2 = layer.w2_weight_packed.data
+            w2 = _gptq_int32_to_flydsl_packed(w2)
+            layer.w2_weight_packed = torch.nn.Parameter(w2, requires_grad=False)
+
+            # Convert scales for FlyDSL:
+            #   per-row:   [E, 1, N] -> squeeze -> [E, N]
+            #   groupwise: [E, K//gs, N] -> keep as-is (Opt 0: cache-friendly layout)
+            w13_scale = layer.w13_weight_scale.data
+            if self.group_size > 0 and w13_scale.dim() == 3 and w13_scale.shape[1] > 1:
+                # Groupwise: keep [E, K//gs, N] layout (Opt 0: stride-1 access for adjacent threads)
+                w13_scale = w13_scale.contiguous()
+            elif w13_scale.dim() == 3 and w13_scale.shape[1] == 1:
+                # Per-row: squeeze [E, 1, N] -> [E, N]
+                w13_scale = w13_scale.squeeze(1)
+            layer.w13_weight_scale = torch.nn.Parameter(w13_scale.contiguous(), requires_grad=False)
+
+            w2_scale = layer.w2_weight_scale.data
+            if self.group_size > 0 and w2_scale.dim() == 3 and w2_scale.shape[1] > 1:
+                # Groupwise: keep [E, K//gs, N] layout (Opt 0: stride-1 access for adjacent threads)
+                w2_scale = w2_scale.contiguous()
+            elif w2_scale.dim() == 3 and w2_scale.shape[1] == 1:
+                # Per-row: squeeze [E, 1, N] -> [E, N]
+                w2_scale = w2_scale.squeeze(1)
+            layer.w2_weight_scale = torch.nn.Parameter(w2_scale.contiguous(), requires_grad=False)
+
+            layer.w13_weight_packed.is_shuffled = True
+            layer.w2_weight_packed.is_shuffled = True
+            layer.is_aiter_converted = True
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
@@ -1589,6 +1693,19 @@ class CompressedTensorsWNA16AiterMoEMethod(CompressedTensorsWNA16MoEMethod):
         x = dispatch_output.hidden_states
         topk_weights, topk_ids, _ = dispatch_output.topk_output
 
+        _hybrid = getattr(layer, "is_hybrid", None)
+
+        # Determine per-weight scale: None when scales are baked into bf16 weights
+        if _hybrid == "w13_bf16":
+            w1_scale = None  # w13 is bf16 (scales baked in)
+            w2_scale = layer.w2_weight_scale  # w2 is W4A16
+        elif _hybrid == "w2_bf16":
+            w1_scale = layer.w13_weight_scale  # w13 is W4A16
+            w2_scale = None  # w2 is bf16 (scales baked in)
+        else:
+            w1_scale = layer.w13_weight_scale
+            w2_scale = layer.w2_weight_scale
+
         output = fused_moe(
             x,
             layer.w13_weight_packed,
@@ -1596,8 +1713,8 @@ class CompressedTensorsWNA16AiterMoEMethod(CompressedTensorsWNA16MoEMethod):
             topk_weights,
             topk_ids,
             quant_type=QuantType.No,
-            w1_scale=layer.w13_weight_scale,
-            w2_scale=layer.w2_weight_scale,
+            w1_scale=w1_scale,
+            w2_scale=w2_scale,
             a1_scale=None,
             a2_scale=None,
             activation=ActivationType.Silu,
