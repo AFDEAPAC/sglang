@@ -744,6 +744,7 @@ class ServerArgs:
         """
         Orchestrates the handling of various server arguments, ensuring proper configuration and validation.
         """
+        self._user_mem_fraction_static = self.mem_fraction_static
 
         self._maybe_download_model_for_runai()
 
@@ -2413,7 +2414,7 @@ class ServerArgs:
         # AMD platforms backends
         if self.attention_backend == "aiter":
             if model_config.context_len > 8192:
-                self.mem_fraction_static *= 0.85
+                if self._user_mem_fraction_static is None: self.mem_fraction_static *= 0.85
 
         # Other platforms backends
         if (
