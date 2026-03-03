@@ -799,16 +799,16 @@ class QuarkW4A8Int4Fp8MoEMethod(QuarkMoEMethod):
             not moe_runner_config.no_combine
         ), f"no_combine={moe_runner_config.no_combine} is not supported."
 
-        # Weights are int4-packed-int8 which the aiter kernel treats as W4A16
-        # (bf16 activations, no dynamic activation quantization).
-        # The int4 dequant is handled via w1_scale/w2_scale (combined int4*fp8 scale).
+        # W4A8: int4 weights + fp8 dynamic activation quantization.
+        # QuantType.per_Token triggers fp8 activation quant in fused_moe,
+        # and routes to FlyDSL's "int4_fp8" kernel.
         output = fused_moe(
             dispatch_output.hidden_states,
             layer.w13_weight,
             layer.w2_weight,
             topk_output.topk_weights,
             topk_output.topk_ids,
-            quant_type=QuantType.No,
+            quant_type=QuantType.per_Token,
             w1_scale=layer.w13_int4_scale,
             w2_scale=layer.w2_int4_scale,
             activation=(
