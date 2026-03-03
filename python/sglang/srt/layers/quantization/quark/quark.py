@@ -20,6 +20,7 @@ from sglang.srt.layers.quantization.quark.schemes import (
     QuarkMoEScheme,
     QuarkW4A4MXFP4,
     QuarkW4A4MXFp4MoE,
+    QuarkW4A8Int4Fp8MoE,
     QuarkW8A8Fp8,
     QuarkW8A8FP8MoE,
 )
@@ -376,12 +377,38 @@ class QuarkConfig(QuantizationConfig):
         weight_config = layer_quant_config.get("weight")
         input_config = layer_quant_config.get("input_tensors")
 
+        if isinstance(weight_config, list):
+            has_int4 = any(
+                isinstance(wc, dict) and wc.get("dtype") == "int4"
+                for wc in weight_config
+            )
+            has_fp8 = any(
+                isinstance(wc, dict)
+                and wc.get("dtype")
+                in ("fp8_e4m3", "fp8_e4m3fn", "fp8_e4m3fnuz")
+                for wc in weight_config
+            )
+            if has_int4 and has_fp8:
+                return QuarkW4A8Int4Fp8MoE(weight_config, input_config)
+            for wc in weight_config:
+                if self._is_mx_fp4(wc, input_config):
+                    return QuarkW4A4MXFp4MoE(wc, input_config)
+                elif self._is_fp8_w8a8(wc, input_config):
+                    return QuarkW8A8FP8MoE(wc, input_config)
+            raise RuntimeError(
+                f"Unsupported FusedMoe scheme. "
+                f"Weight config: {weight_config}, Input config: {input_config}"
+            )
+
         if self._is_mx_fp4(weight_config, input_config):
             return QuarkW4A4MXFp4MoE(weight_config, input_config)
         elif self._is_fp8_w8a8(weight_config, input_config):
             return QuarkW8A8FP8MoE(weight_config, input_config)
         else:
-            raise RuntimeError("Unsupported FusedMoe scheme")
+            raise RuntimeError(
+                f"Unsupported FusedMoe scheme. "
+                f"Weight config: {weight_config}, Input config: {input_config}"
+            )
 
     def get_scaled_act_names(self) -> List[str]:
         return []
