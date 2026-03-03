@@ -266,7 +266,7 @@ class QuarkW4A8Int4Fp8MoE(QuarkMoEScheme):
             layer.w2_weight,
             topk_output.topk_weights,
             topk_output.topk_ids,
-            quant_type=QuantType.No,
+            quant_type=QuantType.per_Token,
             w1_scale=layer.w13_int4_scale,
             w2_scale=layer.w2_int4_scale,
             activation=(
