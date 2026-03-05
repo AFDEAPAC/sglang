@@ -204,7 +204,10 @@ class RMSNorm(MultiPlatformOp):
             if post_residual_addition is not None:
                 residual = residual + post_residual_addition
             fused_add_rms_norm(
-                out, x, residual_out, residual, self.weight.data, self.variance_epsilon
+                out, x,
+                #residual_out,
+                #residual,
+                self.weight.data, self.variance_epsilon
             )
             return out, residual_out
         out = torch.empty_like(x)
