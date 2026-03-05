@@ -495,7 +495,13 @@ class DeepseekMHAForwardMixin:
                 attn_dtype = k_nope.dtype
             k = k_nope.new_empty(*k_shape, dtype=attn_dtype)
             concat_and_cast_mha_k_triton(k, k_nope, k_pe)
-        elif _is_hip and self.current_attention_backend == "aiter":
+        elif (
+            _is_hip
+            and self.current_attention_backend == "aiter"
+            and next_power_of_2(self.num_local_heads) == self.num_local_heads
+            and next_power_of_2(self.qk_nope_head_dim) == self.qk_nope_head_dim
+            and next_power_of_2(self.qk_rope_head_dim) == self.qk_rope_head_dim
+        ):
             k = k_nope.new_empty(*k_shape)
             concat_and_cast_mha_k_triton(k, k_nope, k_pe)
         else:
