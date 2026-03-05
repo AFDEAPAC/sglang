@@ -216,7 +216,8 @@ class AiterAttnBackend(AttentionBackend):
             self.fix_max_split_per_batch = self.max_split_per_batch
 
     def make_mla_decode_meta_data_buffer(self, max_seqlen_qo, batch_size):
-        nhead = self.num_head
+        #nhead = self.num_head
+        nhead = max(self.num_head, 16)
         dtype = self.kv_cache_dtype
 
         if self.enable_dp_attention:
@@ -303,7 +304,8 @@ class AiterAttnBackend(AttentionBackend):
             qo_indptr,
             kv_indptr,
             kv_last_page_len,
-            self.num_head // nhead_kv,
+            #self.num_head // nhead_kv,
+            max(self.num_head, 16) // nhead_kv,
             nhead_kv,
             False,
             work_metadata,
