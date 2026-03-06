@@ -48,6 +48,7 @@ from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.utils import pad_sequence_with_mask
 from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
 from sglang.srt.utils import get_bool_env_var
+from sglang.srt.environ import envs as sglang_envs
 
 logger = logging.getLogger(__name__)
 
@@ -187,6 +188,9 @@ class AiterAttnBackend(AttentionBackend):
         self.logits_soft_cap = 0.0
 
         self.forward_metadata: ForwardMetadata = None
+
+        self.max_split_per_batch = None
+        self.fix_max_split_per_batch = None
 
         if self.use_mla:
             self.enable_dp_attention = is_dp_attention_enabled()
@@ -673,6 +677,106 @@ class AiterAttnBackend(AttentionBackend):
                     self.indices_updater_prefill.max_q_len,
                     self.indices_updater_prefill.max_kv_len,
                 )
+        elif forward_batch.forward_mode.is_draft_extend_v2() and sglang_envs.SGLANG_ENABLE_SPEC_V2.get():
+            # DRAFT_EXTEND_V2: fill draft KV cache using MLA decode kernel
+            # (same structure as TARGET_VERIFY, but driven by self.num_draft_tokens)
+            if self.use_mla:
+                num_draft = self.num_draft_tokens
+                kv_lens = forward_batch.seq_lens + num_draft
+                kv_lens_sum = forward_batch.seq_lens_sum + num_draft * bs
+                device = forward_batch.seq_lens.device
+
+                qo_indptr = torch.arange(
+                    0,
+                    (1 + bs) * num_draft,
+                    step=num_draft,
+                    dtype=torch.int32,
+                    device=device,
+                )
+                kv_indptr = self.kv_indptr
+                kv_indptr[1 : bs + 1] = torch.cumsum(kv_lens, dim=0)
+                kv_indptr = kv_indptr[: bs + 1]
+                kv_indices = torch.empty(
+                    kv_lens_sum, dtype=torch.int32, device=device
+                )
+                create_flashinfer_kv_indices_triton[(bs,)](
+                    self.req_to_token,
+                    forward_batch.req_pool_indices,
+                    kv_lens,
+                    kv_indptr,
+                    None,
+                    kv_indices,
+                    self.req_to_token.stride(0),
+                )
+
+                work_metadata = None
+                work_indptr = None
+                work_info_set = None
+                reduce_indptr = None
+                reduce_final_map = None
+                reduce_partial_map = None
+                num_kv_splits = None
+
+                if _use_mla_ps_kernel:
+                    max_seqlen_qo = num_draft
+                    (
+                        work_metadata,
+                        work_indptr,
+                        work_info_set,
+                        reduce_indptr,
+                        reduce_final_map,
+                        reduce_partial_map,
+                    ) = self.make_mla_decode_meta_data_buffer(max_seqlen_qo, bs)
+                    num_kv_splits = self.max_split_per_batch
+                    self.make_mla_meta_data(
+                        qo_indptr,
+                        kv_indptr,
+                        self.kv_last_page_len[:bs],
+                        work_metadata,
+                        work_info_set,
+                        work_indptr,
+                        reduce_indptr,
+                        reduce_final_map,
+                        reduce_partial_map,
+                        max_seqlen_qo,
+                        fast_mode=fast_mode,
+                        max_split_per_batch=num_kv_splits,
+                        intra_batch_mode=intra_batch_mode,
+                    )
+
+                self.forward_metadata = ForwardMetadata(
+                    kv_indptr,
+                    kv_indices,
+                    qo_indptr,
+                    self.kv_last_page_len[:bs],
+                    num_draft,
+                    None,
+                    work_metadata=work_metadata,
+                    work_info_set=work_info_set,
+                    work_indptr=work_indptr,
+                    reduce_indptr=reduce_indptr,
+                    reduce_final_map=reduce_final_map,
+                    reduce_partial_map=reduce_partial_map,
+                    num_kv_splits=num_kv_splits,
+                    run_graph=False,
+                )
+            else:
+                self.indices_updater_prefill.update(
+                    forward_batch.req_pool_indices,
+                    forward_batch.seq_lens,
+                    forward_batch.seq_lens_sum,
+                    prefix_lens=None,
+                    encoder_lens=forward_batch.encoder_lens,
+                    spec_info=forward_batch.spec_info,
+                )
+                self.forward_metadata = ForwardMetadata(
+                    self.indices_updater_prefill.kv_indptr,
+                    self.indices_updater_prefill.kv_indices,
+                    None,
+                    None,
+                    self.indices_updater_prefill.max_q_len,
+                    self.indices_updater_prefill.max_kv_len,
+                )
         else:
             prefix_lens = forward_batch.extend_prefix_lens
 
@@ -975,22 +1079,41 @@ class AiterAttnBackend(AttentionBackend):
                     # num_kv_splits_indptr=num_kv_splits_indptr,
                 )
             else:
-                seq_lens_sum = seq_lens.sum().item()
-                self.indices_updater_prefill.update(
-                    req_pool_indices,
-                    seq_lens,
-                    seq_lens_sum,
-                    prefix_lens=None,
-                    encoder_lens=encoder_lens,
-                    spec_info=spec_info,
+                # Non-MLA: use static CUDA graph buffers to match replay logic.
+                # indices_updater_prefill.update() allocates new tensors which causes
+                # the CUDA graph to capture stale addresses, leading to wrong attention
+                # output during replay and 0% accuracy. Use the same static buffers as
+                # the replay path so captured addresses remain valid.
+                kv_lens = seq_lens + self.num_draft_tokens
+                qo_indptr = self.qo_indptr[: bs + 1]
+                qo_indptr[: bs + 1] = torch.arange(
+                    0,
+                    (1 + bs) * self.num_draft_tokens,
+                    step=self.num_draft_tokens,
+                    dtype=torch.int32,
+                    device=self.device,
                 )
+                kv_indptr = self.kv_indptr[: bs + 1]
+                kv_indptr[1 : bs + 1] = torch.cumsum(kv_lens, dim=0)
+                kv_indices = self.cuda_graph_kv_indices
+                create_flashinfer_kv_indices_triton[(bs,)](
+                    self.req_to_token,
+                    req_pool_indices,
+                    kv_lens,
+                    kv_indptr,
+                    None,
+                    kv_indices,
+                    self.req_to_token.stride(0),
+                )
+                kv_last_page_len = self.cuda_graph_kv_last_page_len[:bs]
+                max_q_len = self.num_draft_tokens
                 self.forward_metadata = ForwardMetadata(
-                    self.indices_updater_prefill.kv_indptr,
-                    self.indices_updater_prefill.kv_indices,
-                    None,
-                    None,
-                    self.indices_updater_prefill.max_q_len,
-                    self.indices_updater_prefill.max_kv_len,
+                    kv_indptr,
+                    kv_indices,
+                    qo_indptr,
+                    kv_last_page_len,
+                    max_q_len,
+                    kv_indptr[-1].item(),
                 )
         elif forward_mode.is_draft_extend():
             num_tokens_per_bs = self.speculative_num_steps + 1
@@ -1017,7 +1140,11 @@ class AiterAttnBackend(AttentionBackend):
             kv_last_page_len = self.cuda_graph_kv_last_page_len[:bs]
             max_q_len = num_tokens_per_bs
 
-            if _use_mla_ps_kernel:
+            work_metadata = work_info_set = work_indptr = None
+            reduce_indptr = reduce_final_map = reduce_partial_map = None
+            num_kv_splits = None
+
+            if _use_mla_ps_kernel and self.use_mla:
 
                 num_kv_splits = self.max_split_per_batch
 
@@ -1094,6 +1221,21 @@ class AiterAttnBackend(AttentionBackend):
             else:
                 kv_indptr[: spec_info.kv_indptr.shape[0]] = spec_info.kv_indptr
                 kv_indices[: spec_info.kv_indices.shape[0]] = spec_info.kv_indices
+
+            # Reset forward_metadata to point back to the static CUDA graph buffers.
+            # Prefill (eager mode) overwrites self.forward_metadata with freshly
+            # allocated tensors. If that stale metadata is read before the graph
+            # replay updates self.forward_metadata, the attention kernel will use
+            # wrong tensor addresses. Resetting here ensures the metadata always
+            # reflects the correct static buffers for the decode CUDA graph.
+            self.forward_metadata = ForwardMetadata(
+                kv_indptr,
+                kv_indices,
+                None,
+                None,
+                None,
+                None,
+            )
 
         elif forward_mode.is_target_verify():
             bs = len(req_pool_indices)
@@ -1408,7 +1550,7 @@ class AiterAttnBackend(AttentionBackend):
                     num_kv_splits=num_kv_splits,
                 )
                 return o
-            elif forward_batch.forward_mode.is_draft_extend():
+            elif forward_batch.forward_mode.is_draft_extend(include_v2=sglang_envs.SGLANG_ENABLE_SPEC_V2.get()):
 
                 work_metadata = self.forward_metadata.work_metadata
                 work_indptr = self.forward_metadata.work_indptr

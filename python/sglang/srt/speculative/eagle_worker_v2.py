@@ -634,6 +634,12 @@ class EAGLEWorkerV2(BaseSpecWorker):
         self.extend_lens = torch.empty((), dtype=torch.int64, device=self.device)
 
         self.plan_stream, self.plan_stream_ctx = _get_plan_stream(self.device)
+        # Dedicated stream for async _draft_extend_for_prefill (reduces TTFT with SPEC_V2)
+        self._draft_extend_async_stream = torch.get_device_module(self.device).Stream()
+        self._draft_extend_async_ctx = torch.get_device_module(self.device).stream(
+            self._draft_extend_async_stream
+        )
+        self._prefill_draft_extend_event = None
 
     @property
     def target_worker(self):
@@ -663,15 +669,47 @@ class EAGLEWorkerV2(BaseSpecWorker):
             with self.draft_worker.draft_tp_context(
                 self.draft_worker.draft_runner.tp_group
             ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
-                batch_output.next_draft_input = (
-                    self.draft_worker._draft_extend_for_prefill(
-                        model_worker_batch,
-                        batch_output.logits_output.hidden_states,
-                        batch_output.next_token_ids,
+                if envs.SGLANG_ENABLE_SPEC_V2.get():
+                    # Async path: run _draft_extend_for_prefill on a dedicated stream so
+                    # the GPU->CPU logits copy is not blocked by the draft extend forward.
+                    # All TP ranks execute this simultaneously (SPMD), so XGMI /
+                    # custom-allreduce inside draft_extend synchronizes correctly across
+                    # ranks.  We record an event and sync before draft() in next decode.
+                    cur_stream = torch.get_device_module(self.device).current_stream()
+                    self._draft_extend_async_stream.wait_stream(cur_stream)
+                    with self._draft_extend_async_ctx:
+                        batch_output.next_draft_input = (
+                            self.draft_worker._draft_extend_for_prefill(
+                                model_worker_batch,
+                                batch_output.logits_output.hidden_states,
+                                batch_output.next_token_ids,
+                            )
+                        )
+                    self._prefill_draft_extend_event = (
+                        torch.get_device_module(self.device).Event()
                     )
-                )
+                    self._prefill_draft_extend_event.record(
+                        self._draft_extend_async_stream
+                    )
+                else:
+                    batch_output.next_draft_input = (
+                        self.draft_worker._draft_extend_for_prefill(
+                            model_worker_batch,
+                            batch_output.logits_output.hidden_states,
+                            batch_output.next_token_ids,
+                        )
+                    )
                 return batch_output
         else:
+            # Sync with async _draft_extend_for_prefill: ensure the draft KV cache
+            # fill from the previous prefill iteration is complete before draft()
+            # reads from the KV cache.
+            if self._prefill_draft_extend_event is not None:
+                torch.get_device_module(self.device).current_stream().wait_event(
+                    self._prefill_draft_extend_event
+                )
+                self._prefill_draft_extend_event = None
+
             if model_worker_batch.spec_info is None:
                 model_worker_batch.spec_info = EagleDraftInput.create_idle_input(
                     device=self.device,

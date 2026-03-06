@@ -928,7 +928,7 @@ class Indexer(MultiPlatformOp):
         return_indices: bool = True,
     ) -> Optional[torch.Tensor]:
         if _is_hip:
-            from sglang.srt.layers.attention.nsa.tilelang_kernel import act_quant
+            from sglang.srt.layers.attention.nsa.aiter_kernel import act_quant
         elif not _is_npu:
             from sglang.srt.layers.attention.nsa.triton_kernel import act_quant
 
