@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 import logging
 from enum import Enum
 from functools import lru_cache
@@ -55,42 +57,16 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 if _use_aiter:
     import aiter
 
-    # from aiter import gemm_a8w8_blockscale, gemm_a8w8_bpreshuffle, get_hip_quant
     from aiter import gemm_a8w8_bpreshuffle, get_hip_quant
-    from aiter.ops.triton.gemm_a8w8_blockscale import gemm_a8w8_blockscale
-
-    _use_flydsl_blockscale_gemm = get_bool_env_var("SGLANG_USE_FLYDSL_BLOCKSCALE_GEMM")
-    _flydsl_gemm_a8w8_blockscale = None
-    if _use_flydsl_blockscale_gemm:
-        try:
-            from aiter.ops.flydsl.gemm_a8w8_blockscale import (
-                flydsl_gemm_a8w8_blockscale as _flydsl_gemm_a8w8_blockscale,
-            )
-            logger.info("FlyDSL blockscale GEMM enabled")
-        except ImportError:
-            logger.warning("FlyDSL blockscale GEMM requested but not available")
-            _use_flydsl_blockscale_gemm = False
+    from aiter.ops.triton.gemm_a8w8_blockscale import (
+        gemm_a8w8_blockscale as triton_gemm_a8w8_blockscale,
+    )
+    from aiter import gemm_a8w8_blockscale as ck_gemm_a8w8_blockscale
 
     aiter_per1x128_quant = get_hip_quant(aiter.QuantType.per_1x128)
 
-    _use_adaptive_dispatch = get_bool_env_var("SGLANG_ADAPTIVE_FP8_DISPATCH")
-    _ck_gemm_a8w8_blockscale = None
-    if _use_adaptive_dispatch:
-        try:
-            from aiter import gemm_a8w8_blockscale as _ck_gemm_a8w8_blockscale
-            logger.info("Adaptive FP8 dispatch enabled: CK for small M, Triton/FlyDSL for large M")
-        except ImportError:
-            logger.warning("Adaptive dispatch: CK backend not available, falling back to Triton only")
-            _use_adaptive_dispatch = False
-
-    _ADAPTIVE_DISPATCH_TABLE = {
-        (2048, 2048): {"small": "ck", "large": "triton", "threshold": 128},
-        (2048, 6144): {"small": "ck", "large": "triton", "threshold": 128},
-        (2624, 6144): {"small": "ck", "large": "triton", "threshold": 128},
-        (3072, 6144): {"small": "ck", "large": "ck", "threshold": 128},
-        (6144, 2048): {"small": "ck", "large": "flydsl", "threshold": 128},
-        (6144, 6144): {"small": "ck", "large": "triton", "threshold": 128},
-    }
+_adaptive_fp8_dispatch = get_bool_env_var("SGLANG_ADAPTIVE_FP8_DISPATCH")
+_adaptive_fp8_threshold = int(os.environ.get("SGLANG_ADAPTIVE_FP8_THRESHOLD", "128"))
 
 if _is_cuda:
     from sgl_kernel import fp8_blockwise_scaled_mm, fp8_scaled_mm
@@ -585,43 +561,26 @@ def aiter_w8a8_block_fp8_linear(
     input_scale: Optional[torch.Tensor] = None,
     bias: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    # assert input_scale is None
     input_2d = input.view(-1, input.shape[-1])
     output_shape = [*input.shape[:-1], weight.shape[0]]
+    M = input_2d.shape[0]
 
-    # if input_scale not None, input is quanted
     if input_scale is not None:
         q_input = input_2d
         x_scale = input_scale
-
     else:
         q_input, x_scale = aiter_per1x128_quant(input_2d, quant_dtype=aiter.dtypes.fp8)
 
-    _out_dtype = torch.bfloat16 if input_scale is not None else input.dtype
-    _dispatched = False
+    out_dtype = torch.bfloat16 if input_scale is not None else input.dtype
 
-    if _use_aiter and _use_adaptive_dispatch:
-        _m = q_input.shape[0]
-        _n = weight.shape[0]
-        _k = q_input.shape[1]
-        _rule = _ADAPTIVE_DISPATCH_TABLE.get((_n, _k))
-        if _rule is not None:
-            _backend = _rule["large"] if _m >= _rule["threshold"] else _rule["small"]
-            if _backend == "ck" and _ck_gemm_a8w8_blockscale is not None:
-                output = _ck_gemm_a8w8_blockscale(q_input, weight, x_scale, weight_scale, dtype=_out_dtype)
-                _dispatched = True
-            elif _backend == "flydsl" and _flydsl_gemm_a8w8_blockscale is not None:
-                output = _flydsl_gemm_a8w8_blockscale(q_input, weight, x_scale, weight_scale, out_dtype=_out_dtype)
-                _dispatched = True
-            elif _backend == "triton":
-                output = gemm_a8w8_blockscale(q_input, weight, x_scale, weight_scale, dtype=_out_dtype)
-                _dispatched = True
-
-    if not _dispatched:
-        if _use_aiter and _use_flydsl_blockscale_gemm and _flydsl_gemm_a8w8_blockscale is not None:
-            output = _flydsl_gemm_a8w8_blockscale(q_input, weight, x_scale, weight_scale, out_dtype=_out_dtype)
-        else:
-            output = gemm_a8w8_blockscale(q_input, weight, x_scale, weight_scale, dtype=_out_dtype)
+    if _adaptive_fp8_dispatch and M < _adaptive_fp8_threshold:
+        output = ck_gemm_a8w8_blockscale(
+            q_input, weight, x_scale, weight_scale, dtype=out_dtype,
+        )
+    else:
+        output = triton_gemm_a8w8_blockscale(
+            q_input, weight, x_scale, weight_scale, dtype=out_dtype,
+        )
 
     if bias is not None:
         output += bias
