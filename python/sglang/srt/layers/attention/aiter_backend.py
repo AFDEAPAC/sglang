@@ -45,6 +45,7 @@ except ImportError:
     )
 
 from sglang.srt.configs.model_config import AttentionArch
+from sglang.srt.environ import envs as sglang_envs
 from sglang.srt.layers.attention.utils import pad_sequence_with_mask
 from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
 from sglang.srt.utils import get_bool_env_var
@@ -507,7 +508,9 @@ class AiterAttnBackend(AttentionBackend):
                 run_graph=False,
             )
 
-        elif forward_batch.forward_mode.is_draft_extend():
+        elif forward_batch.forward_mode.is_draft_extend(
+            include_v2=sglang_envs.SGLANG_ENABLE_SPEC_V2.get()
+        ):
             if self.use_mla:
                 kv_indices, kv_indptr, qo_indptr, custom_mask = (
                     spec_info.generate_attn_arg_prefill(
@@ -677,9 +680,11 @@ class AiterAttnBackend(AttentionBackend):
                     self.indices_updater_prefill.max_q_len,
                     self.indices_updater_prefill.max_kv_len,
                 )
-        elif forward_batch.forward_mode.is_draft_extend_v2() and sglang_envs.SGLANG_ENABLE_SPEC_V2.get():
-            # DRAFT_EXTEND_V2: fill draft KV cache using MLA decode kernel
-            # (same structure as TARGET_VERIFY, but driven by self.num_draft_tokens)
+        elif (
+            forward_batch.forward_mode.is_draft_extend_v2()
+            and sglang_envs.SGLANG_ENABLE_SPEC_V2.get()
+        ):
+            # DRAFT_EXTEND_V2 fills draft KV cache using the MLA decode kernel.
             if self.use_mla:
                 num_draft = self.num_draft_tokens
                 kv_lens = forward_batch.seq_lens + num_draft
@@ -696,9 +701,7 @@ class AiterAttnBackend(AttentionBackend):
                 kv_indptr = self.kv_indptr
                 kv_indptr[1 : bs + 1] = torch.cumsum(kv_lens, dim=0)
                 kv_indptr = kv_indptr[: bs + 1]
-                kv_indices = torch.empty(
-                    kv_lens_sum, dtype=torch.int32, device=device
-                )
+                kv_indices = torch.empty(kv_lens_sum, dtype=torch.int32, device=device)
                 create_flashinfer_kv_indices_triton[(bs,)](
                     self.req_to_token,
                     forward_batch.req_pool_indices,
