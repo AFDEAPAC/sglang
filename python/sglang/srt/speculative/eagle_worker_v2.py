@@ -694,7 +694,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     # the GPU->CPU logits copy is not blocked by the draft extend forward.
                     # All TP ranks execute this simultaneously (SPMD), so XGMI /
                     # custom-allreduce inside draft_extend synchronizes correctly across
-                    # ranks.  We record an event and sync before draft() in next decode.
+                    # ranks. We record an event and sync before draft() in next decode.
                     cur_stream = torch.get_device_module(self.device).current_stream()
                     self._draft_extend_async_stream.wait_stream(cur_stream)
                     with self._draft_extend_async_ctx:
@@ -705,9 +705,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
                                 batch_output.next_token_ids,
                             )
                         )
-                    self._prefill_draft_extend_event = (
-                        torch.get_device_module(self.device).Event()
-                    )
+                    self._prefill_draft_extend_event = torch.get_device_module(
+                        self.device
+                    ).Event()
                     self._prefill_draft_extend_event.record(
                         self._draft_extend_async_stream
                     )
