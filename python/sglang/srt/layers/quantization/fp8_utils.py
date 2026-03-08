@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 
 import logging
+import os
 from enum import Enum
 from functools import lru_cache
 from typing import TYPE_CHECKING, Callable, List, Optional, Tuple
@@ -56,12 +57,11 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if _use_aiter:
     import aiter
-
+    from aiter import gemm_a8w8_blockscale as ck_gemm_a8w8_blockscale
     from aiter import gemm_a8w8_bpreshuffle, get_hip_quant
     from aiter.ops.triton.gemm_a8w8_blockscale import (
         gemm_a8w8_blockscale as triton_gemm_a8w8_blockscale,
     )
-    from aiter import gemm_a8w8_blockscale as ck_gemm_a8w8_blockscale
 
     aiter_per1x128_quant = get_hip_quant(aiter.QuantType.per_1x128)
 
@@ -575,11 +575,19 @@ def aiter_w8a8_block_fp8_linear(
 
     if _adaptive_fp8_dispatch and M < _adaptive_fp8_threshold:
         output = ck_gemm_a8w8_blockscale(
-            q_input, weight, x_scale, weight_scale, dtype=out_dtype,
+            q_input,
+            weight,
+            x_scale,
+            weight_scale,
+            dtype=out_dtype,
         )
     else:
         output = triton_gemm_a8w8_blockscale(
-            q_input, weight, x_scale, weight_scale, dtype=out_dtype,
+            q_input,
+            weight,
+            x_scale,
+            weight_scale,
+            dtype=out_dtype,
         )
 
     if bias is not None:
