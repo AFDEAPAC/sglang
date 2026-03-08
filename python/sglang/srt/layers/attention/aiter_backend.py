@@ -508,9 +508,7 @@ class AiterAttnBackend(AttentionBackend):
                 run_graph=False,
             )
 
-        elif forward_batch.forward_mode.is_draft_extend(
-            include_v2=sglang_envs.SGLANG_ENABLE_SPEC_V2.get()
-        ):
+        elif forward_batch.forward_mode.is_draft_extend():
             if self.use_mla:
                 kv_indices, kv_indptr, qo_indptr, custom_mask = (
                     spec_info.generate_attn_arg_prefill(
@@ -1553,7 +1551,9 @@ class AiterAttnBackend(AttentionBackend):
                     num_kv_splits=num_kv_splits,
                 )
                 return o
-            elif forward_batch.forward_mode.is_draft_extend(include_v2=sglang_envs.SGLANG_ENABLE_SPEC_V2.get()):
+            elif forward_batch.forward_mode.is_draft_extend(
+                include_v2=sglang_envs.SGLANG_ENABLE_SPEC_V2.get()
+            ):
 
                 work_metadata = self.forward_metadata.work_metadata
                 work_indptr = self.forward_metadata.work_indptr
