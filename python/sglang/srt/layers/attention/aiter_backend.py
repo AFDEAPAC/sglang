@@ -48,6 +48,7 @@ from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.utils import pad_sequence_with_mask
 from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
 from sglang.srt.utils import get_bool_env_var
+from sglang.srt.environ import envs as sglang_envs
 
 logger = logging.getLogger(__name__)
 
@@ -188,6 +189,9 @@ class AiterAttnBackend(AttentionBackend):
 
         self.forward_metadata: ForwardMetadata = None
 
+        self.max_split_per_batch = None
+        self.fix_max_split_per_batch = None
+
         if self.use_mla:
             self.enable_dp_attention = is_dp_attention_enabled()
             self.qo_indptr_ = torch.zeros(
@@ -216,7 +220,7 @@ class AiterAttnBackend(AttentionBackend):
             self.fix_max_split_per_batch = self.max_split_per_batch
 
     def make_mla_decode_meta_data_buffer(self, max_seqlen_qo, batch_size):
-        nhead = self.num_head
+        nhead = max(self.num_head, 16)
         dtype = self.kv_cache_dtype
 
         if self.enable_dp_attention:
@@ -303,7 +307,7 @@ class AiterAttnBackend(AttentionBackend):
             qo_indptr,
             kv_indptr,
             kv_last_page_len,
-            self.num_head // nhead_kv,
+            max(self.num_head, 16) // nhead_kv,
             nhead_kv,
             False,
             work_metadata,

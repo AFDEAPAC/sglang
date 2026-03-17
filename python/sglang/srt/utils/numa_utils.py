@@ -18,7 +18,11 @@ def configure_subprocess(server_args: ServerArgs, gpu_id: int):
         numa_nodes := server_args.numa_node
     ) is not None and envs.SGLANG_NUMA_BIND_V2.get():
         numa_node = numa_nodes[gpu_id]
-        numactl_args = f"--cpunodebind={numa_node} --membind={numa_node}"
+        mem_policy = os.environ.get("SGLANG_NUMA_MEM_POLICY", "preferred")
+        if mem_policy == "membind":
+            numactl_args = f"--cpunodebind={numa_node} --membind={numa_node}"
+        else:
+            numactl_args = f"--cpunodebind={numa_node} --preferred={numa_node}"
         executable, debug_str = _create_numactl_executable(numactl_args=numactl_args)
         with _mp_set_executable(executable=executable, debug_str=debug_str):
             yield
