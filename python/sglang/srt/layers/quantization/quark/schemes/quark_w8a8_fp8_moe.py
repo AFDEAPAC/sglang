@@ -239,22 +239,19 @@ class QuarkW8A8FP8MoE(QuarkMoEScheme):
                 f"Unsupported weight quantization strategy: {self.weight_qscheme}."
             )
 
-        if (
-            _use_aiter
-            and self.is_weight_per_channel
-            and self.moe_runner_config.apply_router_weight_on_input
-        ):
+        if _use_aiter and self.is_weight_per_channel:
             with torch.no_grad():
-                # Pre-shuffle weights
                 layer.w13_weight = torch.nn.Parameter(
                     shuffle_weight(layer.w13_weight.data, (16, 16)),
                     requires_grad=False,
                 )
+                layer.w13_weight.is_shuffled = True
                 torch.cuda.empty_cache()
                 layer.w2_weight = torch.nn.Parameter(
                     shuffle_weight(layer.w2_weight.data, (16, 16)),
                     requires_grad=False,
                 )
+                layer.w2_weight.is_shuffled = True
                 torch.cuda.empty_cache()
 
     def create_moe_runner(
@@ -296,6 +293,28 @@ class QuarkW8A8FP8MoE(QuarkMoEScheme):
                 w2_scale=layer.w2_weight_scale,
                 a1_scale=layer.w13_input_scale,
                 a2_scale=layer.w2_input_scale,
+            )
+            return StandardCombineInput(hidden_states=output)
+        elif _use_aiter and self.is_weight_per_channel:
+            from aiter import ActivationType, QuantType
+            from aiter.fused_moe import fused_moe
+
+            topk_weights, topk_ids, _ = topk_output
+            activation = (
+                ActivationType.Silu
+                if moe_runner_config.activation == "silu"
+                else ActivationType.Gelu
+            )
+            output = fused_moe(
+                x,
+                layer.w13_weight,
+                layer.w2_weight,
+                topk_weights.to(torch.float32),
+                topk_ids.to(torch.int32),
+                activation=activation,
+                quant_type=QuantType.per_Token,
+                w1_scale=layer.w13_weight_scale,
+                w2_scale=layer.w2_weight_scale,
             )
             return StandardCombineInput(hidden_states=output)
         else:
