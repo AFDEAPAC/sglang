@@ -40,6 +40,10 @@ class QuarkW4A8Int4Fp8MoE(QuarkMoEScheme):
         original ~= int4_weight * weight_scale_2 * weight_scale
     """
 
+    @classmethod
+    def get_min_capability(cls) -> int:
+        return 80
+
     def __init__(
         self,
         weight_configs: list[dict[str, Any]],

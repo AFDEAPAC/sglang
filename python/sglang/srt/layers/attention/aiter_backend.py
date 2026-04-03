@@ -248,13 +248,19 @@ class AiterAttnBackend(AttentionBackend):
                 fast_mode = True
                 intra_batch_mode = False
 
+            # nhead=8 (TP8 with 64 attention heads) needs padding to 16
+            # for metadata and kernel calls
+            self._mla_padded_nhead = self.num_head
+            if self.num_head == 8:
+                self._mla_padded_nhead = 16
+
             # current persist a16w16 mla_decode kernel does not support head_num = 128
             # need to fall back to non-persist
             # only use mla_ps_kernel when fp8 kv_cache
             # for non-fp8 kv_cache on tp8, use non-persist kernel to avoid performance degradation
             # head_num=16 (tp8 perf issue), head_num=128 (unsupported, like tp1 or --enable-dp-attention with tp8-dp8)
             if (
-                self.num_head == 16 or self.num_head == 128
+                self.num_head in (8, 16, 128)
             ) and self.kv_cache_dtype is not fp8_dtype:
                 _use_mla_ps_kernel = False
                 fast_mode = False
@@ -268,7 +274,7 @@ class AiterAttnBackend(AttentionBackend):
             self.fix_max_split_per_batch = self.max_split_per_batch
 
     def make_mla_decode_meta_data_buffer(self, max_seqlen_qo, batch_size):
-        nhead = self.num_head
+        nhead = self._mla_padded_nhead
         dtype = self.kv_cache_dtype
 
         if self.enable_dp_attention:
@@ -355,7 +361,7 @@ class AiterAttnBackend(AttentionBackend):
             qo_indptr,
             kv_indptr,
             kv_last_page_len,
-            self.num_head // nhead_kv,
+            self._mla_padded_nhead // nhead_kv,
             nhead_kv,
             False,
             work_metadata,
