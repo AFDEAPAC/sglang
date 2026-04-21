@@ -62,6 +62,92 @@ logger = logging.getLogger(__name__)
 # Use aiter mla persist design for fp8-kv cache
 _use_mla_ps_kernel = get_bool_env_var("SGLANG_AITER_MLA_PERSIST", "True")
 
+# Fold qlen x nhead for MLA decode to skip aiter's nhead=8 -> 16 padding.
+# MLA attention is per-head independent against a shared KV latent, so
+# [bs*qlen, nhead, D] can be reshaped to [bs, qlen*nhead, D] with
+# max_seqlen_q=1 when every request has a uniform qlen. This trades the
+# implicit causal mask across qlen positions for extra bookkeeping, so it
+# is only safe when the caller is OK with non-causal semantics across the
+# folded qlen dimension (EAGLE3 target-verify / draft-extend uses full
+# prefix context across the small qlen).
+_mla_fold_enabled = get_bool_env_var("SGLANG_MLA_FOLD", "False")
+
+
+def _try_fold_mla_q(q, tp_q_head_num, qk_head_dim, max_q_len, qo_indptr, kv_dtype=None):
+    """If eligible, return a dict describing the folded Q/indptr, else None.
+
+    Eligibility:
+      - SGLANG_MLA_FOLD=1
+      - tp_q_head_num == 8 (Kimi-K2.5 TP=8 setting; fold target is 16 or 32)
+      - max_q_len in (2, 3, 4)
+      - q.shape[0] evenly divisible by max_q_len (uniform qlen per batch)
+      - not currently capturing a CUDA graph (ctypes-based persistent path
+        may interact badly; be conservative)
+    """
+    if not _mla_fold_enabled:
+        return None
+    # aiter only has optimized persistent/ASM kernels for bf16/fp16 KV on folded
+    # shapes (nhead=16/32, qseqlen=1). fp8 KV falls through to a heuristic miss
+    # and aborts. Gate to avoid that crash.
+    if kv_dtype is not None and kv_dtype not in (torch.bfloat16, torch.float16):
+        return None
+    if tp_q_head_num != 8:
+        return None
+    if max_q_len not in (2, 3, 4):
+        return None
+    total_s = q.shape[0]
+    if total_s % max_q_len != 0:
+        return None
+    try:
+        if torch.cuda.is_current_stream_capturing():
+            return None
+    except AttributeError:
+        pass
+
+    bs = total_s // max_q_len
+    pad_qlen = max_q_len
+    q_in = q
+    if max_q_len == 3:
+        # nhead=24 is not supported by aiter; pad qlen 3 -> 4, nhead -> 32.
+        pad_qlen = 4
+        q_padded = torch.zeros(
+            bs * 4, tp_q_head_num, qk_head_dim, dtype=q.dtype, device=q.device
+        )
+        q_padded.view(bs, 4, tp_q_head_num, qk_head_dim)[:, :3].copy_(
+            q.view(bs, 3, tp_q_head_num, qk_head_dim)
+        )
+        q_in = q_padded
+
+    fold_nhead = pad_qlen * tp_q_head_num  # 16 or 32
+    if fold_nhead not in (16, 32):
+        return None
+
+    q_folded = q_in.reshape(bs, fold_nhead, qk_head_dim).contiguous()
+    qo_indptr_folded = torch.arange(
+        bs + 1, dtype=qo_indptr.dtype, device=qo_indptr.device
+    )
+    return {
+        "q": q_folded,
+        "bs": bs,
+        "fold_nhead": fold_nhead,
+        "qo_indptr": qo_indptr_folded,
+        "max_q_len": 1,
+        "pad_qlen": pad_qlen,
+        "orig_max_q_len": max_q_len,
+    }
+
+
+def _unfold_mla_o(o_fold, fold_info, tp_q_head_num, v_head_dim):
+    """Reshape folded output [bs, pad_qlen*nhead, VD] back to
+    [bs*orig_max_q_len, nhead, VD], slicing off the qlen padding if any."""
+    bs = fold_info["bs"]
+    pad_qlen = fold_info["pad_qlen"]
+    orig = fold_info["orig_max_q_len"]
+    o = o_fold.view(bs, pad_qlen, tp_q_head_num, v_head_dim)
+    if pad_qlen != orig:
+        o = o[:, :orig]
+    return o.reshape(bs * orig, tp_q_head_num, v_head_dim).contiguous()
+
 # Use fp8 prefill only on gfx95
 _use_fp8_prefill_attn = (
     get_bool_env_var("SGLANG_AITER_FP8_PREFILL_ATTN", "True") and is_gfx95_supported()
@@ -253,6 +339,10 @@ class AiterAttnBackend(AttentionBackend):
             self._mla_padded_nhead = self.num_head
             if self.num_head == 8:
                 self._mla_padded_nhead = 16
+            # Persistent padding buffers so aiter's forced_head_pad (zeros+alloc+slice)
+            # becomes a no-op. Lazy-allocated on first use; reused across layers/steps.
+            self._mla_pad_q_buf = None
+            self._mla_pad_o_buf = None
 
             # current persist a16w16 mla_decode kernel does not support head_num = 128
             # need to fall back to non-persist
@@ -272,6 +362,42 @@ class AiterAttnBackend(AttentionBackend):
                 self.max_split_per_batch = 64
 
             self.fix_max_split_per_batch = self.max_split_per_batch
+
+    def _pad_mla_q_8_to_16(self, q, total_s, qk_head_dim, v_head_dim):
+        """Pre-pad q from [total_s, 8, qk_head_dim] to [total_s, 16, qk_head_dim] via a
+        persistent buffer. Returns (q_padded, o_padded) where o_padded is an uninitialized
+        [total_s, 16, v_head_dim] buffer. The last 8 query heads are zero-initialized once
+        (buffer init), so subsequent calls only copy the 8 real heads.
+
+        Caller is responsible for slicing the output back:
+            real_o.copy_(o_padded[:, :8, :])
+        """
+        buf_q = self._mla_pad_q_buf
+        if (
+            buf_q is None
+            or buf_q.dtype != q.dtype
+            or buf_q.shape[0] < total_s
+            or buf_q.shape[2] != qk_head_dim
+        ):
+            capacity = max(total_s, 2048)
+            self._mla_pad_q_buf = torch.zeros(
+                (capacity, 16, qk_head_dim), dtype=q.dtype, device=q.device
+            )
+        buf_o = self._mla_pad_o_buf
+        if (
+            buf_o is None
+            or buf_o.dtype != self.input_dtype
+            or buf_o.shape[0] < total_s
+            or buf_o.shape[2] != v_head_dim
+        ):
+            capacity = max(total_s, 2048)
+            self._mla_pad_o_buf = torch.empty(
+                (capacity, 16, v_head_dim), dtype=self.input_dtype, device=self.device
+            )
+        q_padded = self._mla_pad_q_buf[:total_s]
+        o_padded = self._mla_pad_o_buf[:total_s]
+        q_padded[:, :8, :] = q
+        return q_padded, o_padded
 
     def make_mla_decode_meta_data_buffer(self, max_seqlen_qo, batch_size):
         nhead = self._mla_padded_nhead
@@ -487,11 +613,11 @@ class AiterAttnBackend(AttentionBackend):
         """Resolve fixed per-request extend length for DRAFT_EXTEND_V2."""
         num_draft_tokens = self.num_draft_tokens
         if num_draft_tokens is None:
-            if extend_seq_lens is not None and extend_seq_lens.numel() > 0:
-                # Avoid list scans in hot path when tensor lengths are already available.
-                num_draft_tokens = int(extend_seq_lens[0].item())
-            elif extend_seq_lens_cpu:
+            # Prefer CPU-side metadata to avoid a GPU->CPU sync stall.
+            if extend_seq_lens_cpu:
                 num_draft_tokens = max(extend_seq_lens_cpu)
+            elif extend_seq_lens is not None and extend_seq_lens.numel() > 0:
+                num_draft_tokens = int(extend_seq_lens[0].item())
             else:
                 raise ValueError(
                     "DRAFT_EXTEND_V2 requires speculative_num_draft_tokens or "
@@ -2184,6 +2310,41 @@ class AiterAttnBackend(AttentionBackend):
                     K_Buffer = K_Buffer.view(-1, layer.tp_k_head_num, layer.qk_head_dim)
                     return o
             elif forward_batch.forward_mode.is_target_verify():
+                fold_info = _try_fold_mla_q(
+                    q,
+                    layer.tp_q_head_num,
+                    layer.qk_head_dim,
+                    self.forward_metadata.max_q_len,
+                    self.forward_metadata.qo_indptr,
+                    kv_dtype=K_Buffer.dtype,
+                )
+                if fold_info is not None:
+                    o_fold = q.new_empty(
+                        (
+                            fold_info["bs"],
+                            fold_info["fold_nhead"],
+                            layer.v_head_dim,
+                        ),
+                        dtype=self.input_dtype,
+                    )
+                    mla_decode_fwd(
+                        fold_info["q"],
+                        K_Buffer.view(-1, 1, 1, layer.qk_head_dim),
+                        o_fold,
+                        fold_info["qo_indptr"],
+                        self.forward_metadata.kv_indptr,
+                        self.forward_metadata.kv_indices,
+                        self.forward_metadata.kv_last_page_len,
+                        fold_info["max_q_len"],
+                        sm_scale=layer.scaling,
+                        logit_cap=layer.logit_cap,
+                        q_scale=k_descale,
+                        kv_scale=k_descale,
+                    )
+                    return _unfold_mla_o(
+                        o_fold, fold_info, layer.tp_q_head_num, layer.v_head_dim
+                    )
+
                 o = q.new_empty(
                     (q.shape[0], layer.tp_q_head_num, layer.v_head_dim),
                     dtype=self.input_dtype,
@@ -2199,10 +2360,17 @@ class AiterAttnBackend(AttentionBackend):
 
                 num_kv_splits = self.forward_metadata.num_kv_splits
 
+                if layer.tp_q_head_num == 8:
+                    q_in, o_in = self._pad_mla_q_8_to_16(
+                        q, q.shape[0], layer.qk_head_dim, layer.v_head_dim
+                    )
+                else:
+                    q_in, o_in = q, o
+
                 mla_decode_fwd(
-                    q,
+                    q_in,
                     K_Buffer.view(-1, 1, 1, layer.qk_head_dim),
-                    o,
+                    o_in,
                     self.forward_metadata.qo_indptr,
                     self.forward_metadata.kv_indptr,
                     self.forward_metadata.kv_indices,
@@ -2221,6 +2389,8 @@ class AiterAttnBackend(AttentionBackend):
                     intra_batch_mode=intra_batch_mode,
                     num_kv_splits=num_kv_splits,
                 )
+                if layer.tp_q_head_num == 8:
+                    o.copy_(o_in[:, :8, :])
                 return o
             elif (
                 forward_batch.forward_mode.is_draft_extend()
@@ -2245,6 +2415,47 @@ class AiterAttnBackend(AttentionBackend):
                         forward_batch.extend_seq_lens,
                         self.forward_metadata.max_q_len,
                     )
+                    q_pad_v = q_pad.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+                    fold_info = _try_fold_mla_q(
+                        q_pad_v,
+                        layer.tp_q_head_num,
+                        layer.qk_head_dim,
+                        self.forward_metadata.max_q_len,
+                        self.forward_metadata.qo_indptr,
+                        kv_dtype=K_Buffer.dtype,
+                    )
+                    if fold_info is not None:
+                        o_fold = q.new_empty(
+                            (
+                                fold_info["bs"],
+                                fold_info["fold_nhead"],
+                                layer.v_head_dim,
+                            ),
+                            dtype=self.input_dtype,
+                        )
+                        mla_decode_fwd(
+                            fold_info["q"],
+                            K_Buffer.view(-1, 1, 1, layer.qk_head_dim),
+                            o_fold,
+                            fold_info["qo_indptr"],
+                            self.forward_metadata.kv_indptr,
+                            self.forward_metadata.kv_indices,
+                            self.forward_metadata.kv_last_page_len,
+                            fold_info["max_q_len"],
+                            sm_scale=layer.scaling,
+                            logit_cap=layer.logit_cap,
+                            q_scale=k_descale,
+                            kv_scale=k_descale,
+                        )
+                        o = _unfold_mla_o(
+                            o_fold,
+                            fold_info,
+                            layer.tp_q_head_num,
+                            layer.v_head_dim,
+                        )
+                        total_valid_q = int(qo_indptr[-1].item())
+                        return o[:total_valid_q]
+
                     o = q.new_empty(
                         (
                             bs * self.forward_metadata.max_q_len,
@@ -2253,10 +2464,16 @@ class AiterAttnBackend(AttentionBackend):
                         ),
                         dtype=self.input_dtype,
                     )
+                    if layer.tp_q_head_num == 8:
+                        q_in, o_in = self._pad_mla_q_8_to_16(
+                            q_pad_v, q_pad_v.shape[0], layer.qk_head_dim, layer.v_head_dim
+                        )
+                    else:
+                        q_in, o_in = q_pad_v, o
                     mla_decode_fwd(
-                        q_pad.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                        q_in,
                         K_Buffer.view(-1, 1, 1, layer.qk_head_dim),
-                        o,
+                        o_in,
                         self.forward_metadata.qo_indptr,
                         self.forward_metadata.kv_indptr,
                         self.forward_metadata.kv_indices,
@@ -2275,8 +2492,11 @@ class AiterAttnBackend(AttentionBackend):
                         intra_batch_mode=intra_batch_mode,
                         num_kv_splits=num_kv_splits,
                     )
+                    if layer.tp_q_head_num == 8:
+                        o.copy_(o_in[:, :8, :])
 
-                    total_valid_q = int(qo_indptr[-1].item())
+                    # q shape[0] equals qo_indptr[-1]; skip GPU->CPU sync.
+                    total_valid_q = q.shape[0]
                     return o[:total_valid_q]
                 else:
                     o = q.new_empty(
@@ -2284,10 +2504,17 @@ class AiterAttnBackend(AttentionBackend):
                         dtype=self.input_dtype,
                     )
 
+                    if layer.tp_q_head_num == 8:
+                        q_in, o_in = self._pad_mla_q_8_to_16(
+                            q, q.shape[0], layer.qk_head_dim, layer.v_head_dim
+                        )
+                    else:
+                        q_in, o_in = q, o
+
                     mla_decode_fwd(
-                        q,
+                        q_in,
                         K_Buffer.view(-1, 1, 1, layer.qk_head_dim),
-                        o,
+                        o_in,
                         self.forward_metadata.qo_indptr,
                         self.forward_metadata.kv_indptr,
                         self.forward_metadata.kv_indices,
@@ -2464,10 +2691,18 @@ class AiterAttnBackend(AttentionBackend):
 
             num_kv_splits = self.forward_metadata.num_kv_splits
 
+            _q3 = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+            _o3 = o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+            if layer.tp_q_head_num == 8:
+                _q_in, _o_in = self._pad_mla_q_8_to_16(
+                    _q3, _q3.shape[0], layer.qk_head_dim, layer.v_head_dim
+                )
+            else:
+                _q_in, _o_in = _q3, _o3
             mla_decode_fwd(
-                q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                _q_in,
                 k_buffer.view(-1, 1, 1, layer.qk_head_dim),
-                o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+                _o_in,
                 self.forward_metadata.qo_indptr,
                 self.forward_metadata.kv_indptr,
                 self.forward_metadata.kv_indices,
@@ -2486,6 +2721,8 @@ class AiterAttnBackend(AttentionBackend):
                 intra_batch_mode=intra_batch_mode,
                 num_kv_splits=num_kv_splits,
             )
+            if layer.tp_q_head_num == 8:
+                _o3.copy_(_o_in[:, :8, :])
         else:
             self.logits_soft_cap = layer.logit_cap
 
