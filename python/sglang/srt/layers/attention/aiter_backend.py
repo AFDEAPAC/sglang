@@ -42,6 +42,7 @@ try:
         paged_attention_ragged,
     )
     from aiter.mla import mla_decode_fwd, mla_prefill_fwd
+    from aiter.jit.utils.chip_info import get_gfx as _aiter_get_gfx
     from aiter.ops.triton.attention.unified_attention import unified_attention
 except ImportError:
     print(
@@ -188,6 +189,11 @@ class ForwardMetadata:
     max_extend_len: Optional[int] = None
     fp8_prefill_kv_indices: Optional[torch.Tensor] = None
     swa_page_table: Optional[torch.Tensor] = None
+    splitter_active: bool = False
+    splitter_qlen: int = 0
+    split_qo_indptr: Optional[torch.Tensor] = None
+    split_kv_indptr_a: Optional[torch.Tensor] = None
+    split_kv_indices_a: Optional[torch.Tensor] = None
 
 
 global_workspace_buffer = None
@@ -237,6 +243,11 @@ class AiterAttnBackend(AttentionBackend):
         if self.use_mla:
             # For MLA models, get v_head_dim from model config
             self.v_head_dim = model_runner.model_config.v_head_dim
+            # PR 2852 splitter: record aiter-MLA effective dims.
+            # aiter.mla_decode_fwd operates in kv_lora_rank output space.
+            _mc = model_runner.model_config
+            self._mla_qk_head_dim = _mc.kv_lora_rank + _mc.qk_rope_head_dim
+            self._mla_v_head_dim = _mc.kv_lora_rank
         elif hasattr(model_runner.token_to_kv_pool, "get_v_head_dim"):
             # For hybrid models (Mamba+attention, GDN, Kimi linear),
             # layer_id=0 may not be a full attention layer
@@ -344,13 +355,28 @@ class AiterAttnBackend(AttentionBackend):
             self._mla_pad_q_buf = None
             self._mla_pad_o_buf = None
 
+            # PR 2852: nh=8 bf16 on gfx942 has a native PS kernel
+            # (mla_dec_stage1_bf16_a16w16_subQ16_mqa16_ps).
+            # When active, we keep PS mode ON for nh=8 bf16 and dynamically
+            # build nh=8 metadata for qlen=2 via _resolve_mla_nhead().
+            self._nh8_native_ps = (
+                self.num_head == 8
+                and self.kv_cache_dtype is not fp8_dtype
+                and _aiter_get_gfx() == "gfx942"
+            )
+            if self._nh8_native_ps:
+                fast_mode = True
+                intra_batch_mode = False
+
             # current persist a16w16 mla_decode kernel does not support head_num = 128
             # need to fall back to non-persist
             # only use mla_ps_kernel when fp8 kv_cache
             # for non-fp8 kv_cache on tp8, use non-persist kernel to avoid performance degradation
             # head_num=16 (tp8 perf issue), head_num=128 (unsupported, like tp1 or --enable-dp-attention with tp8-dp8)
+            # Exclude nh=8 bf16 gfx942 from the fallback -- stays on PS for PR 2852 path.
             if (
-                self.num_head in (8, 16, 128)
+                self.num_head in (16, 128)
+                or (self.num_head == 8 and not self._nh8_native_ps)
             ) and self.kv_cache_dtype is not fp8_dtype:
                 _use_mla_ps_kernel = False
                 fast_mode = False
@@ -399,8 +425,208 @@ class AiterAttnBackend(AttentionBackend):
         q_padded[:, :8, :] = q
         return q_padded, o_padded
 
+    def _resolve_mla_nhead(self, max_seqlen_qo):
+        """Effective nhead for MLA metadata.
+
+        PR 2852 native kernel supports (gfx942, nh=8, bf16, qlen=2) without
+        padding. For any other max_seqlen_qo (including qlen=1 decode, qlen=4
+        verify with draft=4), we fall back to the nh-padded=16 path which
+        hands off to AITER's forced_head_pad internally.
+        """
+        if getattr(self, "_nh8_native_ps", False) and max_seqlen_qo == 2:
+            return 8
+        return self._mla_padded_nhead
+
+    def _populate_splitter_metadata(self, bs, seq_lens, req_pool_indices):
+        """Build qlen=2 sub-call A metadata (kv ends at seq+2).
+        Call B reuses main kv_indptr/kv_indices."""
+        split = 2
+        split_qo_indptr = self.cg_split_qo_indptr[: bs + 1]
+        split_qo_indptr[: bs + 1] = torch.arange(
+            0, (1 + bs) * split, step=split,
+            dtype=torch.int32, device=self.device,
+        )
+        kv_lens_a = seq_lens + split
+        split_kv_indptr_a = self.cg_split_kv_indptr_a[: bs + 1]
+        split_kv_indptr_a[0] = 0
+        split_kv_indptr_a[1 : bs + 1] = torch.cumsum(kv_lens_a, dim=0)
+        split_kv_indices_a = self.cg_split_kv_indices_a
+        create_flashinfer_kv_indices_triton[(bs,)](
+            self.req_to_token,
+            req_pool_indices,
+            kv_lens_a,
+            split_kv_indptr_a,
+            None,
+            split_kv_indices_a,
+            self.req_to_token.stride(0),
+        )
+        return split_qo_indptr, split_kv_indptr_a, split_kv_indices_a
+
+    def _run_mla_splitter(self, q, K_Buffer, o, layer, k_descale, intra_batch_mode):
+        """PR 2852 splitter dispatch.
+
+        qlen_total:
+          1 -> pad q[bs,1,nh,qhd] to [bs,2,nh,qhd] (dummy at pos 1), single
+               kernel call reusing main kv_indptr/kv_indices, return out[:,0].
+          3 -> pad qlen 3->4 (dummy at pos 3), split to 2 x qlen=2 (calls A,B).
+          4 -> 2 x qlen=2 split (calls A,B).
+        """
+        from aiter.mla import mla_decode_fwd
+        fm = self.forward_metadata
+        qlen_total = fm.splitter_qlen
+        assert qlen_total in (1, 3, 4), f"splitter expects qlen in {{1,3,4}}, got {qlen_total}"
+        bs = fm.split_qo_indptr.numel() - 1
+        nh = q.shape[1]
+        qhd = q.shape[2]
+        vhd = o.shape[2]
+
+        out_a = self.cg_split_out_a[: bs * 2]
+        num_kv_splits = fm.num_kv_splits
+
+        if qlen_total == 1:
+            # Pad q[bs,1,nh,qhd] -> qa[bs,2,nh,qhd] with [dummy, real].
+            # qlen=2 kernel causal aligns position 1 with last kv slot (= seq_len-1,
+            # i.e. own-token K/V); position 0 aligns with kv[seq_len-2] (misses
+            # last slot). Real q must go at position 1 for its window to cover
+            # kv[0..seq_len-1] including its own K/V.
+            qa = self.cg_split_qa[: bs * 2].view(bs, 2, nh, qhd)
+            qa[:, 0].zero_()
+            qa[:, 1].copy_(q.view(bs, nh, qhd))
+
+            # Rebuild metadata for qlen=2, reusing main kv_indptr/kv_indices
+            # (no split — real token at pos 0, dummy at pos 1 sees the same KV).
+            self.make_mla_meta_data(
+                fm.split_qo_indptr,
+                fm.kv_indptr,
+                fm.kv_last_page_len,
+                self.work_metadata, self.work_info_set, self.work_indptr,
+                self.reduce_indptr, self.reduce_final_map, self.reduce_partial_map,
+                2,
+                fast_mode=True,
+                max_split_per_batch=num_kv_splits,
+                intra_batch_mode=intra_batch_mode,
+            )
+            mla_decode_fwd(
+                self.cg_split_qa[: bs * 2],
+                K_Buffer.view(-1, 1, 1, layer.qk_head_dim),
+                out_a,
+                fm.split_qo_indptr,
+                fm.kv_indptr,
+                fm.kv_indices,
+                fm.kv_last_page_len,
+                2,
+                sm_scale=layer.scaling,
+                logit_cap=layer.logit_cap,
+                work_meta_data=self.work_metadata,
+                work_indptr=self.work_indptr,
+                work_info_set=self.work_info_set,
+                reduce_indptr=self.reduce_indptr,
+                reduce_final_map=self.reduce_final_map,
+                reduce_partial_map=self.reduce_partial_map,
+                q_scale=k_descale, kv_scale=k_descale,
+                intra_batch_mode=intra_batch_mode,
+                num_kv_splits=num_kv_splits,
+            )
+            o.view(bs, nh, vhd).copy_(out_a.view(bs, 2, nh, vhd)[:, 1])
+            return o
+
+        qa = self.cg_split_qa[: bs * 2].view(bs, 2, nh, qhd)
+        qb = self.cg_split_qb[: bs * 2].view(bs, 2, nh, qhd)
+        out_b = self.cg_split_out_b[: bs * 2]
+
+        q4 = q.view(bs, qlen_total, nh, qhd)
+        qa.copy_(q4[:, 0:2])
+        if qlen_total == 4:
+            qb.copy_(q4[:, 2:4])
+        else:  # qlen=3: [dummy=0, q[2]]
+            # cg_split_qb was initialized to 0; overwrite index 1 with real q[2].
+            qb[:, 0].zero_()
+            qb[:, 1].copy_(q4[:, 2])
+        # Populate + launch call A
+        self.make_mla_meta_data(
+            fm.split_qo_indptr,
+            fm.split_kv_indptr_a,
+            fm.kv_last_page_len,
+            self.work_metadata, self.work_info_set, self.work_indptr,
+            self.reduce_indptr, self.reduce_final_map, self.reduce_partial_map,
+            2,
+            fast_mode=True,
+            max_split_per_batch=num_kv_splits,
+            intra_batch_mode=intra_batch_mode,
+        )
+        mla_decode_fwd(
+            self.cg_split_qa[: bs * 2],
+            K_Buffer.view(-1, 1, 1, layer.qk_head_dim),
+            out_a,
+            fm.split_qo_indptr,
+            fm.split_kv_indptr_a,
+            fm.split_kv_indices_a,
+            fm.kv_last_page_len,
+            2,
+            sm_scale=layer.scaling,
+            logit_cap=layer.logit_cap,
+            work_meta_data=self.work_metadata,
+            work_indptr=self.work_indptr,
+            work_info_set=self.work_info_set,
+            reduce_indptr=self.reduce_indptr,
+            reduce_final_map=self.reduce_final_map,
+            reduce_partial_map=self.reduce_partial_map,
+            q_scale=k_descale, kv_scale=k_descale,
+            intra_batch_mode=intra_batch_mode,
+            num_kv_splits=num_kv_splits,
+        )
+
+        # Populate + launch call B (reuses main kv_indptr/kv_indices for full kv range).
+        self.make_mla_meta_data(
+            fm.split_qo_indptr,
+            fm.kv_indptr,
+            fm.kv_last_page_len,
+            self.work_metadata, self.work_info_set, self.work_indptr,
+            self.reduce_indptr, self.reduce_final_map, self.reduce_partial_map,
+            2,
+            fast_mode=True,
+            max_split_per_batch=num_kv_splits,
+            intra_batch_mode=intra_batch_mode,
+        )
+        mla_decode_fwd(
+            self.cg_split_qb[: bs * 2],
+            K_Buffer.view(-1, 1, 1, layer.qk_head_dim),
+            out_b,
+            fm.split_qo_indptr,
+            fm.kv_indptr,
+            fm.kv_indices,
+            fm.kv_last_page_len,
+            2,
+            sm_scale=layer.scaling,
+            logit_cap=layer.logit_cap,
+            work_meta_data=self.work_metadata,
+            work_indptr=self.work_indptr,
+            work_info_set=self.work_info_set,
+            reduce_indptr=self.reduce_indptr,
+            reduce_final_map=self.reduce_final_map,
+            reduce_partial_map=self.reduce_partial_map,
+            q_scale=k_descale, kv_scale=k_descale,
+            intra_batch_mode=intra_batch_mode,
+            num_kv_splits=num_kv_splits,
+        )
+
+        # Stitch outputs back into o.
+        o4 = o.view(bs, qlen_total, nh, vhd)
+        o4[:, 0:2].copy_(out_a.view(bs, 2, nh, vhd))
+        if qlen_total == 4:
+            o4[:, 2:4].copy_(out_b.view(bs, 2, nh, vhd))
+        else:  # qlen=3: discard dummy at position 0, keep real at position 1
+            o4[:, 2:3].copy_(out_b.view(bs, 2, nh, vhd)[:, 1:2])
+        return o
+
     def make_mla_decode_meta_data_buffer(self, max_seqlen_qo, batch_size):
-        nhead = self._mla_padded_nhead
+        # PR 2852 splitter: when _nh8_native_ps is on, ALL qlen traffic
+        # (1, 3, 4) is routed through the qlen=2 kernel via the splitter.
+        # Buffer must be sized for qlen=2 metadata.  qlen=2 itself (d=2)
+        # stays at max_seqlen_qo=2 naturally.
+        if getattr(self, "_nh8_native_ps", False):
+            max_seqlen_qo = 2
+        nhead = self._resolve_mla_nhead(max_seqlen_qo)
         dtype = self.kv_cache_dtype
 
         if self.enable_dp_attention:
@@ -483,11 +709,12 @@ class AiterAttnBackend(AttentionBackend):
         page_size = self.page_size
         dtype = self.kv_cache_dtype
 
+        effective_nhead = self._resolve_mla_nhead(max_q_len)
         meta = get_mla_metadata_v1(
             qo_indptr,
             kv_indptr,
             kv_last_page_len,
-            self._mla_padded_nhead // nhead_kv,
+            effective_nhead // nhead_kv,
             nhead_kv,
             False,
             work_metadata,
@@ -1321,6 +1548,58 @@ class AiterAttnBackend(AttentionBackend):
                 self.reduce_partial_map,
             ) = self.make_mla_decode_meta_data_buffer(max_seqlen_qo, max_bs)
 
+            # PR 2852 splitter scratch.
+            # Enabled whenever the nh=8 bf16 qlen=2 native kernel is usable.
+            # At per-step time, `splitter_active` narrows based on max_q_len:
+            #   qlen=1 pure decode  -> pad 1->2, single kernel call
+            #   qlen=2 target_verify -> native, no splitter needed
+            #   qlen=3               -> pad qlen 3->4, then 2 x qlen=2
+            #   qlen=4               -> 2 x qlen=2 split
+            self._splitter_enabled = bool(
+                getattr(self, "_nh8_native_ps", False)
+            )
+            if self._splitter_enabled:
+                max_num_blocks_per_seq = (
+                    self.max_context_len + self.page_size - 1
+                ) // self.page_size
+                self.cg_split_kv_indices_a = torch.zeros(
+                    max_bs * max_num_blocks_per_seq,
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+                self.cg_split_kv_indptr_a = torch.zeros(
+                    max_bs + 1, dtype=torch.int32, device=self.device
+                )
+                self.cg_split_qo_indptr = torch.zeros(
+                    max_bs + 1, dtype=torch.int32, device=self.device
+                )
+                qhd = self._mla_qk_head_dim
+                vhd = self._mla_v_head_dim
+                self.cg_split_qa = torch.zeros(
+                    max_bs * 2, self.num_head, qhd,
+                    dtype=torch.bfloat16, device=self.device,
+                )
+                self.cg_split_qb = torch.zeros(
+                    max_bs * 2, self.num_head, qhd,
+                    dtype=torch.bfloat16, device=self.device,
+                )
+                self.cg_split_out_a = torch.zeros(
+                    max_bs * 2, self.num_head, vhd,
+                    dtype=torch.bfloat16, device=self.device,
+                )
+                self.cg_split_out_b = torch.zeros(
+                    max_bs * 2, self.num_head, vhd,
+                    dtype=torch.bfloat16, device=self.device,
+                )
+            else:
+                self.cg_split_kv_indices_a = None
+                self.cg_split_kv_indptr_a = None
+                self.cg_split_qo_indptr = None
+                self.cg_split_qa = None
+                self.cg_split_qb = None
+                self.cg_split_out_a = None
+                self.cg_split_out_b = None
+
         else:
             self.work_metadata = None
             self.work_indptr = None
@@ -1466,6 +1745,24 @@ class AiterAttnBackend(AttentionBackend):
                     reduce_final_map = self.reduce_final_map
                     reduce_partial_map = self.reduce_partial_map
 
+            # PR 2852 splitter for pure-decode (qlen=1) pre-pads 1->2 and
+            # uses the nh=8 qlen=2 native kernel.  Populate split_qo_indptr
+            # so forward_decode can emit the qlen=2 call under CUDA graph.
+            splitter_active = bool(
+                getattr(self, "_splitter_enabled", False)
+                and _use_mla_ps_kernel
+                and max_q_len == 1
+                and self.use_mla
+                # qlen=1 -> qlen=2 pad: real at position 1, dummy at position 0
+            )
+            split_qo_indptr = None
+            if splitter_active:
+                split_qo_indptr = self.cg_split_qo_indptr[: bs + 1]
+                split_qo_indptr[: bs + 1] = torch.arange(
+                    0, (1 + bs) * 2, step=2,
+                    dtype=torch.int32, device=self.device,
+                )
+
             self.forward_metadata = ForwardMetadata(
                 kv_indptr,
                 kv_indices,
@@ -1481,6 +1778,9 @@ class AiterAttnBackend(AttentionBackend):
                 reduce_partial_map=reduce_partial_map,
                 num_kv_splits=num_kv_splits,
                 swa_page_table=swa_page_table,
+                splitter_active=splitter_active,
+                splitter_qlen=1 if splitter_active else 0,
+                split_qo_indptr=split_qo_indptr,
             )
 
         elif forward_mode.is_target_verify():
@@ -1540,6 +1840,23 @@ class AiterAttnBackend(AttentionBackend):
                     reduce_final_map = self.reduce_final_map
                     reduce_partial_map = self.reduce_partial_map
 
+                splitter_active = bool(
+                    getattr(self, "_splitter_enabled", False)
+                    and _use_mla_ps_kernel
+                    and max_q_len in (1, 3, 4)
+                )
+                split_qo_indptr = None
+                split_kv_indptr_a = None
+                split_kv_indices_a = None
+                if splitter_active:
+                    (
+                        split_qo_indptr,
+                        split_kv_indptr_a,
+                        split_kv_indices_a,
+                    ) = self._populate_splitter_metadata(
+                        bs, seq_lens, req_pool_indices
+                    )
+
                 self.forward_metadata = ForwardMetadata(
                     kv_indptr,
                     kv_indices,
@@ -1554,6 +1871,11 @@ class AiterAttnBackend(AttentionBackend):
                     reduce_final_map=reduce_final_map,
                     reduce_partial_map=reduce_partial_map,
                     num_kv_splits=num_kv_splits,
+                    splitter_active=splitter_active,
+                    splitter_qlen=max_q_len if splitter_active else 0,
+                    split_qo_indptr=split_qo_indptr,
+                    split_kv_indptr_a=split_kv_indptr_a,
+                    split_kv_indices_a=split_kv_indices_a,
                 )
             else:
                 custom_mask = self.cuda_graph_custom_mask
@@ -1848,6 +2170,24 @@ class AiterAttnBackend(AttentionBackend):
                     reduce_final_map = self.reduce_final_map
                     reduce_partial_map = self.reduce_partial_map
 
+            # PR 2852 splitter for pure-decode (qlen=1): mirror of the capture
+            # branch.  Populate split_qo_indptr so forward_decode can replay
+            # the qlen=2 kernel call under CUDA graph.
+            splitter_active = bool(
+                getattr(self, "_splitter_enabled", False)
+                and _use_mla_ps_kernel
+                and max_q_len == 1
+                and self.use_mla
+                # qlen=1 -> qlen=2 pad: real at position 1, dummy at position 0
+            )
+            split_qo_indptr = None
+            if splitter_active:
+                split_qo_indptr = self.cg_split_qo_indptr[: bs + 1]
+                split_qo_indptr[: bs + 1] = torch.arange(
+                    0, (1 + bs) * 2, step=2,
+                    dtype=torch.int32, device=self.device,
+                )
+
             self.forward_metadata = ForwardMetadata(
                 kv_indptr,
                 kv_indices,
@@ -1863,6 +2203,9 @@ class AiterAttnBackend(AttentionBackend):
                 reduce_partial_map=reduce_partial_map,
                 num_kv_splits=num_kv_splits,
                 swa_page_table=swa_page_table,
+                splitter_active=splitter_active,
+                splitter_qlen=1 if splitter_active else 0,
+                split_qo_indptr=split_qo_indptr,
                 # num_kv_splits_indptr=num_kv_splits_indptr,
             )
 
@@ -1924,6 +2267,23 @@ class AiterAttnBackend(AttentionBackend):
                     reduce_final_map = self.reduce_final_map
                     reduce_partial_map = self.reduce_partial_map
 
+                splitter_active = bool(
+                    getattr(self, "_splitter_enabled", False)
+                    and _use_mla_ps_kernel
+                    and max_q_len in (1, 3, 4)
+                )
+                split_qo_indptr = None
+                split_kv_indptr_a = None
+                split_kv_indices_a = None
+                if splitter_active:
+                    (
+                        split_qo_indptr,
+                        split_kv_indptr_a,
+                        split_kv_indices_a,
+                    ) = self._populate_splitter_metadata(
+                        bs, seq_lens, req_pool_indices
+                    )
+
                 self.forward_metadata = ForwardMetadata(
                     kv_indptr,
                     kv_indices,
@@ -1938,6 +2298,11 @@ class AiterAttnBackend(AttentionBackend):
                     reduce_final_map=reduce_final_map,
                     reduce_partial_map=reduce_partial_map,
                     num_kv_splits=num_kv_splits,
+                    splitter_active=splitter_active,
+                    splitter_qlen=max_q_len if splitter_active else 0,
+                    split_qo_indptr=split_qo_indptr,
+                    split_kv_indptr_a=split_kv_indptr_a,
+                    split_kv_indices_a=split_kv_indices_a,
                 )
             else:
                 custom_mask = self.cuda_graph_custom_mask
@@ -2350,6 +2715,11 @@ class AiterAttnBackend(AttentionBackend):
                     dtype=self.input_dtype,
                 )
 
+                if getattr(self.forward_metadata, "splitter_active", False):
+                    return self._run_mla_splitter(
+                        q, K_Buffer, o, layer, k_descale, intra_batch_mode
+                    )
+
                 work_metadata = self.forward_metadata.work_metadata
                 work_indptr = self.forward_metadata.work_indptr
                 work_info_set = self.forward_metadata.work_info_set
@@ -2360,7 +2730,12 @@ class AiterAttnBackend(AttentionBackend):
 
                 num_kv_splits = self.forward_metadata.num_kv_splits
 
-                if layer.tp_q_head_num == 8:
+                _use_native_nh8_q2 = (
+                    getattr(self, "_nh8_native_ps", False)
+                    and self.forward_metadata.max_q_len == 2
+                    and layer.tp_q_head_num == 8
+                )
+                if layer.tp_q_head_num == 8 and not _use_native_nh8_q2:
                     q_in, o_in = self._pad_mla_q_8_to_16(
                         q, q.shape[0], layer.qk_head_dim, layer.v_head_dim
                     )
@@ -2389,8 +2764,10 @@ class AiterAttnBackend(AttentionBackend):
                     intra_batch_mode=intra_batch_mode,
                     num_kv_splits=num_kv_splits,
                 )
-                if layer.tp_q_head_num == 8:
+                if layer.tp_q_head_num == 8 and not _use_native_nh8_q2:
                     o.copy_(o_in[:, :8, :])
+                elif _use_native_nh8_q2:
+                    o = o_in
                 return o
             elif (
                 forward_batch.forward_mode.is_draft_extend()
@@ -2464,7 +2841,12 @@ class AiterAttnBackend(AttentionBackend):
                         ),
                         dtype=self.input_dtype,
                     )
-                    if layer.tp_q_head_num == 8:
+                    _use_native_nh8_q2 = (
+                        getattr(self, "_nh8_native_ps", False)
+                        and self.forward_metadata.max_q_len == 2
+                        and layer.tp_q_head_num == 8
+                    )
+                    if layer.tp_q_head_num == 8 and not _use_native_nh8_q2:
                         q_in, o_in = self._pad_mla_q_8_to_16(
                             q_pad_v, q_pad_v.shape[0], layer.qk_head_dim, layer.v_head_dim
                         )
@@ -2492,8 +2874,10 @@ class AiterAttnBackend(AttentionBackend):
                         intra_batch_mode=intra_batch_mode,
                         num_kv_splits=num_kv_splits,
                     )
-                    if layer.tp_q_head_num == 8:
+                    if layer.tp_q_head_num == 8 and not _use_native_nh8_q2:
                         o.copy_(o_in[:, :8, :])
+                    elif _use_native_nh8_q2:
+                        o = o_in
 
                     # q shape[0] equals qo_indptr[-1]; skip GPU->CPU sync.
                     total_valid_q = q.shape[0]
@@ -2504,7 +2888,12 @@ class AiterAttnBackend(AttentionBackend):
                         dtype=self.input_dtype,
                     )
 
-                    if layer.tp_q_head_num == 8:
+                    _use_native_nh8_q2 = (
+                        getattr(self, "_nh8_native_ps", False)
+                        and self.forward_metadata.max_q_len == 2
+                        and layer.tp_q_head_num == 8
+                    )
+                    if layer.tp_q_head_num == 8 and not _use_native_nh8_q2:
                         q_in, o_in = self._pad_mla_q_8_to_16(
                             q, q.shape[0], layer.qk_head_dim, layer.v_head_dim
                         )
@@ -2693,6 +3082,14 @@ class AiterAttnBackend(AttentionBackend):
 
             _q3 = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
             _o3 = o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+
+            # PR 2852 splitter intercept: route qlen=1 pure decode through
+            # the nh=8 qlen=2 native kernel (pad 1->2, dummy at pos 1).
+            if getattr(self.forward_metadata, "splitter_active", False):
+                return self._run_mla_splitter(
+                    _q3, k_buffer, _o3, layer, k_descale, intra_batch_mode
+                )
+
             if layer.tp_q_head_num == 8:
                 _q_in, _o_in = self._pad_mla_q_8_to_16(
                     _q3, _q3.shape[0], layer.qk_head_dim, layer.v_head_dim
