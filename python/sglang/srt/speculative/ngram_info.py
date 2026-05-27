@@ -45,6 +45,11 @@ if is_cuda():
     )
 elif is_hip():
     from sgl_kernel import verify_tree_greedy
+    from sglang.srt.speculative.sampling_torch_fallback import (
+        top_k_renorm_prob,
+        top_p_renorm_prob,
+        tree_speculative_sampling_target_only,
+    )
 
 
 @dataclass

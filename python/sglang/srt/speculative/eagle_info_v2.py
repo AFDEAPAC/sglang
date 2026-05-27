@@ -48,6 +48,13 @@ if is_cuda():
         top_p_renorm_prob,
         tree_speculative_sampling_target_only,
     )
+elif is_hip():
+    from sglang.srt.speculative.sampling_torch_fallback import (
+        fused_topk_topp_renorm,
+        top_k_renorm_prob,
+        top_p_renorm_prob,
+        tree_speculative_sampling_target_only,
+    )
 
 
 @triton.jit
@@ -320,18 +327,32 @@ class EagleVerifyInputV2Mixin:
             target_probs = F.softmax(
                 next_token_logits / expanded_temperature, dim=-1
             )  # (bs * num_draft_tokens, vocab_size)
-            target_probs = top_k_renorm_prob(
-                target_probs,
-                torch.repeat_interleave(
+            if _is_hip:
+                expanded_top_ks = torch.repeat_interleave(
                     sampling_info.top_ks, self.draft_token_num, dim=0
-                ),
-            )  # (bs * num_draft_tokens, vocab_size)
-            target_probs = top_p_renorm_prob(
-                target_probs,
-                torch.repeat_interleave(
-                    sampling_info.top_ps, self.draft_token_num, dim=0
-                ),
-            )
+                )
+                if sampling_info.need_top_p_sampling:
+                    expanded_top_ps = torch.repeat_interleave(
+                        sampling_info.top_ps, self.draft_token_num, dim=0
+                    )
+                    target_probs = fused_topk_topp_renorm(
+                        target_probs, expanded_top_ks, expanded_top_ps, need_top_p=True
+                    )
+                else:
+                    target_probs = top_k_renorm_prob(target_probs, expanded_top_ks)
+            else:
+                target_probs = top_k_renorm_prob(
+                    target_probs,
+                    torch.repeat_interleave(
+                        sampling_info.top_ks, self.draft_token_num, dim=0
+                    ),
+                )  # (bs * num_draft_tokens, vocab_size)
+                target_probs = top_p_renorm_prob(
+                    target_probs,
+                    torch.repeat_interleave(
+                        sampling_info.top_ps, self.draft_token_num, dim=0
+                    ),
+                )
             target_probs = target_probs.reshape(bs, self.draft_token_num, -1)
             draft_probs = torch.zeros_like(target_probs)
 

@@ -1920,10 +1920,10 @@ class ServerArgs:
             )
             self.page_size = 128
 
-        # AMD platforms backends
-        if self.attention_backend == "aiter":
-            if model_config.context_len > 8192:
-                self.mem_fraction_static *= 0.85
+        # AMD platforms backends - skip aiter 0.85 reduction (new aiter main needs full allocation)
+        # if self.attention_backend == "aiter":
+        #     if model_config.context_len > 8192:
+        #         self.mem_fraction_static *= 0.85
 
         # Other platforms backends
         if (
