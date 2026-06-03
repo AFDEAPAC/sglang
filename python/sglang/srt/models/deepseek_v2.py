@@ -1698,9 +1698,11 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
                     )
 
                 else:
+                    # w_kc is pre-folded to bf16 with w_scale applied at load time
+                    # (see post_load_weights), so the per-step cast/scale is elided.
                     q_nope_out = torch.bmm(
                         q_nope.to(torch.bfloat16).transpose(0, 1),
-                        self.w_kc.to(torch.bfloat16) * self.w_scale,
+                        self.w_kc,
                     )
 
         elif self.w_kc.dtype == torch.float8_e4m3fn:
@@ -1874,9 +1876,11 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
                         dtype=torch.bfloat16,
                     )
                 else:
+                    # w_vc is pre-folded to bf16 with w_scale applied at load time
+                    # (see post_load_weights), so the per-step cast/scale is elided.
                     attn_bmm_output = torch.bmm(
                         attn_output.to(torch.bfloat16).transpose(0, 1),
-                        self.w_vc.to(torch.bfloat16) * self.w_scale,
+                        self.w_vc,
                     )
 
             if self.o_proj.weight.dtype == torch.uint8:

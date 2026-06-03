@@ -35,6 +35,18 @@ if TYPE_CHECKING:
 
 _is_fp8_fnuz = is_fp8_fnuz()
 
+# AVO patch: route per-channel (PTPC) W8A8-FP8 MoE to the aiter asm fused_moe
+# (per_Token) instead of the Triton runner. MoE must run on aiter (user directive).
+import os as _avo_os
+
+try:
+    from sglang.srt.utils import is_hip as _avo_is_hip_fn
+
+    _avo_is_hip = bool(_avo_is_hip_fn())
+except Exception:
+    _avo_is_hip = False
+_use_aiter = (_avo_os.environ.get("SGLANG_USE_AITER", "0") == "1") and _avo_is_hip
+
 
 class W8A8Fp8Config(QuantizationConfig):
     """Config class for W8A8 FP8 Quantization.
@@ -117,7 +129,18 @@ class W8A8Fp8LinearMethod(LinearMethodBase):
                     weight=weight, weight_scale=weight_scale
                 )
 
-            layer.weight = Parameter(weight.t(), requires_grad=False)
+            if _use_aiter:
+                # AVO: mirror Fp8LinearMethod exactly. Weight is [N,K]; shuffle in
+                # [N,K] orientation (shuffle_weight needs N%16,K%32), THEN .t() -> [K,N]
+                # so apply_fp8_linear's WQ=weight.T == shuffled [N,K] that
+                # gemm_a8w8_bpreshuffle expects. (Earlier bug: missing .t() made the
+                # output dim K=6144 instead of N -> MLA split mismatch.)
+                from aiter.ops.shuffle import shuffle_weight
+
+                weight = shuffle_weight(weight.contiguous(), (16, 16))
+                layer.weight = Parameter(weight.t(), requires_grad=False)
+            else:
+                layer.weight = Parameter(weight.t(), requires_grad=False)
             layer.weight_scale = Parameter(weight_scale, requires_grad=False)
         else:
             # If checkpoint not offline quantized, quantize the weights with per-channel quantization.
@@ -191,6 +214,7 @@ class W8A8Fp8LinearMethod(LinearMethodBase):
             layer.weight_scale,
             bias=bias,
             cutlass_fp8_supported=self.cutlass_fp8_supported,
+            use_per_token_if_dynamic=_use_aiter,  # AVO: aiter rowwise, avoid OOM fallback
         )
 
 
@@ -225,7 +249,7 @@ class W8A8FP8MoEMethod(FusedMoEMethodBase):
                 num_experts,
                 2 * intermediate_size_per_partition,
                 hidden_size,
-                dtype=fp8_dtype,
+                dtype=torch.float8_e4m3fn,  # AVO: match e4m3fn checkpoint; normalize->fnuz in process_weights
             ),
             requires_grad=False,
         )
@@ -237,7 +261,7 @@ class W8A8FP8MoEMethod(FusedMoEMethodBase):
                 num_experts,
                 hidden_size,
                 intermediate_size_per_partition,
-                dtype=fp8_dtype,
+                dtype=torch.float8_e4m3fn,  # AVO: match e4m3fn checkpoint; normalize->fnuz in process_weights
             ),
             requires_grad=False,
         )
@@ -279,6 +303,29 @@ class W8A8FP8MoEMethod(FusedMoEMethodBase):
         layer.w2_weight_scale = Parameter(
             layer.w2_weight_scale.data, requires_grad=False
         )
+        # AVO: prep expert weights for aiter asm fused_moe. Checkpoint is e4m3fn;
+        # gfx942 aiter MFMA needs e4m3fnuz -> normalize (adjusts per-channel scale),
+        # then pre-shuffle (mirrors the regular Fp8MoEMethod _use_aiter path).
+        if _use_aiter:
+            from aiter.ops.shuffle import shuffle_weight
+
+            w13w, w13s = layer.w13_weight.data, layer.w13_weight_scale.data
+            w2w, w2s = layer.w2_weight.data, layer.w2_weight_scale.data
+            if _is_fp8_fnuz:
+                w13w, w13s, _ = normalize_e4m3fn_to_e4m3fnuz(
+                    weight=w13w, weight_scale=w13s
+                )
+                w2w, w2s, _ = normalize_e4m3fn_to_e4m3fnuz(
+                    weight=w2w, weight_scale=w2s
+                )
+            layer.w13_weight = Parameter(
+                shuffle_weight(w13w.contiguous(), (16, 16)), requires_grad=False
+            )
+            layer.w2_weight = Parameter(
+                shuffle_weight(w2w.contiguous(), (16, 16)), requires_grad=False
+            )
+            layer.w13_weight_scale = Parameter(w13s, requires_grad=False)
+            layer.w2_weight_scale = Parameter(w2s, requires_grad=False)
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
@@ -291,6 +338,31 @@ class W8A8FP8MoEMethod(FusedMoEMethodBase):
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
+
+        # AVO: per-channel (PTPC) MoE on aiter asm fused_moe (per_Token), not Triton.
+        if _use_aiter:
+            from aiter import ActivationType, QuantType
+            from aiter.fused_moe import fused_moe
+
+            from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+
+            x = dispatch_output.hidden_states
+            topk_weights, topk_ids, _ = dispatch_output.topk_output
+            act = getattr(self.moe_runner_config, "activation", "silu")
+            output = fused_moe(
+                x,
+                layer.w13_weight,
+                layer.w2_weight,
+                topk_weights,
+                topk_ids,
+                quant_type=QuantType.per_Token,
+                w1_scale=layer.w13_weight_scale,
+                w2_scale=layer.w2_weight_scale,
+                activation=(
+                    ActivationType.Silu if act == "silu" else ActivationType.Gelu
+                ),
+            )
+            return StandardCombineInput(hidden_states=output)
 
         quant_info = TritonMoeQuantInfo(
             w13_weight=layer.w13_weight,

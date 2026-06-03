@@ -591,6 +591,24 @@ class DeepseekV2WeightLoaderMixin:
                     self_attn.w_vc = (
                         self_attn.w_vc.to(torch.bfloat16) * self_attn.w_scale
                     )
+                # On HIP (non-gfx95), the MLA absorb bmm runs
+                # `w_kc.to(bf16) * w_scale` every decode step. w_kc/w_vc/w_scale are
+                # constant after load, so hoist this loop-invariant fp8->bf16 cast and
+                # per-tensor scale to load time (folding w_scale into the weight).
+                elif (
+                    _is_hip
+                    and not _use_aiter_gfx95
+                    and self_attn.w_kc is not None
+                    and self_attn.w_kc.dtype
+                    in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+                ):
+                    self_attn.w_kc = (
+                        self_attn.w_kc.to(torch.bfloat16) * self_attn.w_scale
+                    )
+                    self_attn.w_vc = (
+                        self_attn.w_vc.to(torch.bfloat16) * self_attn.w_scale
+                    )
+                    self_attn.w_scale = 1.0
             else:
                 num_tiles_k = self_attn.qk_nope_head_dim // weight_block_size[1]
                 num_tiles_n = self_attn.v_head_dim // weight_block_size[0]

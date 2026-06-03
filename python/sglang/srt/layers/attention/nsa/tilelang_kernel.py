@@ -1048,16 +1048,16 @@ def tilelang_sparse_fwd(
             kernel = sparse_attention_fwd_kernel_v1(
                 num_heads, d_v, tail_dim, topk, sm_scale=sm_scale, num_stages=1
             )
-        else:  # reduce LDS usage on gfx942 target
+        else:  # tuned gfx942 candidate: larger top-k tile and more threads
             kernel = sparse_attention_fwd_kernel_v1(
                 num_heads,
                 d_v,
                 tail_dim,
                 topk,
                 sm_scale=sm_scale,
-                block_I=32,
+                block_I=64,
                 num_stages=1,
-                threads=128,
+                threads=256,
             )
     else:
         kernel = sparse_attention_fwd_kernel_v2(
