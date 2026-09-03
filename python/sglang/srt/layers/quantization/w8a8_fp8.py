@@ -25,7 +25,12 @@ from sglang.srt.layers.quantization.fp8_utils import (
     input_to_float8,
     normalize_e4m3fn_to_e4m3fnuz,
 )
-from sglang.srt.utils import set_weight_attrs
+from sglang.srt.layers.quantization.unquant import (
+    UnquantizedFusedMoEMethod,
+    UnquantizedLinearMethod,
+)
+from sglang.srt.layers.quantization.utils import is_layer_skipped
+from sglang.srt.utils import get_bool_env_var, is_hip, set_weight_attrs
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -34,6 +39,10 @@ if TYPE_CHECKING:
     )
 
 _is_fp8_fnuz = is_fp8_fnuz()
+# Route per-channel (PTPC) MoE through the aiter asm fused_moe(per_Token) on fnuz
+# HIP (gfx942). The upstream Triton per-channel fnuz MoE path produces corrupted
+# output on gfx942, so the checkpoint decodes to garbage without this.
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 
 
 class W8A8Fp8Config(QuantizationConfig):
@@ -55,8 +64,17 @@ class W8A8Fp8Config(QuantizationConfig):
     - If CUTLASS is not supported: Falls back to per-tensor weight quantization
     """
 
-    def __init__(self, is_checkpoint_fp8_serialized: bool = False):
+    def __init__(
+        self,
+        is_checkpoint_fp8_serialized: bool = False,
+        ignored_layers: Optional[List[str]] = None,
+        packed_modules_mapping: Optional[Dict[str, List[str]]] = None,
+    ):
+        super().__init__()
         self.is_checkpoint_fp8_serialized = is_checkpoint_fp8_serialized
+        self.ignored_layers = ignored_layers or []
+        if packed_modules_mapping:
+            self.packed_modules_mapping = packed_modules_mapping
 
     @classmethod
     def get_supported_act_dtypes(cls) -> List[torch.dtype]:
@@ -80,7 +98,25 @@ class W8A8Fp8Config(QuantizationConfig):
         is_checkpoint_fp8_serialized = (
             "compressed-tensors" in quant_method or "w8a8_fp8" in quant_method
         )
-        return cls(is_checkpoint_fp8_serialized=is_checkpoint_fp8_serialized)
+        packed_modules_mapping = (
+            cls.get_from_keys_or(config, ["packed_modules_mapping"], {}) or {}
+        )
+        ignored_layers = cls.get_from_keys_or(
+            config, ["ignored_layers", "modules_to_not_convert"], None
+        )
+        if ignored_layers:
+            # Keep both "model." and non-"model." variants for robust prefix matching.
+            normalized = []
+            for layer in ignored_layers:
+                base = layer.removeprefix("model.")
+                normalized.append(base)
+                normalized.append(f"model.{base}")
+            ignored_layers = normalized
+        return cls(
+            is_checkpoint_fp8_serialized=is_checkpoint_fp8_serialized,
+            ignored_layers=ignored_layers,
+            packed_modules_mapping=packed_modules_mapping,
+        )
 
     def get_quant_method(
         self,
@@ -91,8 +127,18 @@ class W8A8Fp8Config(QuantizationConfig):
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 
         if isinstance(layer, LinearBase):
+            if is_layer_skipped(
+                prefix, self.ignored_layers, fused_mapping=self.packed_modules_mapping
+            ):
+                return UnquantizedLinearMethod()
             return W8A8Fp8LinearMethod(self)
         elif isinstance(layer, FusedMoE):
+            if is_layer_skipped(
+                prefix, self.ignored_layers, fused_mapping=self.packed_modules_mapping
+            ):
+                return UnquantizedFusedMoEMethod(
+                    layer.use_triton_kernels, layer.use_flashinfer_trtllm_moe
+                )
             return W8A8FP8MoEMethod(self)
         return None
 
@@ -218,13 +264,22 @@ class W8A8FP8MoEMethod(FusedMoEMethodBase):
     ):
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 
+        # Offline-quantized checkpoints store e4m3fn bytes. On fnuz hardware they
+        # must be loaded as e4m3fn and converted in process_weights_after_loading,
+        # otherwise the bits are reinterpreted under a different exponent bias.
+        weight_dtype = (
+            torch.float8_e4m3fn
+            if self.quant_config.is_checkpoint_fp8_serialized
+            else fp8_dtype
+        )
+
         # WEIGHTS
         w13_weight = torch.nn.Parameter(
             torch.empty(
                 num_experts,
                 2 * intermediate_size_per_partition,
                 hidden_size,
-                dtype=fp8_dtype,
+                dtype=weight_dtype,
             ),
             requires_grad=False,
         )
@@ -236,7 +291,7 @@ class W8A8FP8MoEMethod(FusedMoEMethodBase):
                 num_experts,
                 hidden_size,
                 intermediate_size_per_partition,
-                dtype=fp8_dtype,
+                dtype=weight_dtype,
             ),
             requires_grad=False,
         )
@@ -270,20 +325,55 @@ class W8A8FP8MoEMethod(FusedMoEMethodBase):
         layer.register_parameter("w2_input_scale", w2_input_scale)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        layer.w13_weight = Parameter(layer.w13_weight, requires_grad=False)
-        layer.w2_weight = Parameter(layer.w2_weight, requires_grad=False)
-        layer.w13_weight_scale = Parameter(
-            layer.w13_weight_scale.data, requires_grad=False
-        )
-        layer.w2_weight_scale = Parameter(
-            layer.w2_weight_scale.data, requires_grad=False
-        )
+        w13_weight = layer.w13_weight
+        w2_weight = layer.w2_weight
+        w13_weight_scale = layer.w13_weight_scale.data
+        w2_weight_scale = layer.w2_weight_scale.data
+
+        # If ROCm, normalize the weights and scales to e4m3fnuz
+        if _is_fp8_fnuz and self.quant_config.is_checkpoint_fp8_serialized:
+            w13_weight, w13_weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
+                weight=w13_weight,
+                weight_scale=w13_weight_scale,
+                input_scale=None,
+            )
+            w2_weight, w2_weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
+                weight=w2_weight,
+                weight_scale=w2_weight_scale,
+                input_scale=None,
+            )
+            layer.w13_input_scale = None
+            layer.w2_input_scale = None
+
+        layer.w13_weight = Parameter(w13_weight, requires_grad=False)
+        layer.w2_weight = Parameter(w2_weight, requires_grad=False)
+        layer.w13_weight_scale = Parameter(w13_weight_scale, requires_grad=False)
+        layer.w2_weight_scale = Parameter(w2_weight_scale, requires_grad=False)
+
+        if _use_aiter:
+            # aiter asm fused_moe expects MFMA-shuffled expert weights.
+            from aiter.ops.shuffle import shuffle_weight
+
+            layer.w13_weight = Parameter(
+                shuffle_weight(layer.w13_weight.data.contiguous(), (16, 16)),
+                requires_grad=False,
+            )
+            layer.w2_weight = Parameter(
+                shuffle_weight(layer.w2_weight.data.contiguous(), (16, 16)),
+                requires_grad=False,
+            )
+            # Parameter() does not carry over the is_shuffled attribute that
+            # shuffle_weight sets, and aiter reads it off the tensor to pick the
+            # preshuffled kernel path.
+            layer.w13_weight.is_shuffled = True
+            layer.w2_weight.is_shuffled = True
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
-        self.runner = MoeRunner(MoeRunnerBackend.TRITON, moe_runner_config)
+        backend = MoeRunnerBackend.AITER if _use_aiter else MoeRunnerBackend.TRITON
+        self.runner = MoeRunner(backend, moe_runner_config)
 
     def get_triton_quant_info(self, layer: torch.nn.Module) -> TritonMoeQuantInfo:
         return TritonMoeQuantInfo(
@@ -302,6 +392,21 @@ class W8A8FP8MoEMethod(FusedMoEMethodBase):
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
+
+        if _use_aiter:
+            from sglang.srt.layers.moe.moe_runner.aiter import (
+                AiterMoeQuantInfo,
+                AiterQuantType,
+            )
+
+            quant_info = AiterMoeQuantInfo(
+                w13_weight=layer.w13_weight,
+                w2_weight=layer.w2_weight,
+                quant_type=AiterQuantType.PER_TOKEN,
+                w13_scale=layer.w13_weight_scale,
+                w2_scale=layer.w2_weight_scale,
+            )
+            return self.runner.run(dispatch_output, quant_info)
 
         quant_info = self.get_triton_quant_info(layer)
         return self.runner.run(dispatch_output, quant_info)

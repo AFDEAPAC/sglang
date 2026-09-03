@@ -787,6 +787,12 @@ class DeepseekV2MoE(nn.Module):
                 and shared_gate_up_weight.dtype == torch.float8_e4m3fn
             )
             if self.shared_experts_is_fp8 and not _is_npu:
+                gate_up_quant_config = getattr(
+                    self.shared_experts.gate_up_proj.quant_method, "quant_config", None
+                )
+                down_quant_config = getattr(
+                    self.shared_experts.down_proj.quant_method, "quant_config", None
+                )
                 if (
                     _use_aiter
                     and config.quantization_config.get("quant_method")
@@ -794,12 +800,20 @@ class DeepseekV2MoE(nn.Module):
                 ):
                     # For compressed-tensors ptpc model, don't need to check the weight_block_size
                     pass
+                elif gate_up_quant_config is None or down_quant_config is None:
+                    # Per-channel fp8 checkpoints (w8a8_fp8 PTPC) are served by
+                    # W8A8Fp8LinearMethod, which exposes no quant_config and has no
+                    # weight_block_size to reconcile. Leaving the block size unset
+                    # makes the block-128 shared-expert fast paths decline themselves.
+                    pass
                 else:
                     assert (
-                        self.shared_experts.gate_up_proj.quant_method.quant_config.weight_block_size
-                        == self.shared_experts.down_proj.quant_method.quant_config.weight_block_size
+                        gate_up_quant_config.weight_block_size
+                        == down_quant_config.weight_block_size
                     )
-                    self.shared_experts_weight_block_size = self.shared_experts.gate_up_proj.quant_method.quant_config.weight_block_size
+                    self.shared_experts_weight_block_size = (
+                        gate_up_quant_config.weight_block_size
+                    )
 
         self.top_k = config.num_experts_per_tok
 
