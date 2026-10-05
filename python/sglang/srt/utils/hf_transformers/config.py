@@ -284,8 +284,15 @@ class HfModelConfigParser(ModelConfigParserBase):
             from sglang.srt.configs.mamba2 import Mamba2Config
 
             if not isinstance(config, (Mamba2Config, MambaConfig, FalconMambaConfig)):
+                reload_kwargs = {}
+                if kwargs.get("_configuration_file") is not None:
+                    # Preserve decrypted draft config overrides across the
+                    # registered model-type reload used by DeepSeek V4 DSpark.
+                    reload_kwargs["_configuration_file"] = kwargs[
+                        "_configuration_file"
+                    ]
                 config = _CONFIG_REGISTRY[model_type].from_pretrained(
-                    model, revision=revision
+                    model, revision=revision, **reload_kwargs
                 )
 
             # Re-check after reloading config from registry
