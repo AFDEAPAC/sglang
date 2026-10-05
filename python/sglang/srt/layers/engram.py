@@ -60,9 +60,11 @@ _is_hip = is_hip()
 
 
 def _cuda_kernels(t: torch.Tensor) -> bool:
-    """True where the Triton kernels apply (CUDA and gfx950); other ROCm GPUs and CPU
-    take the torch paths."""
-    return t.is_cuda and (is_cuda() or is_gfx95_supported())
+    """True where the Triton Engram kernels are enabled."""
+    gfx942_enabled = (
+        _is_hip and os.environ.get("SGLANG_GFX942_ENGRAM_KERNELS", "0") == "1"
+    )
+    return t.is_cuda and (is_cuda() or is_gfx95_supported() or gfx942_enabled)
 
 
 def _is_prime(n: int) -> bool:
@@ -313,13 +315,7 @@ class EngramHasher(nn.Module):
             )
             lens = forward_batch.extend_seq_lens.to(torch.int64)
             starts = forward_batch.extend_start_loc.to(torch.int64)
-            lens_cpu = forward_batch.extend_seq_lens_cpu
-            row = torch.repeat_interleave(
-                torch.arange(bs, device=device),
-                lens,
-                # The host total skips the device sum's sync.
-                output_size=sum(lens_cpu) if lens_cpu is not None else None,
-            )
+            row = torch.repeat_interleave(torch.arange(bs, device=device), lens)
             num_real = row.shape[0]
             kmode = MODE_EXTEND
             if forward_batch.engram_history is not None:
@@ -757,7 +753,7 @@ class EngramEmbedding(nn.Module):
             engram_gather(
                 self.weight.data_ptr(),
                 self.scale.data_ptr(),
-                indices.reshape(-1),
+                indices,
                 out.view(-1, self.dim),
                 self.dim,
                 FP8_BLOCK_SIZE,
@@ -815,7 +811,7 @@ class EngramEmbedding(nn.Module):
             engram_gather(
                 self.weight.data_ptr(),
                 self.scale.data_ptr(),
-                indices.reshape(-1),
+                indices,
                 out.view(-1, self.dim),
                 self.dim,
                 FP8_BLOCK_SIZE,
