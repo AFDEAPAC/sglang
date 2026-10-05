@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import TYPE_CHECKING, NamedTuple, Optional, Tuple
 
 import torch
+import triton
+import triton.language as tl
 from torch.nn import Module
 from torch.nn.parameter import Parameter
 
@@ -36,6 +39,36 @@ if is_flashinfer_available():
     )
 
 logger = logging.getLogger(__name__)
+
+
+@triton.jit
+def _gfx942_routed_shared_add_kernel(
+    routed_ptr,
+    shared_ptr,
+    out_ptr,
+    numel,
+    BLOCK: tl.constexpr,
+):
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    active = offsets < numel
+    routed = tl.load(routed_ptr + offsets, mask=active, other=0.0)
+    shared = tl.load(shared_ptr + offsets, mask=active, other=0.0)
+    tl.store(out_ptr + offsets, routed + shared, mask=active)
+
+
+def _gfx942_routed_shared_add(
+    routed: torch.Tensor, shared: torch.Tensor
+) -> torch.Tensor:
+    assert routed.shape == shared.shape
+    assert routed.dtype == shared.dtype
+    assert routed.device == shared.device
+    assert routed.is_contiguous() and shared.is_contiguous()
+    out = torch.empty_like(routed)
+    block = 256
+    _gfx942_routed_shared_add_kernel[(triton.cdiv(routed.numel(), block),)](
+        routed, shared, out, routed.numel(), BLOCK=block
+    )
+    return out
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
@@ -515,7 +548,10 @@ def maybe_fuse_routed_scale_and_shared_add(
             return routed
         return routed.mul_(routed_scaling_factor)
     if shared is not None:
-        routed += shared
+        if os.environ.get("SGLANG_GFX942_ROUTED_SHARED_ADD", "0") == "1":
+            routed = _gfx942_routed_shared_add(routed, shared)
+        else:
+            routed += shared
     return routed
 
 
