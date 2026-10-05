@@ -284,6 +284,9 @@ class CustomAllreduce:
 
     def _all_reduce_impl(self, inp: torch.Tensor, registered: bool):
         out = torch.empty_like(inp)
+        # Empty views have a null data pointer and require no communication.
+        if inp.numel() == 0:
+            return out
         if not _is_hip:  # CUDA-like
             if registered:
                 ops.all_reduce(self._ptr, inp, out, 0, 0)
