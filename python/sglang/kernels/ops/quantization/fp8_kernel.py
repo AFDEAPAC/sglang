@@ -129,6 +129,7 @@ def _per_token_group_quant_8bit(
     bit8_max,
     # Meta-parameters
     BLOCK: tl.constexpr,
+    SCALE_UE8M0: tl.constexpr,
 ):
     """A Triton-accelerated function to perform per-token-group quantization on a
     tensor.
@@ -148,6 +149,8 @@ def _per_token_group_quant_8bit(
     # Quant
     _absmax = tl.maximum(tl.max(tl.abs(y)), eps)
     y_s = _absmax / bit8_max
+    if SCALE_UE8M0:
+        y_s = tl.exp2(tl.ceil(tl.log2(tl.abs(y_s))))
     y_s_inv = 1.0 / y_s
     y_q = tl.clamp(y * y_s_inv, bit8_min, bit8_max).to(y_q_ptr.dtype.element_ty)
 
@@ -280,12 +283,11 @@ def _per_token_group_quant_8bit_raw(
             bit8_min=bit8_min,
             bit8_max=bit8_max,
             BLOCK=BLOCK,
+            SCALE_UE8M0=scale_ue8m0,
             num_warps=num_warps,
             num_stages=num_stages,
-            SCALE_UE8M0=scale_ue8m0,
         )
     else:
-        assert not scale_ue8m0
         _per_token_group_quant_8bit[(M,)](
             x,
             x_q,
@@ -296,6 +298,7 @@ def _per_token_group_quant_8bit_raw(
             bit8_min=bit8_min,
             bit8_max=bit8_max,
             BLOCK=BLOCK,
+            SCALE_UE8M0=scale_ue8m0,
             num_warps=num_warps,
             num_stages=num_stages,
         )
@@ -510,7 +513,27 @@ def _run_per_token_group_quant_8bit_kernel(
     checks. Whole-row (per-token) quantization is a different op:
     ``sglang_per_token_quant_fp8``.
     """
-    if scale_ue8m0 and x_s.dtype == torch.float32 and not _is_musa:
+    if scale_ue8m0 and x_s.dtype == torch.float32 and _is_hip:
+        assert not fuse_silu_and_mul, "HIP UE8M0 fallback does not fuse silu+mul"
+        assert masked_m is None, "HIP UE8M0 fallback does not support masked_m"
+        block = triton.next_power_of_2(group_size)
+        _per_token_group_quant_8bit[(x.numel() // group_size,)](
+            x,
+            x_q,
+            x_s,
+            group_size,
+            group_size,
+            eps,
+            bit8_min=fp8_min,
+            bit8_max=fp8_max,
+            BLOCK=block,
+            SCALE_UE8M0=True,
+            num_warps=min(max(block // 256, 1), 8),
+            num_stages=1,
+        )
+        return
+
+    if scale_ue8m0 and x_s.dtype == torch.float32 and _is_cuda:
         from sglang.kernels.ops.quantization.per_token_group_quant_8bit_v2 import (
             per_token_group_quant_8bit_v2,
         )
