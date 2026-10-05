@@ -3036,6 +3036,13 @@ class DeepseekV4DecoderLayer(nn.Module):
                 (0, self.hc_mult, x.shape[-1]), dtype=x.dtype, device=x.device
             )
 
+        if _is_hip and get_bool_env_var(
+            "SGLANG_GFX942_TRITON_MHC_POST", "false"
+        ):
+            from sglang.kernels.ops.layernorm.mhc import gfx942_mhc_post
+
+            return gfx942_mhc_post(x, residual, post, comb)
+
         if _is_npu:
             if not is_npu_arch35():
                 return torch.ops.custom.npu_hc_post(x, residual, post, comb)
@@ -3482,12 +3489,19 @@ class DeepseekV4DecoderLayer(nn.Module):
                     self.hc_eps,
                 )
             return pre, post, comb
-        if x.is_cuda and torch.version.cuda is not None:
+        if x.is_cuda and (torch.version.cuda is not None or _is_hip):
             # cuBLAS/torch reductions can change order with num_tokens; this kernel
             # keeps the mixing and RMS reductions batch-invariant.
             mixes = hc_mix_stats(x_flat, hc_fn, self.rms_norm_eps).unsqueeze(1)
         else:
-            x_flat = x_flat.float()
+            if _is_hip and get_bool_env_var(
+                "SGLANG_GFX942_TRITON_BF16_TO_FP32", "false"
+            ):
+                from sglang.kernels.ops.layernorm.mhc import gfx942_bf16_to_fp32
+
+                x_flat = gfx942_bf16_to_fp32(x_flat.contiguous())
+            else:
+                x_flat = x_flat.float()
             rsqrt = torch.rsqrt(
                 x_flat.square().mean(-1, keepdim=True) + self.rms_norm_eps
             )

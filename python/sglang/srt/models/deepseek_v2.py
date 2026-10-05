@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from contextlib import contextmanager, nullcontext
 from functools import cached_property
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
@@ -1280,8 +1281,12 @@ class DeepseekV2MoE(nn.Module):
                 )
 
                 mhc = current_mhc_post_fusion()
-                if _is_hip and _hip_moe.fused_all_reduce_mhc(
-                    self, mhc, final_hidden_states
+                if (
+                    _is_hip
+                    and os.environ.get("SGLANG_DSV41_DISABLE_FUSED_AR_MHC", "0") != "1"
+                    and _hip_moe.fused_all_reduce_mhc(
+                        self, mhc, final_hidden_states
+                    )
                 ):
                     return final_hidden_states
                 if mhc is not None:
@@ -1455,8 +1460,12 @@ class DeepseekV2MoE(nn.Module):
                 )
 
                 mhc = current_mhc_post_fusion()
-                if _is_hip and _hip_moe.fused_all_reduce_mhc(
-                    self, mhc, final_hidden_states
+                if (
+                    _is_hip
+                    and os.environ.get("SGLANG_DSV41_DISABLE_FUSED_AR_MHC", "0") != "1"
+                    and _hip_moe.fused_all_reduce_mhc(
+                        self, mhc, final_hidden_states
+                    )
                 ):
                     return final_hidden_states
                 if mhc is not None:

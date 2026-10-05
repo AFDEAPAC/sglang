@@ -30,6 +30,88 @@ if _is_hip:
 
 logger = logging.getLogger(__name__)
 
+
+@triton.jit
+def _gfx942_bf16_to_fp32_kernel(input_ptr, output_ptr, numel, BLOCK: tl.constexpr):
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    active = offsets < numel
+    values = tl.load(input_ptr + offsets, mask=active, other=0.0).to(tl.float32)
+    tl.store(output_ptr + offsets, values, mask=active)
+
+
+def gfx942_bf16_to_fp32(x: torch.Tensor) -> torch.Tensor:
+    assert x.dtype == torch.bfloat16 and x.is_contiguous()
+    out = torch.empty(x.shape, dtype=torch.float32, device=x.device)
+    block = 256
+    _gfx942_bf16_to_fp32_kernel[(triton.cdiv(x.numel(), block),)](
+        x, out, x.numel(), BLOCK=block
+    )
+    return out
+
+
+@triton.jit
+def _gfx942_mhc_post_kernel(
+    x_ptr,
+    residual_ptr,
+    post_ptr,
+    comb_ptr,
+    out_ptr,
+    hidden_size,
+    numel,
+    HC: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    active = offsets < numel
+    h = offsets % hidden_size
+    tmp = offsets // hidden_size
+    k = tmp % HC
+    m = tmp // HC
+    post_term = tl.load(post_ptr + m * HC + k, mask=active, other=0.0).to(tl.float32)
+    post_term *= tl.load(
+        x_ptr + m * hidden_size + h, mask=active, other=0.0
+    ).to(tl.float32)
+    residual_sum = tl.zeros((BLOCK,), dtype=tl.float32)
+    for j in tl.static_range(HC):
+        coeff = tl.load(
+            comb_ptr + (m * HC + j) * HC + k, mask=active, other=0.0
+        ).to(tl.float32)
+        value = tl.load(
+            residual_ptr + (m * HC + j) * hidden_size + h,
+            mask=active,
+            other=0.0,
+        ).to(tl.float32)
+        residual_sum += coeff * value
+    tl.store(out_ptr + offsets, post_term + residual_sum, mask=active)
+
+
+def gfx942_mhc_post(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post: torch.Tensor,
+    comb: torch.Tensor,
+) -> torch.Tensor:
+    assert x.is_contiguous() and residual.is_contiguous()
+    assert post.is_contiguous() and comb.is_contiguous()
+    m, hidden_size = x.shape
+    hc = residual.shape[1]
+    assert hc == 4 and residual.shape == (m, hc, hidden_size)
+    assert post.shape == (m, hc) and comb.shape == (m, hc, hc)
+    out = torch.empty_like(residual)
+    block = 256
+    _gfx942_mhc_post_kernel[(triton.cdiv(out.numel(), block),)](
+        x,
+        residual,
+        post,
+        comb,
+        out,
+        hidden_size,
+        out.numel(),
+        HC=hc,
+        BLOCK=block,
+    )
+    return out
+
 _AITER_MHC_RUNTIME_DISABLED = False
 _AITER_MHC_ACTIVE_LOGGED = False
 
