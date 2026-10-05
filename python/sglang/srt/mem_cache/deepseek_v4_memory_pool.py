@@ -723,7 +723,30 @@ class DeepSeekV4IndexerPool(KVCache):
         from sglang.srt.layers.quantization.fp8 import DSV4_DEQUANT_FP4_TABLE
 
         assert self.use_fp4_indexer, "dequant readback only applies to the fp4 layout"
-        buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
+        layer_index = layer_id - self.start_layer
+        if self.uses_aiter_fp4_layout:
+            from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
+                read_fp4_index_k_split,
+            )
+
+            payload_buffer = self.index_k_payload_buffer[layer_index]
+            if slots is None:
+                slots = torch.arange(self.size, device=payload_buffer.device)
+            payload, packed_scales = read_fp4_index_k_split(
+                payload_buffer,
+                self.index_k_scale_buffer[layer_index],
+                slots,
+                page_size=self.page_size,
+            )
+            u = payload.view(torch.uint8)
+            codes = torch.stack([u & 0x0F, (u >> 4) & 0x0F], dim=-1)
+            vals = DSV4_DEQUANT_FP4_TABLE.to(payload.device)[codes.long()].flatten(1)
+            shifts = torch.arange(4, device=payload.device, dtype=torch.int32) * 8
+            exps = (packed_scales[:, None] >> shifts[None, :]) & 0xFF
+            scales = torch.exp2(exps.float() - 127).repeat_interleave(32, dim=-1)
+            return (vals * scales).to(torch.bfloat16)
+
+        buf = self.index_k_with_scale_buffer[layer_index]
         if slots is None:
             slots = torch.arange(self.size, device=buf.device)
         slots = slots.to(torch.int64)
