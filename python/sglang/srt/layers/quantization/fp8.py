@@ -1860,6 +1860,97 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                         new_s2, requires_grad=False
                     )
 
+                # gfx942 (MI30x): the fp4 (E2M1) MoE GEMM kernels are broken/absent on
+                # gfx942 (CK-Tile A16W4 numerically wrong; fp4-activation quant unimplemented;
+                # afp8_wfp4 FlyDSL is gfx950-only). Convert MXFP4 (E2M1 + E8M0 microscale) to
+                # int4 [-7,7] + bf16 groupwise scale and use the FlyDSL a16wi4 (int4_bf16) path,
+                # which is numerically exact on gfx942 (validated logits_diff ~3e-5).
+                if _is_hip and get_bool_env_var("SGLANG_GFX942_MXFP4_INT4", "true"):
+                    logger.info("[GFX942-INT4] converting MXFP4 MoE -> int4 a16wi4 (w13=%s w2=%s)", tuple(layer.w13_weight.shape), tuple(layer.w2_weight.shape))
+                    from aiter import dtypes as _adt
+                    from aiter.ops.quant import per_1x32_i4_quant
+                    from aiter.ops.shuffle import (
+                        pack_int8_to_packed_int4,
+                        shuffle_scale_for_int4,
+                    )
+                    from aiter.utility.fp4_utils import e8m0_to_f32, mxfp4_to_f32
+
+                    def _mxfp4_to_int4_a16wi4(w_packed, scale_e8m0):
+                        # Chunk over experts to bound the (8x) f32 dequant temporary; build the
+                        # full int8[-7,7] + bf16 scale, then pack/shuffle once.
+                        Ee, Nn, Kp = w_packed.shape
+                        Kk = Kp * 2
+                        w_u8 = w_packed.view(torch.uint8)
+                        sc_u8 = scale_e8m0.view(torch.uint8)
+                        bscale_full = torch.empty(
+                            (Ee, Kk // 32, Nn), dtype=torch.bfloat16, device=w_packed.device
+                        )
+                        # [bak_cp] CP fix: fuse dequant+quant+shuffle+pack per expert-chunk and
+                        # write into a preallocated packed output. Avoids materializing the full
+                        # int8 buffer AND the full shuffle/pack temporaries (peak ~8GB -> ~2-3GB),
+                        # so the draft(NextN) MoE int4 conversion fits the tighter prefill-CP
+                        # headroom. Experts (dim 0) are independent for shuffle_weight/pack.
+                        w_shuf_out = None
+                        step = 8  # experts per chunk (smaller -> lower peak temporary)
+                        for e0 in range(0, Ee, step):
+                            e1 = min(e0 + step, Ee)
+                            w_f32 = mxfp4_to_f32(w_u8[e0:e1].clone()).view(e1 - e0, Nn, Kk)
+                            sc = e8m0_to_f32(sc_u8[e0:e1]).view(e1 - e0, Nn, Kk // 32)
+                            w_deq = (
+                                w_f32.view(e1 - e0, Nn, Kk // 32, 32) * sc.unsqueeze(-1)
+                            ).view(e1 - e0, Nn, Kk).to(torch.bfloat16)
+                            del w_f32, sc
+                            w_i8_c, bscale_c = per_1x32_i4_quant(w_deq)
+                            del w_deq
+                            bscale_full[e0:e1] = bscale_c
+                            del bscale_c
+                            w_i4_c = w_i8_c.view(_adt.i4x2)
+                            ws_c = pack_int8_to_packed_int4(
+                                shuffle_weight(w_i4_c.view(_adt.i8), (16, 16))
+                            ).view(e1 - e0, Nn, Kk // 2).view(torch.uint8)
+                            del w_i8_c, w_i4_c
+                            if w_shuf_out is None:
+                                w_shuf_out = torch.empty(
+                                    (Ee, Nn, Kk // 2), dtype=torch.uint8, device=ws_c.device
+                                )
+                            w_shuf_out[e0:e1] = ws_c
+                            del ws_c
+                        w_shuf = w_shuf_out.view(_adt.i4x2)
+                        sc_shuf = (
+                            shuffle_scale_for_int4(bscale_full, group_size=32)
+                            .view(-1)
+                            .contiguous()
+                        )
+                        return w_shuf, sc_shuf
+
+                    w13_w, w13_s = _mxfp4_to_int4_a16wi4(
+                        layer.w13_weight.data, layer.w13_weight_scale_inv.data
+                    )
+                    w2_w, w2_s = _mxfp4_to_int4_a16wi4(
+                        layer.w2_weight.data, layer.w2_weight_scale_inv.data
+                    )
+                    # Free the ORIGINAL MXFP4 expert weights/scales before rebinding the
+                    # int4 params, then empty the caching allocator so the storage is
+                    # actually released (frees KV headroom). [gfx942 int4free patch]
+                    _old_w13 = layer.w13_weight
+                    _old_w2 = layer.w2_weight
+                    _old_s13 = layer.w13_weight_scale_inv
+                    _old_s2 = layer.w2_weight_scale_inv
+                    layer.w13_weight = torch.nn.Parameter(w13_w, requires_grad=False)
+                    layer.w2_weight = torch.nn.Parameter(w2_w, requires_grad=False)
+                    layer.w13_weight_scale_inv = torch.nn.Parameter(
+                        w13_s, requires_grad=False
+                    )
+                    layer.w2_weight_scale_inv = torch.nn.Parameter(w2_s, requires_grad=False)
+                    layer.w13_weight.is_shuffled = True
+                    layer.w2_weight.is_shuffled = True
+                    del _old_w13, _old_w2, _old_s13, _old_s2
+                    try:
+                        torch.cuda.empty_cache()
+                    except Exception:
+                        pass
+                    return
+
                 gfx942_dsv41_repack = (
                     _is_hip
                     and get_bool_env_var(
@@ -3377,9 +3468,19 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             )
 
             if self.is_fp4_expert:
-                fp4_weight_dtype = _require_fp4_dtype()
-                w13_weight = w13_weight.view(fp4_weight_dtype)
-                w2_weight = w2_weight.view(fp4_weight_dtype)
+                if _is_hip and get_bool_env_var(
+                    "SGLANG_GFX942_MXFP4_INT4", "true"
+                ):
+                    # The post-load path converted MXFP4 to the gfx942 INT4/BF16
+                    # layout. Keep the packed bytes as INT4 instead of E2M1.
+                    from aiter import dtypes as _adt
+
+                    w13_weight = w13_weight.view(_adt.i4x2)
+                    w2_weight = w2_weight.view(_adt.i4x2)
+                else:
+                    fp4_weight_dtype = _require_fp4_dtype()
+                    w13_weight = w13_weight.view(fp4_weight_dtype)
+                    w2_weight = w2_weight.view(fp4_weight_dtype)
                 if getattr(layer.w13_weight, "is_shuffled", False):
                     w13_weight.is_shuffled = True
                     w2_weight.is_shuffled = True
