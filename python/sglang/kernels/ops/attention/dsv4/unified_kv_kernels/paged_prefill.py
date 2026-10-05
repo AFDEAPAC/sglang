@@ -129,10 +129,15 @@ def _sparse_attn_v4_paged_prefill_kernel(
         )
         valid = in_range & (slot >= 0)
         slot_clamped = tl.maximum(slot, 0)
+        # Promote before multiplying the whole-pool row index. Triton keeps
+        # int32 x int32 as int32, so a future larger KV pool could otherwise
+        # wrap to a negative pointer offset. Region 2 remains int32 because it
+        # only indexes the chunked per-forward extend buffer.
+        slot_off = slot_clamped.to(tl.int64)
 
         kv = tl.load(
             unified_kv_ptr
-            + slot_clamped[:, None] * pkv_stride_n
+            + slot_off[:, None] * pkv_stride_n
             + d_offs[None, :] * pkv_stride_d,
             mask=valid[:, None] & d_mask[None, :],
             other=0.0,
