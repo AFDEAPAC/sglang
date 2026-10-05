@@ -2962,7 +2962,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
             return y, post.squeeze(-1), comb, norm is not None
 
-        if _is_hip:
+        if _is_hip and not get_bool_env_var("SGLANG_DSV41_HIP_TORCH_MHC", "false"):
             from aiter.ops.mhc import mhc_pre
 
             post, comb, y = mhc_pre(
@@ -3064,7 +3064,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         ):
             return mhc_post_split_h(x, residual, post, comb)
 
-        if _is_hip:
+        if _is_hip and not get_bool_env_var("SGLANG_DSV41_HIP_TORCH_MHC", "false"):
             y = _hip.hc_post(self, x, residual, post, comb)
             if y is not None:
                 return y
@@ -3094,7 +3094,7 @@ class DeepseekV4DecoderLayer(nn.Module):
 
             return mhc_post(x, residual, post, comb)
 
-        elif _is_hip:
+        elif _is_hip and not get_bool_env_var("SGLANG_DSV41_HIP_TORCH_MHC", "false"):
             from aiter.ops.mhc import mhc_post
 
             result = torch.empty_like(residual)
