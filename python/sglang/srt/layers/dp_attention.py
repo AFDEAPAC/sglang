@@ -529,6 +529,8 @@ def reject_attn_tp_shard_with_tp_reduce(
 
 
 def is_allocation_symmetric() -> bool:
+    if get_bool_env_var("SGLANG_DISABLE_SYMMETRIC_ALLOCATIONS", "false"):
+        return False
     return not is_dp_attention_enabled() or is_dp_max_padding()
 
 
