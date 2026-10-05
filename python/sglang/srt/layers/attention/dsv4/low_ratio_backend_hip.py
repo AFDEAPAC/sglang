@@ -4,6 +4,7 @@ payload / scale index-K pools, then the top-k v2 transform -- the DeepGEMM path'
 from __future__ import annotations
 
 import itertools
+import os
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import torch
