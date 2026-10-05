@@ -224,6 +224,43 @@ def low_ratio_decode_rows_fit_candidate_span(backend, forward_batch) -> bool:
     return max_len is not None and max_len <= span
 
 
+def _low_ratio_index_logits_torch_decode(
+    backend, layer, x, q_lora, pos, forward_batch: ForwardBatch
+) -> torch.Tensor:
+    """Reference decode logits for gfx942, where scaled FP4 MFMA is unavailable."""
+    pool = backend.token_to_kv_pool
+    ratio = layer.compress_ratio
+    indexer = layer.indexer
+    req = forward_batch.req_pool_indices.to(torch.int64)
+    query = indexer.queries(q_lora, layer.freqs_cis[pos])
+    weights = indexer.head_weights(x)
+    lens = ((pos + 1) // ratio).to(torch.int64)
+    lens_cpu = lens.tolist()
+    req_cpu = req.tolist()
+    width = max(max(lens_cpu, default=0), 1)
+    logits = torch.full(
+        (req.shape[0], width),
+        -torch.inf,
+        dtype=torch.float32,
+        device=pos.device,
+    )
+    for row, (request, length) in enumerate(zip(req_cpu, lens_cpu)):
+        if length == 0:
+            continue
+        compressed_positions = torch.arange(
+            length, device=pos.device, dtype=torch.int64
+        )
+        slots = (
+            backend.req_to_token[request, compressed_positions * ratio].to(torch.int64)
+            // ratio
+        )
+        index_k = pool.get_low_ratio_index_k_dequant(layer.layer_id, slots)
+        logits[row, :length] = indexer.scores(
+            query[row : row + 1], index_k, weights[row : row + 1]
+        )[0]
+    return logits
+
+
 def low_ratio_index_topk_hip_decode(
     backend, layer, x, q_lora, pos, forward_batch: ForwardBatch
 ) -> None:
@@ -262,20 +299,28 @@ def low_ratio_index_topk_hip_decode(
             backend.candidate_masks = None
         two_level = False
 
-    q_fp4, q_scale, weights = _indexer_inputs(layer, x, q_lora, pos)
-    logits = aiter_fp4_paged_mqa_logits(
-        q_fp4=q_fp4,
-        q_scale=q_scale,
-        k_payload=pool.get_index_k_fp4_payload_buffer(layer.layer_id),
-        k_scale=pool.get_index_k_fp4_scale_buffer(layer.layer_id),
-        weights=weights,
-        page_table=indexer_metadata.page_table,
-        c4_seq_lens=indexer_metadata.compressed_seq_lens,
-        weight_scale=1.0,
-        page_table_bucket=LOW_RATIO_PAGE_TABLE_BUCKET,
-        is_decode=True,
-        decode_workspace=metadata.fp4_low_ratio_decode_workspaces.get(ratio),
-    )
+    if (
+        os.environ.get("SGLANG_DSV41_TORCH_DECODE_INDEXER", "0") == "1"
+        and forward_batch.forward_mode.is_decode()
+    ):
+        logits = _low_ratio_index_logits_torch_decode(
+            backend, layer, x, q_lora, pos, forward_batch
+        )
+    else:
+        q_fp4, q_scale, weights = _indexer_inputs(layer, x, q_lora, pos)
+        logits = aiter_fp4_paged_mqa_logits(
+            q_fp4=q_fp4,
+            q_scale=q_scale,
+            k_payload=pool.get_index_k_fp4_payload_buffer(layer.layer_id),
+            k_scale=pool.get_index_k_fp4_scale_buffer(layer.layer_id),
+            weights=weights,
+            page_table=indexer_metadata.page_table,
+            c4_seq_lens=indexer_metadata.compressed_seq_lens,
+            weight_scale=1.0,
+            page_table_bucket=LOW_RATIO_PAGE_TABLE_BUCKET,
+            is_decode=True,
+            decode_workspace=metadata.fp4_low_ratio_decode_workspaces.get(ratio),
+        )
     # level one is bounded on device by the compressed lengths: a captured step cannot read them back
     if two_level and indexer.uses_candidates:
         candidates = backend.candidate_masks
