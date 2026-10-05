@@ -244,7 +244,7 @@ def _get_quantization_config(
                 quant_config = HybridFp8NvFp4Config(
                     fp8_config=quant_config, nvfp4_config=nvfp4_config
                 )
-        elif quant_config.get_name() == "humming":
+        elif quant_config.get_name() in ("humming", "w8a8_fp8"):
             quant_config.is_fp4_experts = model_config.is_fp4_experts
         if not _is_npu:
             major, minor = get_device_capability()
