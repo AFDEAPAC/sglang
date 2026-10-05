@@ -1743,6 +1743,16 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         logger.warning_once("Dequantized FP4 MoE expert weights to FP8.")
 
     def process_weights_after_loading_block_quant(self, layer: Module) -> None:
+        w13_shape = tuple(layer.w13_weight.shape)
+        w2_shape = tuple(layer.w2_weight.shape)
+        gfx942_exact_native_a16w4 = (
+            _is_hip
+            and get_bool_env_var(
+                "AITER_GFX942_DSV41_EXACT_MXFP4_A16W4", "false"
+            )
+            and w13_shape == (48, 4608, 2560)
+            and w2_shape == (48, 5120, 1152)
+        )
         if _use_aiter and self.is_fp4_expert:
             # aiter MegaMoEv2 builds from the packed FP4 layout, so it has to
             # claim the experts before the native-MXFP4 and dequant arms.
@@ -1855,6 +1865,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     and get_bool_env_var(
                         "AITER_GFX942_DSV41_DIRECT_MXFP4_REPACK", "false"
                     )
+                    and not gfx942_exact_native_a16w4
                     and E == 48
                     and padded_inter == 2304
                     and w13_K_packed * 2 == 5120
@@ -1901,7 +1912,15 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     scale = getattr(layer, scale_name)
                     num_experts, num_rows, _ = scale.shape
                     is_w13_scale = scale_name == "w13_weight_scale_inv"
-                    if _is_gfx1250_supported:
+                    if gfx942_exact_native_a16w4:
+                        scale_2d = scale.reshape(-1, scale.shape[-1])
+                        scale.data = shuffle_scale(
+                            scale_2d,
+                            experts_cnt=num_experts,
+                            is_guinterleave=True,
+                            gate_up=False,
+                        )
+                    elif _is_gfx1250_supported:
                         scale.data = moe_shuffle_scale(
                             scale.contiguous(),
                             experts_cnt=num_experts,
@@ -1917,7 +1936,19 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 layer.w13_weight.data = layer.w13_weight.data.view(fp4_weight_dtype)
                 layer.w2_weight.data = layer.w2_weight.data.view(fp4_weight_dtype)
 
-                if _is_gfx1250_supported:
+                if gfx942_exact_native_a16w4:
+                    is_shuffled = True
+                    layer.w13_weight.data = shuffle_weight(
+                        layer.w13_weight,
+                        is_guinterleave=True,
+                        gate_up=False,
+                    )
+                    layer.w2_weight.data = shuffle_weight(
+                        layer.w2_weight,
+                        is_guinterleave=True,
+                        gate_up=False,
+                    )
+                elif _is_gfx1250_supported:
                     is_shuffled = True
                     layer.w13_weight.data = moe_shuffle_weight(
                         layer.w13_weight,
