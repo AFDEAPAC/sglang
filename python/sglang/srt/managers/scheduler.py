@@ -5904,6 +5904,13 @@ def run_scheduler_process(
     display_dp_rank: Optional[int] = None,
     display_moe_ep_rank: Optional[int] = None,
 ):
+    if os.environ.get("SGLANG_GFX942_OLD_KERNEL_RCCL", "0") == "1":
+        os.environ["HSA_NO_SCRATCH_RECLAIM"] = "1"
+        os.environ["NCCL_CUMEM_ENABLE"] = "0"
+        os.environ["NCCL_CUMEM_HOST_ENABLE"] = "0"
+        os.environ["NCCL_DMABUF_ENABLE"] = "0"
+        logger.info("Applied gfx942 old-kernel RCCL environment overrides.")
+
     # Load plugins so hooks can override Scheduler and its dependencies.
     load_plugins()
     dp_rank = resolve_spawn_dp_rank(dp_rank)
