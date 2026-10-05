@@ -1850,6 +1850,53 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                         new_s2, requires_grad=False
                     )
 
+                gfx942_dsv41_repack = (
+                    _is_hip
+                    and get_bool_env_var(
+                        "AITER_GFX942_DSV41_DIRECT_MXFP4_REPACK", "false"
+                    )
+                    and E == 48
+                    and padded_inter == 2304
+                    and w13_K_packed * 2 == 5120
+                    and w2_N == 5120
+                    and w2_K_packed * 2 == 2304
+                )
+                if gfx942_dsv41_repack:
+                    from aiter.ops.shuffle import (
+                        repack_mxfp4_for_gfx942_fp4_bf16,
+                    )
+
+                    w13, s13 = repack_mxfp4_for_gfx942_fp4_bf16(
+                        layer.w13_weight.data.view(fp4_weight_dtype),
+                        layer.w13_weight_scale_inv.data,
+                        E,
+                        2 * padded_inter,
+                        w13_K_packed * 2,
+                    )
+                    w2, s2 = repack_mxfp4_for_gfx942_fp4_bf16(
+                        layer.w2_weight.data.view(fp4_weight_dtype),
+                        layer.w2_weight_scale_inv.data,
+                        E,
+                        w2_N,
+                        w2_K_packed * 2,
+                    )
+                    layer.w13_weight = Parameter(w13, requires_grad=False)
+                    layer.w2_weight = Parameter(w2, requires_grad=False)
+                    layer.w13_weight_scale_inv = Parameter(s13, requires_grad=False)
+                    layer.w2_weight_scale_inv = Parameter(s2, requires_grad=False)
+                    for weight in (layer.w13_weight, layer.w2_weight):
+                        weight.is_shuffled = True
+                        weight.is_gfx942_fp4_bf16 = True
+                    for scale in (
+                        layer.w13_weight_scale_inv,
+                        layer.w2_weight_scale_inv,
+                    ):
+                        scale.is_gfx942_fp4_bf16 = True
+                    logger.info(
+                        "Repacked DeepSeek-V4.1 TP8 MXFP4 experts for gfx942 FlyDSL."
+                    )
+                    return
+
                 for scale_name in ("w13_weight_scale_inv", "w2_weight_scale_inv"):
                     scale = getattr(layer, scale_name)
                     num_experts, num_rows, _ = scale.shape

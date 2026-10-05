@@ -2,6 +2,7 @@ import functools
 import importlib
 import logging
 import math
+import os
 import threading
 from typing import Tuple
 
@@ -2722,6 +2723,11 @@ def hc_combine(
     """Fused y[m, h] = sum_k pre[m, k] * x_flat[m, k*H + h]."""
     m = x_flat.shape[0]
     h = x_flat.shape[1] // hc
+    if _is_hip and os.environ.get("SGLANG_DSV41_HIP_TORCH_HC_COMBINE", "0") == "1":
+        x_view = x_flat.reshape(m, hc, h).float()
+        pre_view = pre.reshape(m, hc, 1).float()
+        return (x_view * pre_view).sum(dim=1).to(out_dtype)
+
     y = torch.empty((m, h), dtype=out_dtype, device=x_flat.device)
     block_h = 1024
     _hc_combine_kernel[(m, triton.cdiv(h, block_h))](
