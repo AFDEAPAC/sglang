@@ -22,12 +22,18 @@ def _engram_gather_kernel(
     out_ptr,
     row_lo,
     row_hi,
+    ids_cols,
+    ids_row_stride,
+    ids_col_stride,
     DIM: tl.constexpr,
     BLK: tl.constexpr,
     E8M0_ZERO: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
-    idx = tl.load(ids_ptr + row).to(tl.int64)
+    id_row = row // ids_cols
+    id_col = row - id_row * ids_cols
+    id_offset = id_row * ids_row_stride + id_col * ids_col_stride
+    idx = tl.load(ids_ptr + id_offset).to(tl.int64)
     # The table holds rows [row_lo, row_hi); an id outside it is not read and
     # comes out as zeros, which is what the sharded all-reduce sums.
     owned = (idx >= row_lo) & (idx < row_hi)
@@ -64,9 +70,8 @@ def engram_gather(
     """
     assert dim > 0 and dim & (dim - 1) == 0 and block_size > 0, (dim, block_size)
     assert dim % block_size == 0, (dim, block_size)
-    assert (
-        ids.is_cuda and ids.is_contiguous() and ids.dtype in (torch.int32, torch.int64)
-    )
+    assert ids.is_cuda and ids.dtype in (torch.int32, torch.int64)
+    assert ids.dim() in (1, 2), ids.shape
     assert out.is_contiguous() and out.dtype == torch.bfloat16
     assert out.device == ids.device and out.shape == (ids.numel(), dim), out.shape
     n = ids.numel()
@@ -78,6 +83,9 @@ def engram_gather(
             out,
             row_lo,
             row_hi,
+            ids.shape[1] if ids.dim() == 2 else 1,
+            ids.stride(0),
+            ids.stride(1) if ids.dim() == 2 else 1,
             DIM=dim,
             BLK=block_size,
             E8M0_ZERO=_E8M0_ZERO,
