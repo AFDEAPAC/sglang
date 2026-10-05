@@ -238,7 +238,8 @@ def _low_ratio_index_logits_torch_decode(
     lens = ((pos + 1) // ratio).to(torch.int64)
     lens_cpu = lens.tolist()
     req_cpu = req.tolist()
-    width = max(max(lens_cpu, default=0), 1)
+    visible_width = max(max(lens_cpu, default=0), 1)
+    width = (visible_width + 3) // 4 * 4
     logits = torch.full(
         (req.shape[0], width),
         -torch.inf,
