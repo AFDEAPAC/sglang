@@ -5794,8 +5794,10 @@ class DeepseekV4ForCausalLM(nn.Module):
                                 and (
                                     name.endswith(".wq_a.weight")
                                     or name.endswith(".wq_a.weight_scale_inv")
+                                    or name.endswith(".wq_a.weight_scale")
                                     or name.endswith(".wkv.weight")
                                     or name.endswith(".wkv.weight_scale_inv")
+                                    or name.endswith(".wkv.weight_scale")
                                     or name.endswith(".wq_a.qweight")
                                     or name.endswith(".wkv.qweight")
                                     or name.endswith(".wq_a.qweight_type")
@@ -5839,6 +5841,16 @@ class DeepseekV4ForCausalLM(nn.Module):
                                                 f"{scale[0]}_proj", "attn_mqa"
                                             )
                                             break
+                                # Per-channel PTPC checkpoints use
+                                # ``weight_scale`` while this model stores the
+                                # same parameter as ``scale``.
+                                if (
+                                    name not in params_dict
+                                    and name.endswith(".weight_scale")
+                                    and name[: -len(".weight_scale")] + ".scale"
+                                    in params_dict
+                                ):
+                                    name = name[: -len(".weight_scale")] + ".scale"
                                 if name not in params_dict:
                                     if not name.startswith("mtp"):
                                         logger.warning(
