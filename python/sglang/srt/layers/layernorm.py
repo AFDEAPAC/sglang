@@ -18,6 +18,8 @@ from functools import lru_cache
 from typing import Optional, Tuple, Union
 
 import torch
+import triton
+import triton.language as tl
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -178,6 +180,107 @@ if _is_cuda:
 
 
 logger = logging.getLogger(__name__)
+
+
+@triton.jit
+def _gfx942_contiguous_2d_kernel(
+    input_ptr,
+    output_ptr,
+    rows,
+    cols,
+    stride_row,
+    stride_col,
+    numel,
+    BLOCK: tl.constexpr,
+):
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    active = offsets < numel
+    row = offsets // cols
+    col = offsets - row * cols
+    values = tl.load(
+        input_ptr + row * stride_row + col * stride_col, mask=active, other=0.0
+    )
+    tl.store(output_ptr + offsets, values, mask=active)
+
+
+def gfx942_contiguous_2d(x: torch.Tensor) -> torch.Tensor:
+    assert x.dim() == 2
+    if x.is_contiguous():
+        return x
+    out = torch.empty(x.shape, dtype=x.dtype, device=x.device)
+    block = 256
+    _gfx942_contiguous_2d_kernel[(triton.cdiv(x.numel(), block),)](
+        x,
+        out,
+        x.shape[0],
+        x.shape[1],
+        x.stride(0),
+        x.stride(1),
+        x.numel(),
+        BLOCK=block,
+    )
+    return out
+
+
+@triton.jit
+def _gfx942_flat_copy_kernel(input_ptr, output_ptr, numel, BLOCK: tl.constexpr):
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    active = offsets < numel
+    values = tl.load(input_ptr + offsets, mask=active, other=0.0)
+    tl.store(output_ptr + offsets, values, mask=active)
+
+
+@triton.jit
+def _gfx942_strided_copy_3d_kernel(
+    input_ptr,
+    output_ptr,
+    size1,
+    size2,
+    src_stride0,
+    src_stride1,
+    src_stride2,
+    dst_stride0,
+    dst_stride1,
+    dst_stride2,
+    numel,
+    BLOCK: tl.constexpr,
+):
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    active = offsets < numel
+    i2 = offsets % size2
+    tmp = offsets // size2
+    i1 = tmp % size1
+    i0 = tmp // size1
+    src_offsets = i0 * src_stride0 + i1 * src_stride1 + i2 * src_stride2
+    dst_offsets = i0 * dst_stride0 + i1 * dst_stride1 + i2 * dst_stride2
+    values = tl.load(input_ptr + src_offsets, mask=active, other=0.0)
+    tl.store(output_ptr + dst_offsets, values, mask=active)
+
+
+def gfx942_flat_copy(src: torch.Tensor, dst: torch.Tensor) -> torch.Tensor:
+    assert src.shape == dst.shape and src.dtype == dst.dtype
+    block = 256
+    if src.is_contiguous() and dst.is_contiguous():
+        _gfx942_flat_copy_kernel[(triton.cdiv(src.numel(), block),)](
+            src, dst, src.numel(), BLOCK=block
+        )
+        return dst
+    assert src.dim() == dst.dim() == 3
+    _gfx942_strided_copy_3d_kernel[(triton.cdiv(src.numel(), block),)](
+        src,
+        dst,
+        src.shape[1],
+        src.shape[2],
+        src.stride(0),
+        src.stride(1),
+        src.stride(2),
+        dst.stride(0),
+        dst.stride(1),
+        dst.stride(2),
+        src.numel(),
+        BLOCK=block,
+    )
+    return dst
 
 
 if _is_npu:
@@ -704,7 +807,12 @@ class RMSNorm(BaseFusedOp):
                 )
         else:
             if not x.is_contiguous():
-                x = x.contiguous()
+                if _is_hip and get_bool_env_var(
+                    "SGLANG_GFX942_TRITON_CONTIGUOUS", "false"
+                ):
+                    x = gfx942_contiguous_2d(x)
+                else:
+                    x = x.contiguous()
             if residual is not None and not residual.is_contiguous():
                 residual = residual.contiguous()
 

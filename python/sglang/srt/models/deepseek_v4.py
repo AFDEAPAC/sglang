@@ -1024,8 +1024,23 @@ class MqaAttentionBase(nn.Module):
         # pointer.
         sink_num_heads = max(kernel_num_heads, padded_num_heads)
         if self._attn_sink_local is None:
-            sink = self.attn_sink.new_zeros(sink_num_heads)
-            sink[:num_heads] = self.attn_sink[rank * num_heads : (rank + 1) * num_heads]
+            if _is_hip and get_bool_env_var(
+                "SGLANG_GFX942_CPU_ATTN_SINK", "false"
+            ):
+                sink_cpu = torch.zeros(
+                    sink_num_heads, dtype=self.attn_sink.dtype, device="cpu"
+                )
+                sink_cpu[:num_heads].copy_(
+                    self.attn_sink[
+                        rank * num_heads : (rank + 1) * num_heads
+                    ].cpu()
+                )
+                sink = sink_cpu.to(self.attn_sink.device)
+            else:
+                sink = self.attn_sink.new_zeros(sink_num_heads)
+                sink[:num_heads] = self.attn_sink[
+                    rank * num_heads : (rank + 1) * num_heads
+                ]
             self._attn_sink_local = sink
         return self._attn_sink_local[:kernel_num_heads]
 
@@ -1357,6 +1372,12 @@ class MQALayer(MqaAttentionBase):
             )
             if q_out is None:
                 return q
+            if _is_hip and get_bool_env_var(
+                "SGLANG_GFX942_TRITON_FLAT_COPY", "false"
+            ):
+                from sglang.srt.layers.layernorm import gfx942_flat_copy
+
+                return gfx942_flat_copy(q, q_out)
             q_out.copy_(q)
             return q_out
         if q_out is None:
@@ -3442,7 +3463,12 @@ class DeepseekV4DecoderLayer(nn.Module):
             x.shape[0] == 1 or (bf16_parts is not None and 32 <= x.shape[0] <= 65536)
         )
         # gfx950 uses the fused Triton port at every row count (MI350X).
-        use_fused_stats = _is_gfx95_supported or (
+        # gfx942 can opt into the same path to avoid the unsupported split
+        # Sinkhorn dispatch used by the generic HIP fallback.
+        use_fused_stats = (
+            _is_hip
+            and get_bool_env_var("SGLANG_GFX942_FUSED_MHC_STATS", "false")
+        ) or _is_gfx95_supported or (
             torch.version.cuda is not None
             and (get_platform().is_blackwell or hopper_fused_stats)
         )
@@ -4595,6 +4621,11 @@ class DeepseekV4Model(nn.Module):
                 if (
                     self.config.model_type == "deepseek_v41"
                     and self.config.vision_n_layers > 0
+                    and not (
+                        _is_hip
+                        and get_bool_env_var("SGLANG_DSV41_TEXT_ONLY", "false")
+                    )
+                    and forward_batch.contains_image_inputs()
                 ):
                     hidden_states = torch.where(
                         (input_ids == self.config.image_token_id)[:, None, None],
@@ -4840,7 +4871,18 @@ class DeepseekV4Model(nn.Module):
                 hidden_states = self.embed_tokens(input_ids)
             else:
                 hidden_states = input_embeds
-            hidden_states = hidden_states.unsqueeze(1).repeat(1, self.hc_mult, 1)
+            if _is_hip and get_bool_env_var(
+                "SGLANG_GFX942_TRITON_MHC_POST", "false"
+            ):
+                from sglang.kernels.ops.layernorm.mhc import gfx942_repeat_hc
+
+                hidden_states = gfx942_repeat_hc(
+                    hidden_states.contiguous(), self.hc_mult
+                )
+            else:
+                hidden_states = hidden_states.unsqueeze(1).repeat(
+                    1, self.hc_mult, 1
+                )
         else:
             assert pp_proxy_tensors is not None
             hidden_states = pp_proxy_tensors["hidden_states"]
@@ -4965,8 +5007,16 @@ class DeepseekV4Model(nn.Module):
         if self.hc_pre_from_prev_sublayer:
             from sglang.kernels.ops.layernorm.mhc import hc_combine
 
+            if _is_hip and get_bool_env_var(
+                "SGLANG_GFX942_TRITON_BF16_TO_FP32", "false"
+            ):
+                from sglang.kernels.ops.layernorm.mhc import gfx942_bf16_to_fp32
+
+                hc_head_fp32 = gfx942_bf16_to_fp32(pre_hc_head.contiguous())
+            else:
+                hc_head_fp32 = pre_hc_head.float()
             hidden_states = hc_combine(
-                pre_hc_head.float(), last_pre, self.hc_mult, hidden_states.dtype
+                hc_head_fp32, last_pre, self.hc_mult, hidden_states.dtype
             )
         else:
             hidden_states = self.hc_head(

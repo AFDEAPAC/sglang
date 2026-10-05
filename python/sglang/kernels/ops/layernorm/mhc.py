@@ -30,6 +30,55 @@ if _is_hip:
 
 logger = logging.getLogger(__name__)
 
+_GFX942_MHC_POST_CACHE = {}
+_GFX942_REPEAT_HC_CACHE = {}
+_GFX942_BF16_FP32_CACHE = {}
+
+
+
+@triton.jit
+def _gfx942_repeat_hc_kernel(
+    input_ptr,
+    output_ptr,
+    hidden_size,
+    numel,
+    HC: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    active = offsets < numel
+    hidden_offset = offsets % hidden_size
+    row = offsets // (HC * hidden_size)
+    values = tl.load(
+        input_ptr + row * hidden_size + hidden_offset, mask=active, other=0.0
+    )
+    tl.store(output_ptr + offsets, values, mask=active)
+
+
+def gfx942_repeat_hc(x: torch.Tensor, hc: int) -> torch.Tensor:
+    assert x.dim() == 2 and x.is_contiguous()
+    capacity_rows = max(
+        x.shape[0], int(os.environ.get("SGLANG_GFX942_WORKSPACE_TOKENS", "0"))
+    )
+    key = (str(x.device), x.dtype, hc, x.shape[1])
+    storage = _GFX942_REPEAT_HC_CACHE.get(key)
+    if storage is None or storage.shape[0] < capacity_rows:
+        storage = torch.empty(
+            (capacity_rows, hc, x.shape[1]), dtype=x.dtype, device=x.device
+        )
+        _GFX942_REPEAT_HC_CACHE[key] = storage
+    output = storage[: x.shape[0]]
+    block = 256
+    _gfx942_repeat_hc_kernel[(triton.cdiv(output.numel(), block),)](
+        x,
+        output,
+        x.shape[1],
+        output.numel(),
+        HC=hc,
+        BLOCK=block,
+    )
+    return output
+
 
 @triton.jit
 def _gfx942_bf16_to_fp32_kernel(input_ptr, output_ptr, numel, BLOCK: tl.constexpr):
@@ -41,7 +90,17 @@ def _gfx942_bf16_to_fp32_kernel(input_ptr, output_ptr, numel, BLOCK: tl.constexp
 
 def gfx942_bf16_to_fp32(x: torch.Tensor) -> torch.Tensor:
     assert x.dtype == torch.bfloat16 and x.is_contiguous()
-    out = torch.empty(x.shape, dtype=torch.float32, device=x.device)
+    capacity_rows = max(
+        x.shape[0], int(os.environ.get("SGLANG_GFX942_WORKSPACE_TOKENS", "0"))
+    )
+    key = (str(x.device), tuple(x.shape[1:]))
+    storage = _GFX942_BF16_FP32_CACHE.get(key)
+    if storage is None or storage.shape[0] < capacity_rows:
+        storage = torch.empty(
+            (capacity_rows, *x.shape[1:]), dtype=torch.float32, device=x.device
+        )
+        _GFX942_BF16_FP32_CACHE[key] = storage
+    out = storage[: x.shape[0]]
     block = 256
     _gfx942_bf16_to_fp32_kernel[(triton.cdiv(x.numel(), block),)](
         x, out, x.numel(), BLOCK=block
@@ -97,7 +156,29 @@ def gfx942_mhc_post(
     hc = residual.shape[1]
     assert hc == 4 and residual.shape == (m, hc, hidden_size)
     assert post.shape == (m, hc) and comb.shape == (m, hc, hc)
-    out = torch.empty_like(residual)
+    capacity_rows = max(
+        m, int(os.environ.get("SGLANG_GFX942_WORKSPACE_TOKENS", "0"))
+    )
+    key = (str(residual.device), residual.dtype, hc, hidden_size)
+    buffers = _GFX942_MHC_POST_CACHE.setdefault(key, [])
+    input_ptrs = {x.data_ptr(), residual.data_ptr()}
+    storage = next(
+        (
+            buffer
+            for buffer in buffers
+            if buffer.data_ptr() not in input_ptrs
+            and buffer.shape[0] >= capacity_rows
+        ),
+        None,
+    )
+    if storage is None:
+        storage = torch.empty(
+            (capacity_rows, hc, hidden_size),
+            dtype=residual.dtype,
+            device=residual.device,
+        )
+        buffers.append(storage)
+    out = storage[:m]
     block = 256
     _gfx942_mhc_post_kernel[(triton.cdiv(out.numel(), block),)](
         x,
