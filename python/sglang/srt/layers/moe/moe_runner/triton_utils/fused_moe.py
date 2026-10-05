@@ -720,14 +720,30 @@ def _fused_moe_kernel_sequence(
 
             if filter_expert:
                 swiglu_limit_for_triton = swiglu_limit
+            elif _is_hip and not get_bool_env_var(
+                "SGLANG_OPT_SWIGLU_CLAMP_FUSION", "true"
+            ):
+                swiglu_limit_for_triton = swiglu_limit
             else:
                 assert _is_cuda or _is_xpu, (
-                    "fused silu_and_mul_clamp kernel is CUDA/XPU only; HIP must disable SWIGLU_CLAMP_FUSION"
+                    "fused silu_and_mul_clamp kernel is CUDA/XPU only; "
+                    "HIP must disable SWIGLU_CLAMP_FUSION"
                 )
                 swiglu_limit_for_silu_and_mul_clamp = swiglu_limit
 
             if not filter_expert:
-                if swiglu_limit_for_silu_and_mul_clamp is not None:
+                if swiglu_limit_for_triton is not None:
+                    act_and_mul_triton(
+                        intermediate_cache1.view(-1, N),
+                        intermediate_cache2,
+                        config,
+                        topk_ids,
+                        expert_ids,
+                        down_moe_use_tma,
+                        activation,
+                        swiglu_limit=swiglu_limit_for_triton,
+                    )
+                elif swiglu_limit_for_silu_and_mul_clamp is not None:
                     from sglang.kernels.ops.moe.dsv4 import silu_and_mul_clamp
 
                     silu_and_mul_clamp(
