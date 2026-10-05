@@ -806,6 +806,23 @@ class EngramEmbedding(nn.Module):
         """Rows of `indices` this rank's shard holds, zero for the rest."""
         if self.rows == 0:
             return self._empty(indices).zero_()
+        if (
+            self.host_table is None
+            and _is_hip
+            and os.environ.get("SGLANG_GFX942_ENGRAM_GATHER", "0") == "1"
+        ):
+            out = self._empty(indices)
+            engram_gather(
+                self.weight.data_ptr(),
+                self.scale.data_ptr(),
+                indices.reshape(-1),
+                out.view(-1, self.dim),
+                self.dim,
+                FP8_BLOCK_SIZE,
+                row_lo=self.row_start,
+                row_hi=self.row_start + self.rows,
+            )
+            return out
         if self.host_table is None and not _cuda_kernels(indices):
             local = indices - self.row_start
             owned = (local >= 0) & (local < self.rows)
