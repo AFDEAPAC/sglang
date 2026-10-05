@@ -34,6 +34,9 @@ if TYPE_CHECKING:
     )
 
 _is_fp8_fnuz = is_fp8_fnuz()
+# Route per-channel (PTPC) fp8 through aiter on HIP. The upstream unfused path
+# (_apply_fallback_scaled_mm: fp8->fp32 GEMM + separate dequant+cast) and the
+# Triton per-channel fnuz MoE are both far slower on gfx942.
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 
 
@@ -58,6 +61,10 @@ class W8A8Fp8Config(QuantizationConfig):
 
     def __init__(self, is_checkpoint_fp8_serialized: bool = False):
         self.is_checkpoint_fp8_serialized = is_checkpoint_fp8_serialized
+        # Mixed DSV4 layout: body linears are per-channel fp8 while the routed
+        # experts stay mxfp4-packed. Injected by model_loader from ModelConfig.
+        self.is_fp4_experts = False
+        self._fp4_moe_config = None
 
     @classmethod
     def get_supported_act_dtypes(cls) -> List[torch.dtype]:
@@ -94,14 +101,35 @@ class W8A8Fp8Config(QuantizationConfig):
         if isinstance(layer, LinearBase):
             return W8A8Fp8LinearMethod(self)
         elif isinstance(layer, FusedMoE):
+            if self.is_fp4_experts:
+                return self._packed_moe_config().get_quant_method(layer, prefix)
             return W8A8FP8MoEMethod(self)
         return None
+
+    def _packed_moe_config(self) -> QuantizationConfig:
+        """Fp8Config for routed experts the PTPC conversion left mxfp4-packed.
+
+        weight_block_size is not optional: without it Fp8Config selects per-tensor
+        expert scales and the [7168, 96] checkpoint scale fails to load into the
+        TP-sharded [7168, 12] parameter.
+        """
+        if self._fp4_moe_config is None:
+            from sglang.srt.layers.quantization.fp8 import Fp8Config
+
+            self._fp4_moe_config = Fp8Config(
+                is_checkpoint_fp8_serialized=True,
+                activation_scheme="dynamic",
+                weight_block_size=[128, 128],
+                is_fp4_experts=True,
+            )
+        return self._fp4_moe_config
 
     def get_scaled_act_names(self) -> List[str]:
         return []
 
 
 class W8A8Fp8LinearMethod(LinearMethodBase):
+
     def __init__(self, quantization_config: W8A8Fp8Config):
         self.cutlass_fp8_supported = cutlass_fp8_supported()
         self.quantization_config = quantization_config
@@ -117,6 +145,11 @@ class W8A8Fp8LinearMethod(LinearMethodBase):
                     weight=weight, weight_scale=weight_scale
                 )
 
+            if _use_aiter:
+                # MFMA-preshuffle B so gemm_a8w8_bpreshuffle gets the fast layout.
+                from aiter.ops.shuffle import shuffle_weight
+
+                weight = shuffle_weight(weight.contiguous(), (16, 16))
             layer.weight = Parameter(weight.t(), requires_grad=False)
             layer.weight_scale = Parameter(weight_scale, requires_grad=False)
         else:
@@ -191,6 +224,10 @@ class W8A8Fp8LinearMethod(LinearMethodBase):
             layer.weight_scale,
             bias=bias,
             cutlass_fp8_supported=self.cutlass_fp8_supported,
+            # On aiter/HIP route per-token-per-channel fp8 to the fused aiter
+            # rowwise GEMM (gemm_a8w8_bpreshuffle) instead of the unfused
+            # _apply_fallback_scaled_mm.
+            use_per_token_if_dynamic=_use_aiter,
         )
 
 
@@ -219,13 +256,26 @@ class W8A8FP8MoEMethod(FusedMoEMethodBase):
     ):
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 
+        # For an offline-quantized (OCP e4m3fn) checkpoint, create the expert
+        # weight params as e4m3fn so the loader copy_ is bit-faithful. On fnuz
+        # hardware (gfx942/MI300) we reinterpret+rescale via
+        # normalize_e4m3fn_to_e4m3fnuz in process_weights_after_loading. Creating
+        # them as fp8_dtype (e4m3fnuz) here makes copy_ value-convert, which
+        # saturates every checkpoint weight whose magnitude exceeds the fnuz max
+        # of 240 (this checkpoint reaches 448).
+        weight_dtype = (
+            torch.float8_e4m3fn
+            if self.quant_config.is_checkpoint_fp8_serialized
+            else fp8_dtype
+        )
+
         # WEIGHTS
         w13_weight = torch.nn.Parameter(
             torch.empty(
                 num_experts,
                 2 * intermediate_size_per_partition,
                 hidden_size,
-                dtype=fp8_dtype,
+                dtype=weight_dtype,
             ),
             requires_grad=False,
         )
@@ -237,7 +287,7 @@ class W8A8FP8MoEMethod(FusedMoEMethodBase):
                 num_experts,
                 hidden_size,
                 intermediate_size_per_partition,
-                dtype=fp8_dtype,
+                dtype=weight_dtype,
             ),
             requires_grad=False,
         )
@@ -271,8 +321,9 @@ class W8A8FP8MoEMethod(FusedMoEMethodBase):
         layer.register_parameter("w2_input_scale", w2_input_scale)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        # gfx942 executes FP8 as e4m3fnuz. Convert serialized OCP e4m3fn
-        # experts and their per-channel scales before the Triton MoE runner.
+        # On fnuz hardware the experts were loaded bit-faithfully as OCP e4m3fn;
+        # reinterpret to e4m3fnuz and rescale so the per-channel dequant matches
+        # the checkpoint without overflow.
         if _is_fp8_fnuz and layer.w13_weight.dtype == torch.float8_e4m3fn:
             w13_weight, w13_weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
                 weight=layer.w13_weight, weight_scale=layer.w13_weight_scale
@@ -282,9 +333,7 @@ class W8A8FP8MoEMethod(FusedMoEMethodBase):
             )
             layer.w13_weight = Parameter(w13_weight, requires_grad=False)
             layer.w2_weight = Parameter(w2_weight, requires_grad=False)
-            layer.w13_weight_scale = Parameter(
-                w13_weight_scale, requires_grad=False
-            )
+            layer.w13_weight_scale = Parameter(w13_weight_scale, requires_grad=False)
             layer.w2_weight_scale = Parameter(w2_weight_scale, requires_grad=False)
         else:
             layer.w13_weight = Parameter(layer.w13_weight, requires_grad=False)
@@ -297,7 +346,7 @@ class W8A8FP8MoEMethod(FusedMoEMethodBase):
             )
 
         if _use_aiter:
-            # AITER W8A8 MoE consumes MFMA-preshuffled expert weights.
+            # aiter asm fused_moe expects MFMA-shuffled expert weights.
             from aiter.ops.shuffle import shuffle_weight
 
             layer.w13_weight = Parameter(
