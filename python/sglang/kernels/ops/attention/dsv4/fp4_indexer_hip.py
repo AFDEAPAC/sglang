@@ -10,6 +10,7 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
+    _e2m1_decode,
     quantize_fp4_indexer_row,
     quantize_fp4_indexer_tensor,
 )
@@ -170,6 +171,212 @@ def logits_rows_per_chunk(page_table: torch.Tensor, page_table_bucket: int = 4) 
     """Rows whose logits fit the pooled block, for callers that loop by row."""
     width = _guarded_pages(page_table.shape[1], page_table_bucket) * _KV_BLOCK_SIZE
     return max(1, _LOGITS_BUDGET_ELEMS // width)
+
+
+@triton.jit
+def _fp4_split_index_logits_tile(
+    q_ptr,
+    w_ptr,
+    payload_ptr,
+    scale_ptr,
+    row,
+    slot,
+    valid,
+    page_size,
+    stride_q_row,
+    stride_q_head,
+    stride_w_row,
+    HEADS: tl.constexpr,
+    HALF_D: tl.constexpr,
+):
+    """One BF16-query x split-MXFP4-K tile for gfx942."""
+    offs_h = tl.arange(0, HEADS)
+    offs_i = tl.arange(0, HALF_D)
+    page = slot // page_size
+    page_offset = slot % page_size
+    chunk = offs_i // 16
+    byte = offs_i % 16
+
+    packed = tl.load(
+        payload_ptr
+        + page[:, None] * (4 * page_size * 16)
+        + chunk[None, :] * (page_size * 16)
+        + page_offset[:, None] * 16
+        + byte[None, :],
+        mask=valid[:, None],
+        other=0,
+    )
+    shuffled = (page_offset % 16) * 4 + page_offset // 16
+    exponents = tl.load(
+        scale_ptr
+        + page[:, None] * (4 * page_size)
+        + chunk[None, :] * page_size
+        + shuffled[:, None],
+        mask=valid[:, None],
+        other=127,
+    )
+    block_scale = tl.exp2(exponents.to(tl.float32) - 127.0)
+    k_even = (_e2m1_decode(packed & 0x0F) * block_scale).to(tl.bfloat16)
+    k_odd = (_e2m1_decode((packed >> 4) & 0x0F) * block_scale).to(tl.bfloat16)
+
+    q_even = tl.load(
+        q_ptr
+        + row * stride_q_row
+        + offs_h[:, None] * stride_q_head
+        + 2 * offs_i[None, :]
+    )
+    q_odd = tl.load(
+        q_ptr
+        + row * stride_q_row
+        + offs_h[:, None] * stride_q_head
+        + 2 * offs_i[None, :]
+        + 1
+    )
+    acc = tl.dot(q_even, tl.trans(k_even))
+    acc += tl.dot(q_odd, tl.trans(k_odd))
+    scores = acc.to(tl.bfloat16).to(tl.float32)
+    scores = tl.maximum(scores, 0.0)
+    head_weights = tl.load(w_ptr + row * stride_w_row + offs_h).to(tl.float32)
+    scores = (scores * head_weights[:, None]).to(tl.bfloat16).to(tl.float32)
+    logits = tl.sum(scores, axis=0).to(tl.bfloat16).to(tl.float32)
+    return tl.where(valid, logits, float("-inf"))
+
+
+@triton.jit
+def _fp4_split_paged_mqa_logits_kernel(
+    q_ptr,
+    w_ptr,
+    payload_ptr,
+    scale_ptr,
+    page_table_ptr,
+    lengths_ptr,
+    candidate_mask_ptr,
+    out_ptr,
+    max_seq_len,
+    page_size,
+    page_table_stride,
+    candidate_mask_stride,
+    out_stride,
+    stride_q_row,
+    stride_q_head,
+    stride_w_row,
+    HEADS: tl.constexpr,
+    HALF_D: tl.constexpr,
+    HAS_CANDIDATE_MASK: tl.constexpr,
+    BLOCK_L: tl.constexpr,
+):
+    """Paged split-MXFP4 index logits with device-side live lengths."""
+    row = tl.program_id(0)
+    visible = tl.minimum(tl.load(lengths_ptr + row), max_seq_len)
+    for tile in range(
+        tl.program_id(1), tl.cdiv(visible, BLOCK_L), tl.num_programs(1)
+    ):
+        positions = tile * BLOCK_L + tl.arange(0, BLOCK_L)
+        valid = positions < visible
+        if HAS_CANDIDATE_MASK:
+            valid &= tl.load(
+                candidate_mask_ptr + row * candidate_mask_stride + positions,
+                mask=positions < visible,
+                other=False,
+            )
+        page_column = positions // page_size
+        in_page = positions % page_size
+        physical_page = tl.load(
+            page_table_ptr + row * page_table_stride + page_column,
+            mask=valid,
+            other=0,
+        ).to(tl.int64)
+        slot = physical_page * page_size + in_page
+        logits = _fp4_split_index_logits_tile(
+            q_ptr,
+            w_ptr,
+            payload_ptr,
+            scale_ptr,
+            row,
+            slot,
+            valid,
+            page_size,
+            stride_q_row,
+            stride_q_head,
+            stride_w_row,
+            HEADS,
+            HALF_D,
+        )
+        tl.store(
+            out_ptr + row * out_stride + positions,
+            logits,
+            mask=positions < max_seq_len,
+        )
+
+
+def triton_fp4_split_paged_mqa_logits(
+    *,
+    q: torch.Tensor,
+    weights: torch.Tensor,
+    k_payload: torch.Tensor,
+    k_scale: torch.Tensor,
+    page_table: torch.Tensor,
+    lengths: torch.Tensor,
+    is_decode: bool,
+    candidate_mask: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Capture-safe gfx942 indexer over AITER's split MXFP4 cache layout.
+
+    FP4 K values are dequantized to BF16 in the Triton kernel and use the
+    standard gfx942 BF16 MFMA. Live lengths and page ids stay on device, so a
+    captured grid can replay against shorter contexts without host reads.
+    """
+    assert q.dtype == torch.bfloat16 and q.ndim == 3 and q.shape[-1] == _HEAD_DIM
+    assert k_payload.shape[1:] == (1, 4, _KV_BLOCK_SIZE, 16)
+    assert k_scale.shape[1:] == (1, 4, _KV_BLOCK_SIZE)
+    assert page_table.ndim == 2 and page_table.stride(1) == 1
+    assert lengths.ndim == 1 and lengths.shape[0] == q.shape[0]
+    if candidate_mask is not None:
+        assert candidate_mask.shape[0] == q.shape[0]
+        assert candidate_mask.stride(1) == 1
+
+    q = q.contiguous()
+    weights = weights.to(torch.bfloat16).contiguous()
+    page_table = page_table.contiguous()
+    lengths = lengths.to(torch.int32).contiguous()
+    max_seq_len = page_table.shape[1] * _KV_BLOCK_SIZE
+    logits = _alloc_logits(q.shape[0], max_seq_len, q.device, is_decode)
+    if q.shape[0] == 0 or max_seq_len == 0:
+        return logits
+    workers = min(
+        triton.cdiv(max_seq_len, 64),
+        max(
+            1,
+            triton.cdiv(
+                torch.cuda.get_device_properties(q.device).multi_processor_count * 4,
+                q.shape[0],
+            ),
+        ),
+    )
+    _fp4_split_paged_mqa_logits_kernel[(q.shape[0], workers)](
+        q,
+        weights,
+        k_payload.view(torch.uint8),
+        k_scale,
+        page_table,
+        lengths,
+        candidate_mask,
+        logits,
+        max_seq_len,
+        _KV_BLOCK_SIZE,
+        page_table.stride(0),
+        candidate_mask.stride(0) if candidate_mask is not None else 0,
+        logits.stride(0),
+        q.stride(0),
+        q.stride(1),
+        weights.stride(0),
+        HEADS=q.shape[1],
+        HALF_D=_HEAD_DIM // 2,
+        HAS_CANDIDATE_MASK=candidate_mask is not None,
+        BLOCK_L=64,
+        num_warps=4,
+    )
+    return logits
 
 
 def _alloc_logits(

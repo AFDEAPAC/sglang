@@ -4,6 +4,7 @@ payload / scale index-K pools, then the top-k v2 transform -- the DeepGEMM path'
 from __future__ import annotations
 
 import itertools
+import logging
 import os
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
@@ -30,6 +31,7 @@ from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
     pack_fp4_query_flydsl,
     prepare_fp4_decode_workspace,
     prepare_fp4_prefill_workspace,
+    triton_fp4_split_paged_mqa_logits,
 )
 from sglang.kernels.ops.attention.dsv4.fp4_indexer_rope_hip import (
     index_k_norm_rope_pack_store_split,
@@ -42,6 +44,10 @@ from sglang.srt.layers.attention.deepseek_v4_backend import (
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.dsv4.metadata import PagedIndexerMetadata
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+
+
+logger = logging.getLogger(__name__)
+_NATIVE_TRITON_INDEXER_LOGGED = False
 
 
 # fp32 logits scored per candidate-block chunk stay under this many bytes
@@ -359,7 +365,28 @@ def low_ratio_index_topk_hip_decode(
             backend.candidate_masks = None
         two_level = False
 
-    if (
+    use_triton_native = (
+        os.environ.get("SGLANG_DSV41_TRITON_FP4_INDEXER", "0") == "1"
+    )
+    if use_triton_native:
+        global _NATIVE_TRITON_INDEXER_LOGGED
+        if not _NATIVE_TRITON_INDEXER_LOGGED:
+            logger.info(
+                "Using capture-safe gfx942 Triton split-MXFP4 indexer kernel."
+            )
+            _NATIVE_TRITON_INDEXER_LOGGED = True
+        query = indexer.queries(q_lora, layer.freqs_cis[pos])
+        weights = indexer.head_weights(x)
+        logits = triton_fp4_split_paged_mqa_logits(
+            q=query,
+            weights=weights,
+            k_payload=pool.get_index_k_fp4_payload_buffer(layer.layer_id),
+            k_scale=pool.get_index_k_fp4_scale_buffer(layer.layer_id),
+            page_table=indexer_metadata.page_table,
+            lengths=indexer_metadata.compressed_seq_lens,
+            is_decode=True,
+        )
+    elif (
         os.environ.get("SGLANG_DSV41_TORCH_DECODE_INDEXER", "0") == "1"
         and forward_batch.forward_mode.is_decode()
     ):
@@ -513,12 +540,16 @@ def low_ratio_index_topk_hip_extend(
     assert indexer_metadata is not None, f"no prefill indexer metadata for {ratio = }"
     num_tokens = pos.shape[0]
     assert indexer_metadata.page_table.shape[0] >= num_tokens
+    use_triton_native = (
+        os.environ.get("SGLANG_DSV41_TRITON_FP4_INDEXER", "0") == "1"
+    )
     use_torch_prefill = (
         os.environ.get("SGLANG_DSV41_TORCH_PREFILL_INDEXER", "0") == "1"
     )
-    if use_torch_prefill:
+    if use_triton_native or use_torch_prefill:
         query = indexer.queries(q_lora, layer.freqs_cis[pos])
         weights = indexer.head_weights(x)
+    if use_torch_prefill and not use_triton_native:
         request_counts = torch.tensor(
             extend_lens_cpu, dtype=torch.int64, device=pos.device
         )
@@ -527,13 +558,23 @@ def low_ratio_index_topk_hip_extend(
             request_counts,
             output_size=num_tokens,
         )
-    else:
+    elif not use_triton_native:
         q_fp4, q_scale, weights = _indexer_inputs(layer, x, q_lora, pos)
         k_payload = pool.get_index_k_fp4_payload_buffer(layer.layer_id)
         k_scale = pool.get_index_k_fp4_scale_buffer(layer.layer_id)
         prefill_workspace = metadata.fp4_low_ratio_prefill_workspaces.get(ratio)
 
     def score_rows(rows: slice) -> torch.Tensor:
+        if use_triton_native:
+            return triton_fp4_split_paged_mqa_logits(
+                q=query[rows],
+                weights=weights[rows],
+                k_payload=pool.get_index_k_fp4_payload_buffer(layer.layer_id),
+                k_scale=pool.get_index_k_fp4_scale_buffer(layer.layer_id),
+                page_table=indexer_metadata.page_table[rows],
+                lengths=indexer_metadata.compressed_seq_lens[rows],
+                is_decode=False,
+            )
         if use_torch_prefill:
             return _low_ratio_index_logits_torch_extend_rows(
                 backend,
