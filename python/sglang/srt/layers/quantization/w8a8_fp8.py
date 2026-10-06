@@ -24,6 +24,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     cutlass_fp8_supported,
     input_to_float8,
     normalize_e4m3fn_to_e4m3fnuz,
+    use_aiter_bpreshuffle_gemm,
 )
 from sglang.srt.utils import get_bool_env_var, is_hip, set_weight_attrs
 
@@ -145,8 +146,9 @@ class W8A8Fp8LinearMethod(LinearMethodBase):
                     weight=weight, weight_scale=weight_scale
                 )
 
-            if _use_aiter:
-                # MFMA-preshuffle B so gemm_a8w8_bpreshuffle gets the fast layout.
+            if use_aiter_bpreshuffle_gemm(weight.shape[0], weight.shape[1]):
+                # MFMA-preshuffle B only for shapes accepted by the gfx942 CK
+                # dispatch. Unsupported K stays row-major for torch._scaled_mm.
                 from aiter.ops.shuffle import shuffle_weight
 
                 weight = shuffle_weight(weight.contiguous(), (16, 16))

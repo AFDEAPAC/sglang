@@ -2147,13 +2147,18 @@ def _apply_fallback_scaled_mm(
     return output.to(dtype=input_dtype)
 
 
-def use_aiter_bpreshuffle_gemm(output_size: int) -> bool:
+def use_aiter_bpreshuffle_gemm(
+    output_size: int, input_size: Optional[int] = None
+) -> bool:
     # aiter's CK gemm_a8w8_bpreshuffle instances are GemmSpecialization::Default
     # (pre-shuffled weights are never N-padded) with NPerBlock=64, so any N that
-    # is not a multiple of 64 raises "This GEMM is not supported!". Measured on
-    # gfx950 for M=16384/N=32/K=4096, torch._scaled_mm rowwise runs that shape in
-    # 14us against 90us for the cktile instance that does accept it.
-    return _use_aiter and output_size % 64 == 0
+    # is not a multiple of 64 raises "This GEMM is not supported!". Its gfx942
+    # heuristic also requires K <= 192 or K % 64 == 0; V4.1 has K=288 linears.
+    # Keep unsupported shapes unshuffled and route them to torch._scaled_mm.
+    input_supported = (
+        input_size is None or input_size <= 192 or input_size % 64 == 0
+    )
+    return _use_aiter and output_size % 64 == 0 and input_supported
 
 
 def apply_fp8_linear_bmm_flashinfer(
@@ -2369,7 +2374,7 @@ def apply_fp8_linear(
         # Must agree with the load-time predicate that decides whether the
         # weight was pre-shuffled; an unshuffled weight through the aiter path
         # (or a shuffled one through torch._scaled_mm) silently returns garbage.
-        if use_aiter_bpreshuffle_gemm(weight.shape[1]):
+        if use_aiter_bpreshuffle_gemm(weight.shape[1], weight.shape[0]):
             # gemm_a8w8_bpreshuffle(XQ, WQ, x_scale, w_scale, dtype)
             # XQ -> input tensor, shape = (m, k)
             # WQ -> weight tensor, shape = (n, k), with preshuffe get better perf
