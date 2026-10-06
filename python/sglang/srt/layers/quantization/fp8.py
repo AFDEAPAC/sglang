@@ -1750,8 +1750,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             and get_bool_env_var(
                 "AITER_GFX942_DSV41_EXACT_MXFP4_A16W4", "false"
             )
-            and w13_shape == (48, 4608, 2560)
-            and w2_shape == (48, 5120, 1152)
+            and w13_shape[0] in (48, 96)
+            and w13_shape[1:] == (4608, 2560)
+            and w2_shape[0] == w13_shape[0]
+            and w2_shape[1:] == (5120, 1152)
         )
         if _use_aiter and self.is_fp4_expert:
             # aiter MegaMoEv2 builds from the packed FP4 layout, so it has to

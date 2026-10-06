@@ -2153,10 +2153,11 @@ def use_aiter_bpreshuffle_gemm(
     # aiter's CK gemm_a8w8_bpreshuffle instances are GemmSpecialization::Default
     # (pre-shuffled weights are never N-padded) with NPerBlock=64, so any N that
     # is not a multiple of 64 raises "This GEMM is not supported!". Its gfx942
-    # heuristic also requires K <= 192 or K % 64 == 0; V4.1 has K=288 linears.
-    # Keep unsupported shapes unshuffled and route them to torch._scaled_mm.
+    # heuristic accepts K % 64, but the compiled gfx942 instances require
+    # K <= 192 or K % 128 == 0; V4.1 has K=288 and K=576 linears. Keep
+    # unsupported shapes unshuffled and route them to torch._scaled_mm.
     input_supported = (
-        input_size is None or input_size <= 192 or input_size % 64 == 0
+        input_size is None or input_size <= 192 or input_size % 128 == 0
     )
     return _use_aiter and output_size % 64 == 0 and input_supported
 
