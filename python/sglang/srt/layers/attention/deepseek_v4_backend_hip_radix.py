@@ -3232,11 +3232,6 @@ class DeepseekV4HipRadixBackend(
                 self, layer, x, q_lora, pos, forward_batch=forward_batch
             )
         elif forward_batch.forward_mode.is_extend():
-            if envs.SGLANG_DSV41_TORCH_PREFILL_INDEXER.get():
-                raise NotImplementedError(
-                    "SGLANG_DSV41_TORCH_PREFILL_INDEXER (the torch prefill indexer "
-                    "oracle) is not supported on HIP"
-                )
             # HIP rejects V4.1 prefill CP, the only caller passing rows_per_request
             assert rows_per_request is None, "V4.1 prefill CP is not supported on HIP"
             assert (

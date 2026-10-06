@@ -46,6 +46,8 @@ if TYPE_CHECKING:
 
 # fp32 logits scored per candidate-block chunk stay under this many bytes
 _CANDIDATE_SCORE_BUDGET_BYTES = 1 << 30
+# Match the generic torch prefill oracle: cap one [rows, heads, context] tile.
+_TORCH_SCORE_BUDGET_BYTES = 1 << 30
 
 
 def _gemv_head_weight_rows(indexer, x: torch.Tensor) -> bool:
@@ -263,6 +265,62 @@ def _low_ratio_index_logits_torch_decode(
     return logits
 
 
+def _low_ratio_index_logits_torch_extend_rows(
+    backend,
+    layer,
+    query: torch.Tensor,
+    weights: torch.Tensor,
+    request_rows: torch.Tensor,
+    compress_lens: torch.Tensor,
+    rows: slice,
+) -> torch.Tensor:
+    """Reference extend logits for gfx942, where scaled FP4 MFMA is unavailable.
+
+    Rows stay request-local, matching the FlyDSL output contract. Chunking uses
+    the same transient-memory budget as the generic V4.1 torch prefill oracle.
+    """
+    pool = backend.token_to_kv_pool
+    ratio = layer.compress_ratio
+    indexer = layer.indexer
+    row_requests = request_rows[rows]
+    row_lens = compress_lens[rows].to(torch.int64)
+    width = max(int(row_lens.max().item()), 1)
+    width = triton.cdiv(width, 4) * 4
+    logits = torch.full(
+        (row_lens.numel(), width),
+        -torch.inf,
+        dtype=torch.float32,
+        device=query.device,
+    )
+    row_offset = rows.start or 0
+    for request in torch.unique_consecutive(row_requests).tolist():
+        local_rows = (row_requests == request).nonzero().squeeze(1)
+        lens = row_lens[local_rows]
+        lc = int(lens.max().item())
+        if lc == 0:
+            continue
+        columns = torch.arange(lc, device=query.device, dtype=torch.int64)
+        slots = (
+            backend.req_to_token[request, columns * ratio].to(torch.int64) // ratio
+        )
+        index_k = pool.get_low_ratio_index_k_dequant(layer.layer_id, slots)
+        step = max(
+            1, _TORCH_SCORE_BUDGET_BYTES // (query.shape[1] * lc * 2)
+        )
+        for start in range(0, local_rows.numel(), step):
+            local = local_rows[start : start + step]
+            local_lens = lens[start : start + step]
+            global_rows = local + row_offset
+            scores = indexer.scores(
+                query[global_rows], index_k, weights[global_rows]
+            )
+            scores.masked_fill_(
+                columns[None, :] >= local_lens[:, None], -torch.inf
+            )
+            logits[local, :lc] = scores
+    return logits
+
+
 def low_ratio_index_topk_hip_decode(
     backend, layer, x, q_lora, pos, forward_batch: ForwardBatch
 ) -> None:
@@ -455,12 +513,37 @@ def low_ratio_index_topk_hip_extend(
     assert indexer_metadata is not None, f"no prefill indexer metadata for {ratio = }"
     num_tokens = pos.shape[0]
     assert indexer_metadata.page_table.shape[0] >= num_tokens
-    q_fp4, q_scale, weights = _indexer_inputs(layer, x, q_lora, pos)
-    k_payload = pool.get_index_k_fp4_payload_buffer(layer.layer_id)
-    k_scale = pool.get_index_k_fp4_scale_buffer(layer.layer_id)
-    prefill_workspace = metadata.fp4_low_ratio_prefill_workspaces.get(ratio)
+    use_torch_prefill = (
+        os.environ.get("SGLANG_DSV41_TORCH_PREFILL_INDEXER", "0") == "1"
+    )
+    if use_torch_prefill:
+        query = indexer.queries(q_lora, layer.freqs_cis[pos])
+        weights = indexer.head_weights(x)
+        request_counts = torch.tensor(
+            extend_lens_cpu, dtype=torch.int64, device=pos.device
+        )
+        request_rows = torch.repeat_interleave(
+            forward_batch.req_pool_indices.to(torch.int64),
+            request_counts,
+            output_size=num_tokens,
+        )
+    else:
+        q_fp4, q_scale, weights = _indexer_inputs(layer, x, q_lora, pos)
+        k_payload = pool.get_index_k_fp4_payload_buffer(layer.layer_id)
+        k_scale = pool.get_index_k_fp4_scale_buffer(layer.layer_id)
+        prefill_workspace = metadata.fp4_low_ratio_prefill_workspaces.get(ratio)
 
     def score_rows(rows: slice) -> torch.Tensor:
+        if use_torch_prefill:
+            return _low_ratio_index_logits_torch_extend_rows(
+                backend,
+                layer,
+                query,
+                weights,
+                request_rows,
+                compress_lens,
+                rows,
+            )
         return aiter_fp4_paged_mqa_logits(
             q_fp4=q_fp4[rows],
             q_scale=q_scale[rows],
