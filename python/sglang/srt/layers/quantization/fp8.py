@@ -89,6 +89,7 @@ from sglang.srt.layers.quantization.utils import (
 )
 from sglang.srt.layers.utils import copy_or_rebind_param
 from sglang.srt.runtime_context import (
+    get_flags,
     get_parallel,
     get_platform,
 )
@@ -1750,10 +1751,65 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             and get_bool_env_var(
                 "AITER_GFX942_DSV41_EXACT_MXFP4_A16W4", "false"
             )
-            and w13_shape[0] in (48, 96)
+            and w13_shape[0] in (48, 96, 192)
             and w13_shape[1:] == (4608, 2560)
             and w2_shape[0] == w13_shape[0]
             and w2_shape[1:] == (5120, 1152)
+        ) or (
+            # DSV4.1 INT2 TP2/EP1: 384 experts/rank, intermediate tensor-sharded
+            # to 1152 (no pad). w13=(384, 2*1152, 5120/2), w2=(384, 5120, 1152/2).
+            # Routes to the same guinterleave preshuffle contract that the exact
+            # a16w4 gfx942 kernel expects (matches the numerics gate's
+            # shuffle_weight(is_guinterleave=True)); separate env from the
+            # EP2/E=192 path so that path is unchanged.
+            _is_hip
+            and get_bool_env_var(
+                "AITER_GFX942_DSV41_EXACT_MXFP4_A16W4_TP2_EP1", "false"
+            )
+            and w13_shape[0] == 384
+            and w13_shape[1:] == (2304, 2560)
+            and w2_shape[0] == 384
+            and w2_shape[1:] == (5120, 576)
+        )
+        # DSV4.1 TP4/EP1: all 384 routed experts per rank, intermediate
+        # tensor-sharded by TP=4 to a true 576 (pre-pad w13 N=1152, w2 Kpacked=288).
+        # Use the same exact-path guinterleave shuffle the gfx942 a16w4 kernel
+        # expects; otherwise the loader falls through to the non-exact
+        # (gu_intv/gate_up) shuffle layout and the kernel reads mismatched
+        # weights/scales (coherent-looking boot, gibberish output). The LARGEM
+        # env shares this loader-side exact shuffle; the BF16-activation split-K
+        # dispatch itself is selected in AITER by the separate largem env.
+        gfx942_exact_native_a16w4_ep1 = (
+            _is_hip
+            and (
+                get_bool_env_var(
+                    "AITER_GFX942_DSV41_EXACT_MXFP4_A16W4_EP1", "false"
+                )
+                or get_bool_env_var(
+                    "AITER_GFX942_DSV41_EP1_LARGEM_SPLITK_BF16", "false"
+                )
+            )
+            and w13_shape[0] == 384
+            and w13_shape[1:] == (1152, 2560)
+            and w2_shape[0] == 384
+            and w2_shape[1:] == (5120, 288)
+        )
+        if gfx942_exact_native_a16w4_ep1:
+            gfx942_exact_native_a16w4 = True
+            logger.info(
+                "[dsv41-ep1] exact a16w4 guinterleave shuffle enabled for "
+                "w13=%s w2=%s", w13_shape, w2_shape
+            )
+        # DSV4.1 DSpark same-model MTP draft (E=128 routed experts, local inter
+        # 1152, topk 3) uses the packed int4 a16wi4 path below (not the exact
+        # fp4 a16w4 kernel, which produces NaN at E=128). This keeps the draft
+        # weights packed (~3.4 GiB) instead of the BF16 expansion (~13.6 GiB)
+        # that does not fit on top of the 173.7 GiB INT2 target. Triggered only
+        # during speculative draft weight loading.
+        _dspark_draft_int4 = (
+            _is_hip
+            and get_bool_env_var("SGLANG_DSV41_DSPARK_DRAFT_INT4", "false")
+            and get_flags().moe.speculative_context
         )
         if _use_aiter and self.is_fp4_expert:
             # aiter MegaMoEv2 builds from the packed FP4 layout, so it has to
@@ -1862,13 +1918,88 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                         new_s2, requires_grad=False
                     )
 
+                if (
+                    _is_hip
+                    and get_bool_env_var(
+                        "SGLANG_DSV41_DSPARK_TRITON_BF16_MOE", "false"
+                    )
+                    and get_flags().moe.speculative_context
+                    and get_moe_runner_backend().is_triton()
+                ):
+                    # The ROCm Triton runner has no native MXFP4 decode path. For
+                    # the three same-model DSpark MTP layers only, dequantize the
+                    # packed E2M1/E8M0 weights exactly to row-major BF16. Target
+                    # layers remain on the isolated AITER split-K path.
+                    from aiter.utility.fp4_utils import e8m0_to_f32, mxfp4_to_f32
+
+                    def _mxfp4_to_bf16(w_packed, scale_e8m0):
+                        experts, out_dim, packed_k = w_packed.shape
+                        in_dim = packed_k * 2
+                        out = torch.empty(
+                            (experts, out_dim, in_dim),
+                            dtype=torch.bfloat16,
+                            device=w_packed.device,
+                        )
+                        w_u8 = w_packed.view(torch.uint8)
+                        scale_u8 = scale_e8m0.view(torch.uint8)
+                        step = 4
+                        for expert_start in range(0, experts, step):
+                            expert_end = min(expert_start + step, experts)
+                            decoded = mxfp4_to_f32(
+                                w_u8[expert_start:expert_end].clone()
+                            ).view(expert_end - expert_start, out_dim, in_dim)
+                            scales = e8m0_to_f32(
+                                scale_u8[expert_start:expert_end]
+                            ).view(
+                                expert_end - expert_start,
+                                out_dim,
+                                in_dim // 32,
+                            )
+                            out[expert_start:expert_end] = (
+                                decoded.view(
+                                    expert_end - expert_start,
+                                    out_dim,
+                                    in_dim // 32,
+                                    32,
+                                )
+                                * scales.unsqueeze(-1)
+                            ).view(expert_end - expert_start, out_dim, in_dim)
+                            del decoded, scales
+                        return out
+
+                    w13_bf16 = _mxfp4_to_bf16(
+                        layer.w13_weight.data, layer.w13_weight_scale_inv.data
+                    )
+                    w2_bf16 = _mxfp4_to_bf16(
+                        layer.w2_weight.data, layer.w2_weight_scale_inv.data
+                    )
+                    old_w13 = layer.w13_weight
+                    old_w2 = layer.w2_weight
+                    layer.w13_weight = torch.nn.Parameter(
+                        w13_bf16, requires_grad=False
+                    )
+                    layer.w2_weight = torch.nn.Parameter(w2_bf16, requires_grad=False)
+                    layer._dspark_triton_bf16_moe = True
+                    del old_w13, old_w2
+                    torch.cuda.empty_cache()
+                    logger.info(
+                        "DSpark Triton MoE dequantized MXFP4 weights to BF16: "
+                        "w13=%s w2=%s",
+                        tuple(layer.w13_weight.shape),
+                        tuple(layer.w2_weight.shape),
+                    )
+                    return
+
                 # gfx942 (MI30x): the fp4 (E2M1) MoE GEMM kernels are broken/absent on
                 # gfx942 (CK-Tile A16W4 numerically wrong; fp4-activation quant unimplemented;
                 # afp8_wfp4 FlyDSL is gfx950-only). Convert MXFP4 (E2M1 + E8M0 microscale) to
                 # int4 [-7,7] + bf16 groupwise scale and use the FlyDSL a16wi4 (int4_bf16) path,
                 # which is numerically exact on gfx942 (validated logits_diff ~3e-5).
-                if _is_hip and get_bool_env_var("SGLANG_GFX942_MXFP4_INT4", "true"):
-                    logger.info("[GFX942-INT4] converting MXFP4 MoE -> int4 a16wi4 (w13=%s w2=%s)", tuple(layer.w13_weight.shape), tuple(layer.w2_weight.shape))
+                if _is_hip and (
+                    get_bool_env_var("SGLANG_GFX942_MXFP4_INT4", "true")
+                    or _dspark_draft_int4
+                ):
+                    logger.info("[GFX942-INT4] converting MXFP4 MoE -> int4 a16wi4 (w13=%s w2=%s dspark_draft=%s)", tuple(layer.w13_weight.shape), tuple(layer.w2_weight.shape), _dspark_draft_int4)
                     from aiter import dtypes as _adt
                     from aiter.ops.quant import per_1x32_i4_quant
                     from aiter.ops.shuffle import (
@@ -1946,6 +2077,14 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     layer.w2_weight_scale_inv = torch.nn.Parameter(w2_s, requires_grad=False)
                     layer.w13_weight.is_shuffled = True
                     layer.w2_weight.is_shuffled = True
+                    # Mark the layer so the forward dispatch
+                    # (maybe_get_hip_aiter_quant_info) views the packed bytes as
+                    # INT4 (a16wi4) even when the global SGLANG_GFX942_MXFP4_INT4
+                    # env is off (which it is for the DSpark target, whose
+                    # experts stay on the exact fp4 a16w4 path). Without this the
+                    # draft's int4 weights would be re-viewed as E2M1 fp4 and
+                    # dispatched to the broken fp4-activation kernel.
+                    layer._gfx942_int4_a16wi4 = True
                     del _old_w13, _old_w2, _old_s13, _old_s2
                     try:
                         torch.cuda.empty_cache()
@@ -3024,6 +3163,13 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             pass
 
     def get_triton_quant_info(self, layer: torch.nn.Module) -> TritonMoeQuantInfo:
+        if getattr(layer, "_dspark_triton_bf16_moe", False):
+            return TritonMoeQuantInfo(
+                w13_weight=layer.w13_weight,
+                w2_weight=layer.w2_weight,
+                b13=getattr(layer, "w13_weight_bias", None),
+                b2=getattr(layer, "w2_weight_bias", None),
+            )
         use_rocm_mxfp8 = self.use_mxfp8 and _is_hip and _is_gfx95_supported
         return TritonMoeQuantInfo(
             w13_weight=layer.w13_weight,
@@ -3470,11 +3616,15 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             )
 
             if self.is_fp4_expert:
-                if _is_hip and get_bool_env_var(
-                    "SGLANG_GFX942_MXFP4_INT4", "true"
+                if _is_hip and (
+                    get_bool_env_var("SGLANG_GFX942_MXFP4_INT4", "true")
+                    or getattr(layer, "_gfx942_int4_a16wi4", False)
                 ):
                     # The post-load path converted MXFP4 to the gfx942 INT4/BF16
-                    # layout. Keep the packed bytes as INT4 instead of E2M1.
+                    # layout. Keep the packed bytes as INT4 instead of E2M1. The
+                    # per-layer marker covers the DSpark draft, whose experts are
+                    # int4-converted while the global env stays off (target stays
+                    # on the exact fp4 a16w4 path).
                     from aiter import dtypes as _adt
 
                     w13_weight = w13_weight.view(_adt.i4x2)

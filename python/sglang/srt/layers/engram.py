@@ -24,6 +24,13 @@ from torch import nn
 from sglang.kernels.ops.attention.dsv4.torch_quant import FP8_BLOCK_SIZE
 from sglang.kernels.ops.embeddings.engram_gate import fused_engram_gate
 from sglang.kernels.ops.embeddings.engram_gather import engram_gather
+from sglang.kernels.ops.embeddings.engram_int2 import (
+    DEFAULT_R as INT2_DEFAULT_R,
+    INT2_GROUP,
+    SCHEME as INT2_SCHEME,
+    engram_int2_gather,
+    simulate_int2,
+)
 from sglang.kernels.ops.embeddings.engram_hash import (
     MODE_DECODE,
     MODE_EXTEND,
@@ -57,6 +64,21 @@ logger = logging.getLogger(__name__)
 _MILLER_RABIN_WITNESSES = (2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37)
 
 _is_hip = is_hip()
+
+# Env-gated dsv41_engram_int2_v1 path. INT2 enables the packed 2-bit device table
+# + gather kernel (needs an int2 checkpoint); INT2_SIM runs an on-the-fly
+# FP8->INT2->dequant quality simulation on the stock fp8 table. Both default off,
+# so the production fp8 path is byte-for-byte unchanged.
+_ENGRAM_INT2 = os.environ.get("SGLANG_DSV41_ENGRAM_INT2", "0") == "1"
+_ENGRAM_INT2_SIM = os.environ.get("SGLANG_DSV41_ENGRAM_INT2_SIM", "0") == "1"
+_ENGRAM_INT2_R = float(os.environ.get("SGLANG_DSV41_ENGRAM_INT2_R", str(INT2_DEFAULT_R)))
+
+
+def engram_int2_enabled(config) -> bool:
+    """Recognize the INT2 scheme from env or the checkpoint config/manifest."""
+    if _ENGRAM_INT2:
+        return True
+    return getattr(config, "engram_quant_scheme", None) == INT2_SCHEME
 
 
 def _cuda_kernels(t: torch.Tensor) -> bool:
@@ -679,16 +701,35 @@ class EngramEmbedding(nn.Module):
     in every layout: a rank writes only its own row range.
     """
 
-    def __init__(self, num_embeddings: int, dim: int, layer_id: int):
+    def __init__(
+        self, num_embeddings: int, dim: int, layer_id: int, int2: bool = False
+    ):
         super().__init__()
         self.dim = dim
+        self.int2 = int2
+        self.int2_r = _ENGRAM_INT2_R
         self.tp_size = get_parallel().tp_size
         tp_rank = get_parallel().tp_rank
         self.row_start = num_embeddings * tp_rank // self.tp_size
         row_end = num_embeddings * (tp_rank + 1) // self.tp_size
         self.rows = row_end - self.row_start
         self.host_table: Optional[_HostTable] = None
-        if envs.SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE.get():
+        if self.int2:
+            # dsv41_engram_int2_v1: packed 2-bit codes (dim//4 bytes/row) + e8m0
+            # group scales (dim//INT2_GROUP bytes/row), device row shard. The host
+            # table would need these same byte counts (reported below), left to
+            # the converter path; this task exercises the device shard + loader.
+            assert dim % 4 == 0 and dim % INT2_GROUP == 0, dim
+            self.int2_host_bytes = num_embeddings * (dim // 4 + dim // INT2_GROUP)
+            self.weight = nn.Parameter(
+                torch.empty(self.rows, dim // 4, dtype=torch.uint8),
+                requires_grad=False,
+            )
+            self.scale = nn.Parameter(
+                torch.empty(self.rows, dim // INT2_GROUP, dtype=torch.uint8),
+                requires_grad=False,
+            )
+        elif envs.SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE.get():
             self._init_host_table(num_embeddings, dim, layer_id)
         else:
             self.weight = nn.Parameter(
@@ -802,6 +843,22 @@ class EngramEmbedding(nn.Module):
         """Rows of `indices` this rank's shard holds, zero for the rest."""
         if self.rows == 0:
             return self._empty(indices).zero_()
+        if self.int2:
+            # Packed INT2 gather: same row-ownership / zero-unowned contract as the
+            # fp8 gather, so the int32-add all-reduce reassembles the full table.
+            out = self._empty(indices)
+            engram_int2_gather(
+                self.weight.data_ptr(),
+                self.scale.data_ptr(),
+                indices,
+                out.view(-1, self.dim),
+                self.dim,
+                INT2_GROUP,
+                self.int2_r,
+                row_lo=self.row_start,
+                row_hi=self.row_start + self.rows,
+            )
+            return out
         if (
             self.host_table is None
             and _is_hip
@@ -927,7 +984,10 @@ class Engram(nn.Module):
         self.clamp_value = 1e-6
         dim, hc_mult = config.hidden_size, config.hc_mult
         self.embed = EngramEmbedding(
-            layout.num_embeddings[self.layer_hash_index], layout.head_dim, layer_id
+            layout.num_embeddings[self.layer_hash_index],
+            layout.head_dim,
+            layer_id,
+            int2=engram_int2_enabled(config),
         )
         n_hash_cols = (layout.max_ngram_size - 1) * layout.n_heads
         self.wkv = ReplicatedLinear(
@@ -952,6 +1012,12 @@ class Engram(nn.Module):
         # The lookup runs first even for an idle DP-attention batch: under DP
         # attention it is a collective every rank has to join.
         emb = self.embed(hash_ids, forward_batch, cp_all_tokens=cp_all_tokens)
+        if _ENGRAM_INT2_SIM and emb.shape[0] > 0:
+            # On-the-fly quality gate: quantize the gathered fp8 embedding to the
+            # dsv41_engram_int2_v1 contract and dequantize before wkv/gate, exactly
+            # the converter + kernel math. HBM/bandwidth are unchanged; this only
+            # measures model quality ahead of a full INT2 conversion.
+            emb = simulate_int2(emb, _ENGRAM_INT2_R, INT2_GROUP)
         if x.shape[0] == 0:
             # Nothing to gate, and the MXFP8 quantize behind wkv rejects an
             # empty M.

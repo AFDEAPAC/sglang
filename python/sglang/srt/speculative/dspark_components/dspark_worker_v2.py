@@ -1,4 +1,6 @@
 import logging
+import os
+from contextlib import ExitStack, contextmanager
 from typing import TYPE_CHECKING, Callable, Optional, Protocol, runtime_checkable
 
 import torch
@@ -10,6 +12,11 @@ from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_dp_tp_group
 from sglang.srt.layers.logprob_processor import compute_spec_logprobs
+from sglang.srt.layers.moe.utils import (
+    get_speculative_moe_runner_backend,
+    speculative_moe_a2a_backend_context,
+    speculative_moe_backend_context,
+)
 from sglang.srt.lora.layers import unwrap_lora_layer
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
@@ -205,6 +212,14 @@ class DSparkWorkerV2(BaseSpecWorker):
         self.draft_model_runner = bundle.draft_model_runner
         self.draft_model = bundle.draft_model
         self._draft_sampler = None
+        if (
+            os.environ.get("SGLANG_DSV41_DSPARK_SPEC_MOE_CONTEXT", "0") == "1"
+            and get_parallel().tp_rank == 0
+        ):
+            logger.info(
+                "DSpark speculative MoE context enabled. backend=%s",
+                get_speculative_moe_runner_backend(),
+            )
 
         # The mask token is input-only (it is embedded, never sampled), so its
         # bound is the embedding-table row count: the PADDED vocab when the
@@ -438,8 +453,14 @@ class DSparkWorkerV2(BaseSpecWorker):
             raise AttributeError(name)
         return getattr(self.target_worker, name)
 
+    @contextmanager
     def _draft_context(self):
-        return draft_tp_context(self._draft_dp_context_enabled)
+        with ExitStack() as stack:
+            stack.enter_context(draft_tp_context(self._draft_dp_context_enabled))
+            if os.environ.get("SGLANG_DSV41_DSPARK_SPEC_MOE_CONTEXT", "0") == "1":
+                stack.enter_context(speculative_moe_backend_context())
+                stack.enter_context(speculative_moe_a2a_backend_context())
+            yield
 
     def alloc_memory_pool(
         self,
