@@ -4059,6 +4059,23 @@ class MLATokenToKVPool(KVCache):
             if not valid_mask.all():
                 loc = loc[valid_mask]
                 cache_k = cache_k[valid_mask]
+        # SGLANG_DECODE_GLUE_TAIL: fuse bf16->fp8 quant with paged MLA KV write (same as DSA path).
+        if (
+            _is_hip
+            and self.dtype == fp8_dtype
+            and self.store_dtype != self.dtype
+        ):
+            cache_k_nope = cache_k[..., : self.kv_lora_rank]
+            cache_k_rope = cache_k[..., self.kv_lora_rank :]
+            set_mla_kv_buffer_triton_fp8_quant(
+                self.kv_buffer[layer_id - self.start_layer],
+                loc,
+                cache_k_nope,
+                cache_k_rope,
+                fp8_dtype,
+            )
+            return
+
         if cache_k.dtype != self.dtype:
             cache_k = cache_k.to(self.dtype)
 

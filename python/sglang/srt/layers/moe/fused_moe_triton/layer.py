@@ -1501,9 +1501,10 @@ class FusedMoE(torch.nn.Module):
             final_hidden_states = self.dispatcher.combine(combine_input=combine_input)
 
             # TODO: should we add some conditions here?
-            final_hidden_states = final_hidden_states[
-                ..., :origin_hidden_states_dim
-            ].contiguous()
+            # SGLANG_DECODE_GLUE_TAIL: avoid rocclr_copyBuffer when the trim is already contiguous.
+            final_hidden_states = final_hidden_states[..., :origin_hidden_states_dim]
+            if not final_hidden_states.is_contiguous():
+                final_hidden_states = final_hidden_states.contiguous()
 
         if self.reduce_results and (self.moe_tp_size > 1 or self.moe_ep_size > 1):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)

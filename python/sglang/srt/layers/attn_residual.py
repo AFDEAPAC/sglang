@@ -289,6 +289,22 @@ def _aggregate_hip(
     mixing share one read, and the pending residual add, the bank snapshot and
     the output RMSNorm all fold into the same launch. out_norm None returns the
     pre-norm mixture instead. Returns (result, prefix)."""
+    # K3_AITER_ATTN_RES: prefill-only dispatch to aiter's attn_res_gate, which does not
+    # fall off the register-tile cliff this kernel hits at nvb >= 5.
+    if out_norm is not None and not write_bank_row:
+        from sglang.kernels.ops.kimi_k3 import attn_res_aiter as _k3_ara
+
+        if _k3_ara.wants(prefix_sum.shape[0], nvb):
+            return _k3_ara.gate(
+                prefix_sum,
+                addend,
+                bank,
+                nvb,
+                get_cw(score_proj, score_norm),
+                score_norm.variance_epsilon,
+                out_norm.weight,
+                out_norm.variance_epsilon,
+            )
     from sglang.kernels.ops.kimi_k3.attn_res_hip import attn_res_hip
 
     cw = get_cw(score_proj, score_norm)

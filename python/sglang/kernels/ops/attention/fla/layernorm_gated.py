@@ -254,7 +254,10 @@ def _layer_norm_fwd(
     rows_per_block = calc_rows_per_block(M, x.device)
     # Update grid to use rows_per_block
     grid = (cdiv(M, rows_per_block), ngroups)
-    pdl_kwargs = {"USE_GDC": True, "launch_pdl": True} if is_arch_support_pdl() else {}
+    use_pdl = is_arch_support_pdl()
+    pdl_kwargs = {"USE_GDC": use_pdl}
+    if use_pdl:
+        pdl_kwargs["launch_pdl"] = True
     # Workaround for PyTorch <= 2.12: torch.xpu.device is not Dynamo-compatible
     # in that release — it creates a DynamoConfigPatchProxy that
     # SourcelessBuilder cannot wrap, causing a hard error under

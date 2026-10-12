@@ -12,6 +12,7 @@ from enum import Enum, auto
 from typing import TYPE_CHECKING, Optional
 
 import torch
+from sglang.srt.environ import envs
 import triton
 
 from sglang.kernels.ops.attention.utils import (
@@ -295,17 +296,33 @@ class AiterAttnBackend(AttentionBackend):
         self.forward_metadata: ForwardMetadata = None
 
         if self.use_mla:
-            _valid_heads = self.num_head in (4, 8) or (
+            # gfx942/gfx950 MLA ASM are QH8/QH16/... ; TP8 on Kimi-K3
+            # yields 96/8=12 heads. Support 12 by zero-padding Q to 16 and
+            # slicing the first 12 outputs (repeat_interleave only works when
+            # 16 % num_head == 0, i.e. 4 or 8).
+            _valid_heads = self.num_head in (4, 6, 8, 12) or (
                 self.num_head % 16 == 0 and 16 <= self.num_head <= 128
             )
             assert _valid_heads, (
-                f"Aiter MLA supports num_head of 4, 8, or multiples of 16 "
+                f"Aiter MLA supports num_head of 4, 6, 8, 12, or multiples of 16 "
                 f"in [16, 128].\n"
                 f"Provided {self.num_head} number of heads.\n"
                 "Try adjusting tensor_parallel_size value."
             )
-            self.num_head_padded = 16 if self.num_head < 16 else self.num_head
-            self.head_repeat_factor = 16 // self.num_head if self.num_head < 16 else 1
+            if self.num_head < 16:
+                self.num_head_padded = 16
+                if self.num_head in (4, 8):
+                    self.head_repeat_factor = 16 // self.num_head
+                    self.head_zero_pad = 0
+                else:
+                    # TP16 -> 96/16=6: zero-pad to QH16 (same path as QH12).
+                    self.head_repeat_factor = 1
+                    self.head_zero_pad = 16 - self.num_head
+                    self.head_pad_mode = "zero"
+            else:
+                self.num_head_padded = self.num_head
+                self.head_repeat_factor = 1
+                self.head_zero_pad = 0
 
             self.enable_dp_attention = is_dp_attention_enabled()
             self.qo_indptr_ = torch.zeros(
@@ -321,6 +338,17 @@ class AiterAttnBackend(AttentionBackend):
                 fast_mode = True
                 intra_batch_mode = False
 
+            # K3_MLA_DECODE_BALANCED: gfx942 intra-batch metadata pins 16 splits/seq (CU imbalance up to
+            # 1.25x at bs 8/16); fast_mode metadata balances KV tokens per CU.
+            if (
+                get_bool_env_var("SGLANG_K3_MLA_DECODE_BALANCED", "false")
+                and _use_mla_ps_kernel
+                and self.num_head_padded == 16
+            ):
+                fast_mode = True
+                intra_batch_mode = False
+                print("[k3-mla-balanced] active fast_mode=True intra_batch_mode=False", flush=True)
+
             # current persist a16w16 mla_decode kernel does not support head_num = 128
             # need to fall back to non-persist
             # only use mla_ps_kernel when fp8 kv_cache
@@ -333,12 +361,50 @@ class AiterAttnBackend(AttentionBackend):
                 fast_mode = False
                 intra_batch_mode = False
 
+            # K3_GLUON_H12_PORT (#37438): only disable PS kernel when Gluon is selected.
+            self.head_pad_mode = getattr(self, "head_pad_mode", "none")
+            if self.head_pad_mode == "zero" and self.kv_cache_dtype == fp8_dtype:
+                from sglang.srt.layers.attention.aiter_mla_gluon import (
+                    log_mla_gluon_capability,
+                    prefer_mla_gluon_decode,
+                )
+
+                if prefer_mla_gluon_decode(
+                    head_pad_mode=self.head_pad_mode,
+                    num_head=self.num_head,
+                    kv_cache_dtype=self.kv_cache_dtype,
+                ):
+                    _use_mla_ps_kernel = False
+                    fast_mode = False
+                    intra_batch_mode = False
+                log_mla_gluon_capability(logger)
+
             self.max_split_per_batch = 32 if _use_mla_ps_kernel else None
 
             if self.num_draft_tokens is None and _use_mla_ps_kernel:
                 self.max_split_per_batch = 64
 
             self.fix_max_split_per_batch = self.max_split_per_batch
+
+            # K3_MLA_SPLIT_OVERRIDE: measurement hook + positive control.
+            # Deliberately here, in __init__, NOT in make_mla_decode_meta_data_buffer --
+            # that body is guarded by `if self.enable_dp_attention:`, which is 0 on this
+            # config, so a hook placed there never runs. See
+            # prof/next_round_20260915/probe_mla_splits/RETRACTED.md.
+            import os as _k3_os
+            import logging as _k3_logging
+
+            _k3_split = _k3_os.environ.get("SGLANG_MLA_MAX_SPLIT")
+            if _k3_split and self.fix_max_split_per_batch is not None:
+                self.max_split_per_batch = min(
+                    int(_k3_split), self.fix_max_split_per_batch
+                )
+            _k3_logging.getLogger(__name__).info(
+                "[k3-mla-split] effective=%s requested=%s cap=%s",
+                self.max_split_per_batch,
+                _k3_split or "unset",
+                self.fix_max_split_per_batch,
+            )
 
     def _get_aiter_paged_ragged_kv_cache_dtype(self) -> str:
         """``kv_cache_dtype`` string for ``paged_attention_ragged`` (aiter ``pa/pa_ragged.py``).
@@ -760,9 +826,8 @@ class AiterAttnBackend(AttentionBackend):
     ):
         """Wrap mla_decode_fwd with head-dimension padding for num_head < 16.
 
-        When head_repeat_factor > 1 (i.e. num_head is 4 or 8), q is
-        repeat-interleaved to reach num_head_padded (16) before the kernel
-        call, and the corresponding output columns are sliced back afterward.
+        - num_head in {4,8}: repeat-interleave to 16, then stride-slice back.
+        - num_head == 12: zero-pad 4 dummy heads to 16, then take [:12].
         q / o must already be shaped (..., num_head, head_dim).
         """
         if self.head_repeat_factor > 1:
@@ -773,6 +838,93 @@ class AiterAttnBackend(AttentionBackend):
             )
             mla_decode_fwd(q_in, k_buffer_flat, o, **kwargs)
             return o[:, :: self.head_repeat_factor, :]
+        elif getattr(self, "head_zero_pad", 0) > 0:
+            # K3_GLUON_H12_PORT: native h12 Gluon path avoids zero_/copy_ padding.
+            from sglang.srt.layers.attention.aiter_mla_gluon import (
+                mla_gluon_decode,
+                prefer_mla_gluon_decode,
+            )
+
+            if prefer_mla_gluon_decode(
+                head_pad_mode=getattr(self, "head_pad_mode", "none"),
+                num_head=self.num_head,
+                kv_cache_dtype=self.kv_cache_dtype,
+            ):
+                kv_indices = kwargs.get("kv_indices")
+                kv_indptr = kwargs.get("kv_indptr")
+                max_seqlen_q = kwargs.get("max_seqlen_q") or 1
+                kv_scale = kwargs.get("kv_scale")
+                if kv_scale is None:
+                    kv_scale = kwargs.get("q_scale", 1.0)
+                if isinstance(kv_scale, torch.Tensor):
+                    kv_scale = float(kv_scale.reshape(-1)[0].item())
+                if kv_indices is not None and kv_indptr is not None:
+                    gluon_out = mla_gluon_decode(
+                        q=q,
+                        k_buffer=k_buffer_flat,
+                        layer=layer,
+                        kv_indices=kv_indices,
+                        kv_indptr=kv_indptr,
+                        sm_scale=float(kwargs.get("sm_scale", layer.scaling)),
+                        kv_scale=float(kv_scale),
+                        min_kv_seq_len=1,
+                        qlen=int(max_seqlen_q),
+                    )
+                    if gluon_out is not None:
+                        return gluon_out
+            # F.pad pads from the last dim: (D_left, D_right, H_left, H_right)
+            # K3_MLA_FUSED_PREP: q may already sit in heads [0:H) of a zero-padded buffer.
+            from sglang.srt.layers.attention import k3_mla_fused_prep as _k3_mla_fp
+
+            q_in = _k3_mla_fp.lookup(q, self.num_head_padded)
+            if q_in is not None:
+                pass
+            elif envs.SGLANG_DECODE_MLA_HEAD_PAD_BUF.get():
+                batch = q.shape[0]
+                buf = getattr(self, "_decode_q_head_pad_buf", None)
+                if (
+                    buf is None
+                    or buf.shape[0] < batch
+                    or buf.shape[1] != self.num_head_padded
+                    or buf.shape[2] != q.shape[-1]
+                    or buf.dtype != q.dtype
+                    or buf.device != q.device
+                ):
+                    self._decode_q_head_pad_buf = q.new_zeros(
+                        (batch, self.num_head_padded, q.shape[-1])
+                    )
+                    buf = self._decode_q_head_pad_buf
+                q_in = buf[:batch]
+                q_in.zero_()
+                q_in[:, : self.num_head, :].copy_(q)
+            else:
+                q_in = torch.nn.functional.pad(q, (0, 0, 0, self.head_zero_pad))
+            o = q.new_empty(
+                (q.shape[0], self.num_head_padded, layer.v_head_dim),
+                dtype=self.input_dtype,
+            )
+            if _k3_mla_fp.A8W8:
+                from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
+
+                _fp8 = get_fp8_e4m3_dtype()
+                if q_in.dtype != _fp8:
+                    _dst = _k3_mla_fp.q_pad_buffer(
+                        q_in.shape[0],
+                        self.num_head_padded,
+                        q_in.shape[-1],
+                        _fp8,
+                        q_in.device,
+                    )
+                    if _dst is None:
+                        q_in = q_in.to(_fp8)
+                    else:
+                        _view = _dst[: q_in.shape[0]]
+                        _view[:, : q.shape[1]].copy_(q_in[:, : q.shape[1]].to(_fp8))
+                        q_in = _view
+                kwargs = dict(kwargs)
+                kwargs["q_scale"] = _k3_mla_fp.scale_one(q_in.device)
+            mla_decode_fwd(q_in, k_buffer_flat, o, **kwargs)
+            return o[:, : self.num_head, :]
         else:
             o = q.new_empty(
                 (q.shape[0], layer.tp_q_head_num, layer.v_head_dim),
@@ -1391,6 +1543,20 @@ class AiterAttnBackend(AttentionBackend):
         max_num_tokens: int,
         kv_indices_buf: Optional[torch.Tensor] = None,
     ):
+        # K3_MLA_FUSED_PREP: allocate the padded decode-Q buffer before graph capture.
+        if getattr(self, "head_zero_pad", 0) > 0:
+            from sglang.srt.layers.attention import k3_mla_fused_prep as _k3_mla_fp
+
+            _pool = getattr(self.token_to_kv_pool, "full_kv_pool", self.token_to_kv_pool)
+            if _k3_mla_fp.ENABLED and hasattr(_pool, "kv_lora_rank"):
+                _k3_mla_fp.prepare(
+                    max_num_tokens,
+                    self.num_head_padded,
+                    _pool.kv_lora_rank,
+                    _pool.qk_rope_head_dim,
+                    self.input_dtype,
+                    self.device,
+                )
         # PR #20978 pads max_bs beyond pool_size for higher cuda-graph
         # coverage. Reallocate indptr buffers so they fit the padded max_bs.
         # See: https://github.com/sgl-project/sglang/pull/20978

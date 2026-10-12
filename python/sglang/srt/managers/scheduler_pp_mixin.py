@@ -43,6 +43,9 @@ from sglang.srt.utils.common import get_device_module, is_xpu
 
 logger = logging.getLogger(__name__)
 
+# 1: recv starts when the previous forward ends; 2: when the current forward ends.
+_K3_PP_RECV_AFTER_FWD = int(__import__("os").environ.get("SGLANG_K3_PP_RECV_AFTER_PREV_FWD", "0") or 0)
+
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
 
@@ -131,6 +134,11 @@ class SchedulerPPMixin:
                         )
                     )
                 self._pp_commit_comm_work(self.send_proxy_work)
+                if _K3_PP_RECV_AFTER_FWD and cur_batch and self.pp_group.is_first_rank:
+                    if getattr(self, "_k3_prev_fwd_done", None) is None:
+                        print(f"[k3-pp-recv-after-fwd] active mode={_K3_PP_RECV_AFTER_FWD}", flush=True)
+                    self._k3_prev_fwd_done = self.device_module.Event()
+                    self._k3_prev_fwd_done.record(self.forward_stream)
                 if cur_batch:
                     result, self.launch_event = self._pp_launch_batch(
                         mb_id,
@@ -1258,6 +1266,10 @@ class SchedulerPPMixin:
                     self._pp_make_skip_output_result(target, mb_metadata[next_mb_id])
                 )
                 return
+            if _K3_PP_RECV_AFTER_FWD and self.pp_group.is_first_rank:
+                _ev = getattr(self, "launch_event" if _K3_PP_RECV_AFTER_FWD == 2 else "_k3_prev_fwd_done", None)
+                if _ev is not None:
+                    self.schedule_stream.wait_event(_ev)
             with torch.profiler.record_function("recv_res_dict_from_prev_stage"):
                 next_pp_outputs = PPProxyTensors(self._pp_recv_dict_from_prev_stage())
             with self.copy_stream_ctx:

@@ -4,6 +4,8 @@ from typing import Optional, Tuple, Union
 import torch
 
 from sglang.kernels.ops.attention import kda_fused_decode
+from sglang.kernels.ops.attention import kda_fused_decode_aiter_hip
+from sglang.srt.utils import is_hip
 from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     causal_conv1d_fn,
     causal_conv1d_update,
@@ -459,6 +461,54 @@ class KDAAttnBackend(MambaAttnBackendBase):
             onorm_gate = getattr(layer, "_k3_onorm_gate", None)
             if (
                 fused_static is not None
+                and onorm_gate is not None
+                and mixed_qkv.shape[0] == cache_indices.shape[0]
+                and b.ndim == 3
+                and kda_fused_decode_aiter_hip.enabled()
+                and kda_fused_decode_aiter_hip.covered(
+                    mixed_qkv,
+                    a,
+                    b[0],
+                    conv_states,
+                    ssm_states,
+                    cache_indices,
+                    onorm_gate,
+                )
+            ):
+                if self._fused_override_notice is not None:
+                    rank0_log(self._fused_override_notice)
+                    self._fused_override_notice = None
+                w_q_t, w_k_t, w_v_t, conv_bias, a_log, onorm_w, onorm_eps = fused_static
+                core_attn_out = kda_fused_decode_aiter_hip.run(
+                    mixed_qkv=mixed_qkv,
+                    a=a,
+                    b=b,
+                    conv_states=conv_states,
+                    conv_weight=layer.conv_weights,
+                    A_log=a_log,
+                    dt_bias=layer.dt_bias,
+                    lower_bound=layer.lower_bound,
+                    ssm_states=ssm_states,
+                    cache_indices=cache_indices,
+                    query_start_loc=query_start_loc,
+                    onorm_g=onorm_gate,
+                    norm_weight=onorm_w,
+                    norm_eps=onorm_eps,
+                    num_v_heads=layer.num_v_heads,
+                    head_v_dim=layer.head_v_dim,
+                )
+                layer._k3_onorm_consumed = True
+                self._track_mamba_state_decode(
+                    forward_batch,
+                    conv_states,
+                    ssm_states,
+                    cache_indices,
+                    layer.layer_id,
+                )
+                return core_attn_out
+            elif (
+                not is_hip()
+                and fused_static is not None
                 and onorm_gate is not None
                 and mixed_qkv.shape[0] == cache_indices.shape[0]
                 and b.ndim == 3

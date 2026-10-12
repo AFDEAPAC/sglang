@@ -169,6 +169,17 @@ class CompressedTensorsConfig(QuantizationConfig):
             # If linear_fp8_config is set, use FP8 for linear layers
             # This allows mixed quantization: experts with int4, linear layers with fp8
             if self.linear_fp8_config is not None:
+                # K3_FP8_LINEAR_IGNORE: honour linear_fp8_config.ignored_layers. Fp8Config
+                # stores it but only Fp8Config.get_quant_method consults it, so this path
+                # left the field inert and the switch all-or-nothing over every LinearBase.
+                from sglang.srt.layers.quantization.utils import is_layer_skipped
+
+                if is_layer_skipped(
+                    prefix,
+                    self.linear_fp8_config.ignored_layers,
+                    fused_mapping=self.packed_modules_mapping,
+                ):
+                    return UnquantizedLinearMethod()
                 return Fp8LinearMethod(self.linear_fp8_config)
             scheme = self.get_linear_scheme(layer=layer, layer_name=prefix)
             if scheme is None:

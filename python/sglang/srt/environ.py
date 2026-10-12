@@ -797,6 +797,30 @@ class Envs:
     # Enable dual-stream MoE (shared experts vs routed experts) on the
     # ROCm/AITER path. Requires GPU_MAX_HW_QUEUES>=5 to avoid HW-queue serialization.
     SGLANG_ROCM_USE_MULTI_STREAM = EnvBool(False)
+    # Backport of sglang #35176: fold the KDA [f_a|b] tail into the wide
+    # [q,k,v,g] projection so the whole in-proj is one GEMM. Decode is
+    # bandwidth bound there, so the 144 extra output columns ride along
+    # nearly free.
+    SGLANG_ROCM_K3_FUSE_KDA_INPROJ = EnvBool(True)
+    SGLANG_ROCM_K3_FUSE_KDA_INPROJ_MAX_TOKENS = EnvInt(256)
+    # SGLang #34490: ROCm radix-4 router for K3 ungrouped top-16 decode.
+    SGLANG_K3_RADIX4_TOPK = EnvBool(False)
+    # Decode copy elimination: dense 2D gate before o_norm fallback.
+    SGLANG_DECODE_KDA_GATE_COPY = EnvBool(False)
+    # Decode copy elimination: persistent routed_input scratch buffer.
+    SGLANG_DECODE_MOE_ROUTED_COPY = EnvBool(False)
+    # Decode copy elimination: persistent absorb v-BMM buffer.
+    SGLANG_DECODE_MLA_ABSORB_V_BUF = EnvBool(False)
+    # Decode copy elimination: persistent MLA Q head-pad buffer.
+    SGLANG_DECODE_MLA_HEAD_PAD_BUF = EnvBool(False)
+    # Cache MoE correction_bias dtype conversion (sglang #33838 topk hunk).
+    SGLANG_TOPK_BIAS_CACHE = EnvBool(True)
+    # K3_GLUON_H12_PORT: native h12 Gluon MLA decode (zero-pad fallback on failure).
+    SGLANG_AITER_MLA_GLUON = EnvBool(False)
+    # K3_AITER_FUSED_KDA_PORT: aiter Triton fused KDA decode on gfx942.
+    SGLANG_AITER_FUSED_KDA_DECODE = EnvBool(False)
+    # Decode copy elimination: persistent MLA Q head-pad buffer.
+    SGLANG_DECODE_MLA_HEAD_PAD_BUF = EnvBool(False)
     SGLANG_HACK_FLASHMLA_BACKEND = EnvStr("tilelang")
     SGLANG_USE_AITER_FP8_PER_TOKEN = EnvBool(False)
 

@@ -1751,9 +1751,21 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     )
                 ),
             )
-            return self.runner.run(
+            combine_out = self.runner.run(
                 dispatch_output._replace(hidden_states=x_padded), quant_info
             )
+            # SGLANG_DECODE_GLUE_TAIL: unpad inside quant apply so layer.forward does not copy.
+            hs = combine_out.hidden_states
+            if hs.shape[-1] != x.shape[-1]:
+                hs = hs[..., : x.shape[-1]]
+                if not hs.is_contiguous():
+                    hs = hs.contiguous()
+                from sglang.srt.layers.moe.token_dispatcher.standard import (
+                    StandardCombineInput,
+                )
+
+                return StandardCombineInput(hidden_states=hs)
+            return combine_out
 
         backend = self.runner.runner_backend
         if backend.is_triton_kernels():

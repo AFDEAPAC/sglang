@@ -195,7 +195,9 @@ class AiterRunnerCore(MoeRunnerCore):
         if self.config.no_combine:
             extra["no_combine"] = True
 
-        output = fused_moe(
+        _k3_dest = _k3_publish_moe_out(runner_input)
+        try:
+            output = fused_moe(
             hidden_states=runner_input.hidden_states,
             w1=quant_info.w13_weight,
             w2=quant_info.w2_weight,
@@ -215,6 +217,8 @@ class AiterRunnerCore(MoeRunnerCore):
             intermediate_pad=quant_info.intermediate_pad,
             **extra,
         )
+        finally:
+            _k3_unpublish_moe_out(_k3_dest)
         return AiterRunnerOutput(hidden_states=output)
 
     @property
@@ -475,3 +479,33 @@ def post_permute_aiter_to_deepep_ll(
     return _post_permute_aiter_to_deepep(
         runner_output, quant_info, runner_config, running_state, is_normal=False
     )
+
+
+_K3_MOE_OUT_DIRECT = __import__("os").environ.get("SGLANG_K3_MOE_OUT_DIRECT", "0") not in (
+    "", "0", "false", "False"
+)
+
+
+def _k3_publish_moe_out(runner_input):
+    """Hand the zero_copy_context destination to aiter's a16wmix MoE so it accumulates there."""
+    if not _K3_MOE_OUT_DIRECT:
+        return None
+    from sglang.srt.layers import zero_copy_context
+
+    x = runner_input.hidden_states
+    dest = zero_copy_context.get_moe_output_spec(x.shape, x.dtype, x.device)
+    if dest is None:
+        return None
+    try:
+        from aiter.ops.flydsl import a16wmix_fused_moe as mod
+    except ImportError:
+        return None
+    if not hasattr(mod, "publish_output"):
+        return None
+    mod.publish_output(dest)
+    return mod
+
+
+def _k3_unpublish_moe_out(mod):
+    if mod is not None:
+        mod.publish_output(None)

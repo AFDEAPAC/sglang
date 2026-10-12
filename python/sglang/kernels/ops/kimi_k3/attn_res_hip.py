@@ -185,6 +185,11 @@ def attn_res_hip(
     prefix_out_arg = prefix_out if has_add else prefix_sum
     ow_arg = ow if ow is not None else cw
 
+    import os as _os_agg
+    _nw = int(_os_agg.environ.get("SGLANG_K3_AGG_NUM_WARPS", "4"))
+    if not getattr(_os_agg, "_k3_agg_nw_announced", False):
+        print(f"[k3-agg-warps] n={_nw}", flush=True)
+        _os_agg._k3_agg_nw_announced = True
     _agg_kernel[(T,)](
         prefix_sum,
         addend_arg,
@@ -208,5 +213,5 @@ def attn_res_hip(
         HAS_ADD=has_add,
         WRITE_BANK=write_prefix,
         APPLY_OUT_NORM=ow is not None,
-        num_warps=4,
+        num_warps=_nw,
     )

@@ -902,9 +902,27 @@ def fused_topk(
             )
     elif scoring_func == "sigmoid":
         if _use_aiter and correction_bias is not None:
+            # SGLANG_TOPK_BIAS_CACHE: cache dtype conversion (sglang #33838 topk hunk).
+            if envs.SGLANG_TOPK_BIAS_CACHE.get():
+                cache = getattr(correction_bias, "_k3_dtype_cache", None)
+                key = (
+                    correction_bias.data_ptr(),
+                    correction_bias._version,
+                    gating_output.dtype,
+                    correction_bias.device,
+                )
+                if cache is None or getattr(correction_bias, "_k3_dtype_cache_key", None) != key:
+                    correction_bias._k3_dtype_cache = correction_bias.to(
+                        dtype=gating_output.dtype
+                    )
+                    correction_bias._k3_dtype_cache_key = key
+                    print("[k3-topk-bias-cache] hit", flush=True)
+                bias_for_aiter = correction_bias._k3_dtype_cache
+            else:
+                bias_for_aiter = correction_bias.to(dtype=gating_output.dtype)
             aiter_biased_grouped_topk(
                 gating_output,
-                correction_bias.to(dtype=gating_output.dtype),
+                bias_for_aiter,
                 topk_weights,
                 topk_ids,
                 num_expert_group=1,
@@ -1571,11 +1589,41 @@ def biased_grouped_topk_gpu(
         assert (
             hidden_states.shape[0] == gating_output.shape[0]
         ), f"Number of tokens mismatch: hidden_states.shape[0] = {hidden_states.shape[0]}, gating_output.shape[0] = {gating_output.shape[0]}"
+        # SGLANG_TOPK_BIAS_CACHE: cache dtype conversion for radix4 / aiter path.
+        if envs.SGLANG_TOPK_BIAS_CACHE.get():
+            cache = getattr(correction_bias, "_k3_dtype_cache", None)
+            key = (
+                correction_bias.data_ptr(),
+                correction_bias._version,
+                gating_output.dtype,
+                correction_bias.device,
+            )
+            if cache is None or getattr(correction_bias, "_k3_dtype_cache_key", None) != key:
+                correction_bias._k3_dtype_cache = correction_bias.to(
+                    dtype=gating_output.dtype
+                )
+                correction_bias._k3_dtype_cache_key = key
+                print("[k3-topk-bias-cache] hit", flush=True)
+            bias = correction_bias._k3_dtype_cache
+        else:
+            bias = correction_bias.to(dtype=gating_output.dtype)
+        scaling = routed_scaling_factor if routed_scaling_factor is not None else 1.0
+
+        if envs.SGLANG_K3_RADIX4_TOPK.get():
+            from sglang.kernels.ops.moe import moe_route_radix4
+
+            if moe_route_radix4.available() and moe_route_radix4.covered(
+                gating_output, bias, topk, num_expert_group, topk_group
+            ):
+                return moe_route_radix4.route_radix4(
+                    gating_output, bias, topk, renormalize, scaling
+                )
+
         topk_weights = torch.empty((token, topk), dtype=torch.float32, device=device)
         topk_ids = torch.empty((token, topk), dtype=torch.int32, device=device)
         aiter_biased_grouped_topk(
             gating_output,
-            correction_bias.to(dtype=gating_output.dtype),
+            bias,
             topk_weights,
             topk_ids,
             num_expert_group,

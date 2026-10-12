@@ -223,8 +223,10 @@ def sigmoid_gate_topk_renorm(
     BLOCK_SIZE_N = 128 if M <= 1024 else 16
     grid = (triton.cdiv(M, BLOCK_SIZE_M),)
     kwargs = {"num_warps": 8 if M <= 1024 else 2}
-    if is_arch_support_pdl():
-        kwargs.update({"ENABLE_PDL": True, "launch_pdl": True})
+    use_pdl = is_arch_support_pdl()
+    kwargs["ENABLE_PDL"] = use_pdl
+    if use_pdl:
+        kwargs["launch_pdl"] = True
 
     _sigmoid_gate_topk_renorm_kernel[grid](
         logits,
