@@ -2205,17 +2205,26 @@ class AiterAttnBackend(AttentionBackend):
                             layer,
                         )
                     else:
-                        output = flash_attn_varlen_func(
-                            q,
-                            k,
-                            v,
-                            qo_indptr,
-                            qo_indptr,
-                            max_q_len,
-                            max_q_len,
-                            softmax_scale=layer.scaling,
-                            causal=True,
-                        )
+                        # K3_MLA_PREFILL_FP8
+                        from sglang.srt.layers.attention import k3_mla_prefill_fp8 as _k3_pfp8
+
+                        if _k3_pfp8.ON:
+                            output = _k3_pfp8.attn(
+                                q, k, v, qo_indptr, qo_indptr, max_q_len, max_q_len,
+                                layer.scaling, layer.layer_id,
+                            )
+                        else:
+                            output = flash_attn_varlen_func(
+                                q,
+                                k,
+                                v,
+                                qo_indptr,
+                                qo_indptr,
+                                max_q_len,
+                                max_q_len,
+                                softmax_scale=layer.scaling,
+                                causal=True,
+                            )
                     return output
                 elif layer.qk_head_dim != (kv_lora_rank + qk_rope_head_dim):
                     K_Buffer = torch.index_select(K_Buffer, 0, kv_indices)
@@ -2247,23 +2256,32 @@ class AiterAttnBackend(AttentionBackend):
                         )[0]
                     else:
                         kv = layer.kv_b_proj(kvc.contiguous())[0]
+                        # K3_MLA_PREFILL_FP8: fused fp8 emission of k / v (no split / cat)
+                        from sglang.srt.layers.attention import k3_mla_prefill_fp8 as _k3_pfp8
 
-                        kv = kv.view(
-                            -1, layer.tp_k_head_num, qk_nope_head_dim + layer.v_head_dim
-                        )
-                        k, v = torch.split(
-                            kv, [qk_nope_head_dim, layer.v_head_dim], dim=-1
-                        )
-                        k = torch.cat(
-                            [
-                                k,
-                                torch.broadcast_to(
-                                    k_pe,
-                                    (k_pe.shape[0], layer.tp_k_head_num, k_pe.shape[2]),
-                                ),
-                            ],
-                            dim=-1,
-                        )
+                        _k3_kv8 = None
+                        if _k3_pfp8.FUSED_ON:
+                            _k3_kv8 = _k3_pfp8.kv_to_fp8(
+                                kv, k_pe, layer.tp_k_head_num, qk_nope_head_dim, layer.v_head_dim
+                            )
+                            k = v = None
+                        else:
+                            kv = kv.view(
+                                -1, layer.tp_k_head_num, qk_nope_head_dim + layer.v_head_dim
+                            )
+                            k, v = torch.split(
+                                kv, [qk_nope_head_dim, layer.v_head_dim], dim=-1
+                            )
+                            k = torch.cat(
+                                [
+                                    k,
+                                    torch.broadcast_to(
+                                        k_pe,
+                                        (k_pe.shape[0], layer.tp_k_head_num, k_pe.shape[2]),
+                                    ),
+                                ],
+                                dim=-1,
+                            )
 
                     assert (
                         forward_batch.extend_prefix_lens.shape
@@ -2273,6 +2291,15 @@ class AiterAttnBackend(AttentionBackend):
                     if _use_fp8_prefill_attn:
                         return self.mla_fp8_prefill_attn(q, k, v, layer)
                     else:
+                        # K3_MLA_PREFILL_FP8
+                        from sglang.srt.layers.attention import k3_mla_prefill_fp8 as _k3_pfp8
+
+                        if _k3_pfp8.ON:
+                            return _k3_pfp8.attn(
+                                q, k, v, qo_indptr, kv_indptr, max_q_len, max_kv_len,
+                                layer.scaling, layer.layer_id,
+                                kv8=_k3_kv8 if _k3_pfp8.FUSED_ON else None,
+                            )
                         return flash_attn_varlen_func(
                             q,
                             k,
