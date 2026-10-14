@@ -26,6 +26,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.environ import envs
+
 _KV_BLOCK_SIZE = 64
 
 # Rows are query tokens: tens to a few hundred for MTP target-verify, up to the
@@ -326,15 +328,36 @@ def build_prefill_schedule(
             w_dst,
             PT_BLOCK=_PT_BLOCK,
         )
-        compute_prefill_schedule(
+        schedule_args = (
             buffers.row_to_batch,
             buffers.local_starts,
             local_ends,
+        )
+        schedule_kwargs = dict(
             block_k=block_k,
             parallel_unit_num=parallel_unit_num,
             max_seq_len=max_seq_len,
-            cta_info_out=cta_info_out,
         )
+        if envs.SGLANG_DSV41_AITER_PREFILL_SCHEDULE_COMPAT.get():
+            try:
+                compute_prefill_schedule(
+                    *schedule_args,
+                    **schedule_kwargs,
+                    cta_info_out=cta_info_out,
+                )
+            except TypeError as exc:
+                if "cta_info_out" not in str(exc):
+                    raise
+                _, generated_cta_info, _ = compute_prefill_schedule(
+                    *schedule_args, **schedule_kwargs
+                )
+                cta_info_out.copy_(generated_cta_info)
+        else:
+            compute_prefill_schedule(
+                *schedule_args,
+                **schedule_kwargs,
+                cta_info_out=cta_info_out,
+            )
         return guarded_out, buffers
 
     _prefill_schedule_prep_kernel[(1 + rows * pt_tiles_per_row,)](

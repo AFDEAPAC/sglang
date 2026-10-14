@@ -1593,6 +1593,13 @@ class Envs:
     SGLANG_OPT_USE_ONLINE_COMPRESS = EnvBool(False)
     SGLANG_EXPERIMENTAL_ONLINE_C128_MTP = EnvBool(False)
     SGLANG_DSV4_COMPRESS_STATE_DTYPE = EnvStr("float32")
+    # Experimental ROCm/HIP token-parallel prefill for DeepSeek-V4.1. The
+    # context-parallel path remains opt-in until model-level correctness and
+    # performance gates pass on the ratio-1/2 indexer layout.
+    SGLANG_DSV41_HIP_PREFILL_CP = EnvBool(False)
+    # Bridge older task-local AITER prefill schedulers that return a fresh
+    # cta_info tensor instead of accepting the stable cta_info_out buffer.
+    SGLANG_DSV41_AITER_PREFILL_SCHEDULE_COMPAT = EnvBool(False)
     # Run the DeepSeek-V4.1 ratio-1/2 prefill indexer on the torch path instead
     # of the DeepGEMM dense fp4 logits kernel (test oracle / fallback).
     SGLANG_DSV41_TORCH_PREFILL_INDEXER = EnvBool(False)

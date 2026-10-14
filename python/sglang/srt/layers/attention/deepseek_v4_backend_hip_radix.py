@@ -3232,13 +3232,19 @@ class DeepseekV4HipRadixBackend(
                 self, layer, x, q_lora, pos, forward_batch=forward_batch
             )
         elif forward_batch.forward_mode.is_extend():
-            # HIP rejects V4.1 prefill CP, the only caller passing rows_per_request
-            assert rows_per_request is None, "V4.1 prefill CP is not supported on HIP"
             assert (
                 forward_batch.seq_lens_cpu is not None
                 and forward_batch.extend_seq_lens_cpu is not None
             ), "the HIP low-ratio prefill indexer needs the batch's CPU lengths"
-            low_ratio_index_topk_hip_extend(self, layer, x, q_lora, pos, forward_batch)
+            low_ratio_index_topk_hip_extend(
+                self,
+                layer,
+                x,
+                q_lora,
+                pos,
+                forward_batch,
+                rows_per_request=rows_per_request,
+            )
         else:
             raise NotImplementedError(
                 f"low-ratio indexer for {forward_batch.forward_mode} on HIP"

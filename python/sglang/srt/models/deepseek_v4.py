@@ -5066,11 +5066,16 @@ class DeepseekV4ForCausalLM(nn.Module):
         self.determine_num_fused_shared_experts()
         self.vision = None
         if config.model_type == "deepseek_v41" and config.vision_n_layers > 0:
+            text_only_hip_cp = (
+                _is_hip
+                and get_bool_env_var("SGLANG_DSV41_TEXT_ONLY", "false")
+                and get_bool_env_var("SGLANG_DSV41_HIP_PREFILL_CP", "false")
+            )
             if (
                 get_parallel().attn_cp_size != 1
                 or get_parallel().pp_group.world_size != 1
                 or not get_moe_a2a_backend().is_none()
-            ):
+            ) and not text_only_hip_cp:
                 raise ValueError(
                     "V4.1 vision currently supports TP/EP/DP without CP, PP or MoE A2A"
                 )

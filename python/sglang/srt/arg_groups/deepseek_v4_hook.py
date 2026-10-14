@@ -141,12 +141,13 @@ def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
             is_unified_kv_fp8,
         )
 
+        is_dsv41 = (
+            model_config_of(server_args).hf_config.model_type == "deepseek_v41"
+        )
+        enable_dsv41_hip_cp = envs.SGLANG_DSV41_HIP_PREFILL_CP.get()
         unsupported = (
             ("multiple nodes", cfg.nnodes > 1),
-            (
-                "DeepSeek-V4.1",
-                model_config_of(server_args).hf_config.model_type == "deepseek_v41",
-            ),
+            ("DeepSeek-V4.1", is_dsv41 and not enable_dsv41_hip_cp),
             (
                 "--enable-decoder-swa-bounded-replay",
                 cfg.enable_decoder_swa_bounded_replay,
@@ -158,6 +159,32 @@ def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
             if enabled:
                 raise ValueError(
                     f"DeepSeekV4 prefill CP on HIP does not support {feature} yet."
+                )
+        if is_dsv41 and enable_dsv41_hip_cp:
+            logger.warning(
+                "Enabling experimental DeepSeek-V4.1 prefill context parallelism "
+                "on HIP; the feature is default-OFF."
+            )
+            from sglang.srt.model_executor.cuda_graph_config import (
+                Backend,
+                Phase,
+                with_phase,
+            )
+
+            if cfg.cuda_graph_config.prefill.backend != Backend.DISABLED:
+                logger.warning(
+                    "DeepSeek-V4.1 HIP prefill CP is not capture-safe with the "
+                    "%s backend; preserving decode graphs and running prefill eagerly.",
+                    cfg.cuda_graph_config.prefill.backend,
+                )
+                declare_resolution(
+                    server_args,
+                    "validate_deepseek_v4_cp",
+                    cuda_graph_config=with_phase(
+                        cfg.cuda_graph_config,
+                        Phase.PREFILL,
+                        backend=Backend.DISABLED,
+                    ),
                 )
 
     attn_dp_size = context_parallel_attn_dp_size(cfg, "DeepSeek-V4 context parallelism")
