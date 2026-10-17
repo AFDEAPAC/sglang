@@ -5,12 +5,16 @@ einsum output), without the copy that flatten(1) makes; the arithmetic is _per_t
 
 silu_and_mul_clamp_per_token_quant_fp8: the clamped SwiGLU of _silu_and_mul_clamp_kernel, rounded to bf16 as that
 kernel stores it, then per-token fp8 quant of the bf16 row, in one launch per row.
+
+rmsnorm_with_per_token_quant: aiter's residual-free bf16 RMSNorm whose launch also writes the per-token fp8 quant of
+its output (aiter rmsnorm_dual_ptq); apply_fp8_linear takes that pair in place of its own quant of the same tensor.
 """
 
 from __future__ import annotations
 
+import logging
 import os
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 import triton
@@ -27,6 +31,10 @@ WOB_STRIDED_QUANT = _env_on("SGLANG_GFX942_WOB_STRIDED_QUANT")
 SHARED_ACT_QUANT = _env_on("SGLANG_GFX942_SHARED_ACT_QUANT")
 RMSNORM_ROW_STRIDED = _env_on("SGLANG_GFX942_RMSNORM_ROW_STRIDED")
 LOWRATIO_INDEX_CACHE = _env_on("SGLANG_GFX942_LOWRATIO_INDEX_CACHE")
+RMSNORM_PTQ = _env_on("SGLANG_GFX942_RMSNORM_PTQ")
+_RMSNORM_PTQ_LOG = _env_on("SGLANG_GFX942_RMSNORM_PTQ_LOG")
+
+logger = logging.getLogger(__name__)
 
 
 def rowwise_fp8_linear_takes_prequant(linear) -> bool:
@@ -156,3 +164,58 @@ def silu_and_mul_clamp_per_token_quant_fp8(
             num_warps=4,
         )
     return q, s
+
+
+def rmsnorm_ptq_supported(x: torch.Tensor, weight: torch.Tensor) -> bool:
+    return (
+        x.dim() == 2
+        and x.dtype == torch.bfloat16
+        and weight.dtype == torch.bfloat16
+        and x.stride(-1) == 1
+        and x.shape[0] > 0
+        and x.shape[1] <= 8192
+        and x.shape[1] % 8 == 0
+    )
+
+
+def rmsnorm_with_per_token_quant(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+    """aiter rms_norm(x, weight, eps) for a 2-D bf16 x whose rows may be strided. The output carries, as _gfx942_ptq,
+    the (fp8 [T, n], fp32 scale [T, 1]) that per_token_group_quant_fp8(output, n) would return, written by the same
+    launch; it describes the output only while the output's _version is unchanged."""
+    from aiter.ops.rmsnorm import rmsnorm_dual_ptq
+
+    out = torch.empty_like(x)
+    q = torch.empty(x.shape, device=x.device, dtype=fp8_dtype)
+    s = torch.empty((x.shape[0], 1), device=x.device, dtype=torch.float32)
+    rmsnorm_dual_ptq(out, q, s, x, weight, eps)
+    out._gfx942_ptq = (q, s, out._version)
+    return out
+
+
+_ptq_events = {"hit": 0, "miss": 0}
+
+
+def _log_ptq(kind: str, input_2d: torch.Tensor) -> None:
+    _ptq_events[kind] += 1
+    count = _ptq_events[kind]
+    if count <= 48 or count & (count - 1) == 0:
+        import traceback
+
+        callers = " < ".join(f.name for f in traceback.extract_stack(limit=10)[-4::-1])
+        logger.info("gfx942 rmsnorm ptq %s #%d M=%d K=%d via %s", kind, count, *input_2d.shape, callers)
+
+
+def attached_per_token_quant(
+    input: torch.Tensor, input_2d: torch.Tensor
+) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+    """The (fp8, scale) that rmsnorm_with_per_token_quant attached to input, while it still describes input_2d."""
+    ptq = getattr(input, "_gfx942_ptq", None)
+    hit = (
+        ptq is not None
+        and ptq[2] == input._version
+        and ptq[0].shape == input_2d.shape
+        and input_2d.data_ptr() == input.data_ptr()
+    )
+    if _RMSNORM_PTQ_LOG and (hit or input_2d.shape[1] in (1280, 5120)):
+        _log_ptq("hit" if hit else "miss", input_2d)
+    return (ptq[0], ptq[1]) if hit else None

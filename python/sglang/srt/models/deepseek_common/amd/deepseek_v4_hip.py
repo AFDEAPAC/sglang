@@ -46,6 +46,11 @@ def init_mqa_layer(attn, quant_config) -> None:
     attn._wq_b_native_consumer_checked = False
     attn._wq_b_native_consumer = False
     attn._wo_b_fp8_grid_operand = None
+    from sglang.kernels.ops.quantization import gfx942_decode_fuse as _gfx942_fuse
+
+    if _gfx942_fuse.RMSNORM_PTQ and not _is_gfx95_supported and hasattr(attn, "q_norm"):
+        # wq_b and the indexer's wq_b quantize q_norm's output per token
+        attn.q_norm._gfx942_ptq = True
 
 
 def wo_a_emits_fp8_grid(attn) -> bool:
@@ -165,6 +170,12 @@ def init_decoder_layer(layer, quant_config) -> None:
     layer.hc_boundary_fused = (
         _is_gfx95_supported and layer.hc_pre_from_prev_sublayer and layer.hc_mult == 4
     )
+    from sglang.kernels.ops.quantization import gfx942_decode_fuse as _gfx942_fuse
+
+    if _gfx942_fuse.RMSNORM_PTQ and not _is_gfx95_supported:
+        # wqkv_a and the shared experts' gate_up quantize these outputs per token
+        layer.input_layernorm._gfx942_ptq = True
+        layer.post_attention_layernorm._gfx942_ptq = True
 
 
 def hc_post(layer, x, residual, post, comb) -> Optional[torch.Tensor]:

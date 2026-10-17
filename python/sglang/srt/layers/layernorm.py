@@ -869,6 +869,14 @@ class RMSNorm(BaseFusedOp):
                     residual_shape
                 )
             return output, residual_out
+        if self.__dict__.get("_gfx942_ptq", False) and not needs_reshape:
+            from sglang.kernels.ops.quantization import gfx942_decode_fuse as _gfx942_fuse
+
+            if _gfx942_fuse.rmsnorm_ptq_supported(x, self.weight.data):
+                # the consumer's per-token fp8 quant comes out of the same launch
+                return _gfx942_fuse.rmsnorm_with_per_token_quant(
+                    x, self.weight.data, self.variance_epsilon
+                )
         output = rms_norm(x, self.weight.data, self.variance_epsilon)
         if needs_reshape:
             output = output.reshape(original_shape)

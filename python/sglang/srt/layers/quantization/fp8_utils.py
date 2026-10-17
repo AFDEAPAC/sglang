@@ -2339,9 +2339,20 @@ def apply_fp8_linear(
                         use_per_token_if_dynamic=use_per_token_if_dynamic,
                     )
                 else:
-                    qinput, x_scale = per_token_group_quant_fp8(
-                        input_2d, group_size=input_2d.shape[1]
+                    from sglang.kernels.ops.quantization import gfx942_decode_fuse as _gfx942_fuse
+
+                    ptq = (
+                        _gfx942_fuse.attached_per_token_quant(input, input_2d)
+                        if _gfx942_fuse.RMSNORM_PTQ
+                        else None
                     )
+                    if ptq is not None:
+                        # written by the RMSNorm launch that produced input
+                        qinput, x_scale = ptq
+                    else:
+                        qinput, x_scale = per_token_group_quant_fp8(
+                            input_2d, group_size=input_2d.shape[1]
+                        )
 
     if channelwise_cutlass:
         # A tuned config exists only for shapes where tuned Triton beat the
