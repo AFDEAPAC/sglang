@@ -806,7 +806,19 @@ class RMSNorm(BaseFusedOp):
                     -1, post_residual_addition.shape[-1]
                 )
         else:
-            if not x.is_contiguous():
+            from sglang.kernels.ops.quantization import gfx942_decode_fuse as _gfx942_fuse
+
+            # the residual-free HIP and opus RMSNorm kernels read rows by stride
+            row_strided_ok = (
+                _gfx942_fuse.RMSNORM_ROW_STRIDED
+                and residual is None
+                and post_residual_addition is None
+                and x.stride(-1) == 1
+                and not (
+                    self._fused_pad_kernel is not None and self.x_pad_to_multiple > 0
+                )
+            )
+            if not x.is_contiguous() and not row_strided_ok:
                 if _is_hip and get_bool_env_var(
                     "SGLANG_GFX942_TRITON_CONTIGUOUS", "false"
                 ):

@@ -2870,7 +2870,8 @@ class DeepseekV4AttnBackend(
             )
             return
         if not (x.is_cuda and torch.version.cuda):
-            self._low_ratio_compress_torch(layer, x, req, pos)
+            # decode runs every ratio-2 layer in order, which the index cache relies on
+            self._low_ratio_compress_torch(layer, x, req, pos, index_cache=True)
             return
 
         from sglang.kernels.ops.attention.dsv4.c2_decode_pool import c2_decode_pool
@@ -2997,7 +2998,7 @@ class DeepseekV4AttnBackend(
             )
 
     def _low_ratio_compress_torch(
-        self, layer, x, req, pos, projected=None, *, fuse_index_store=False
+        self, layer, x, req, pos, projected=None, *, fuse_index_store=False, index_cache=False
     ) -> None:
         core = self.forward_metadata.core_metadata
         num_tokens = pos.shape[0]
@@ -3014,33 +3015,55 @@ class DeepseekV4AttnBackend(
             )
             return
 
+        idx = (
+            _gfx942_low_ratio_pair_index(self, layer, core, req, pos, num_tokens)
+            if index_cache
+            else None
+        )
         partner_kv, partner_score = self._low_ratio_pair_partners(
             layer_id=layer.layer_id,
             kv=kv,
             score=score,
             req=req,
             pos=pos,
-            pad=core.raw_out_loc[:num_tokens] == 0,
+            pad=idx["pad"] if idx is not None else core.raw_out_loc[:num_tokens] == 0,
+            idx=idx,
         )
         pooled = layer.compressor.pool_pairs(
             torch.stack([partner_kv, kv], dim=1),
             torch.stack([partner_score, score], dim=1),
         )
-        group_pos = torch.where(pos % 2 == 1, pos - 1, pos)
-        out_loc = core.c2_out_loc[:num_tokens]
-        slots = torch.where(out_loc >= 0, out_loc, torch.zeros_like(out_loc))
+        if idx is not None:
+            group_pos, slots = idx["group_pos"], idx["slots"]
+        else:
+            group_pos = torch.where(pos % 2 == 1, pos - 1, pos)
+            out_loc = core.c2_out_loc[:num_tokens]
+            slots = torch.where(out_loc >= 0, out_loc, torch.zeros_like(out_loc))
         self._low_ratio_write_group(
             layer, pooled, slots, group_pos, fuse_index_store=fuse_index_store
         )
 
     def _low_ratio_pair_partners(
-        self, *, layer_id, kv, score, req, pos, pad
+        self, *, layer_id, kv, score, req, pos, pad, idx=None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         state = self.token_to_kv_pool.get_attention_compress_states(layer_id)
         ring = state.ring_size
         num_tokens = pos.shape[0]
         if not num_tokens:
             return kv, score
+        if idx is not None:
+            carried = state.get_state_by_state_loc(idx["read_loc"])
+            in_batch = idx["in_batch"]
+            partner_kv = torch.where(
+                in_batch[:, None], torch.roll(kv, 1, 0), carried.kv
+            )
+            partner_score = torch.where(
+                in_batch[:, None], torch.roll(score, 1, 0), carried.score
+            )
+            state.set_state_by_state_loc(
+                idx["write_loc"], KVAndScore.from_kv_score(kv=kv, score=score)
+            )
+            return partner_kv, partner_score
 
         read_pos = (pos - 1).masked_fill(pad, -1)
         carried = state.get_state_by_state_loc(
@@ -4200,3 +4223,45 @@ def _pad_tensor_to_size(tensor: torch.Tensor, size: int, *, value: int = 0):
             ],
             dim=0,
         )
+
+
+def _gfx942_low_ratio_pair_index(backend, layer, core, req, pos, num_tokens):
+    """The batch-only index math of a ratio-2 compress step, computed by the first ratio-2 layer of
+    a forward and reused by the later ones (gfx942 opt-in); None when off."""
+    from sglang.kernels.ops.quantization import gfx942_decode_fuse as _gfx942_fuse
+
+    if not (_gfx942_fuse.LOWRATIO_INDEX_CACHE and num_tokens):
+        return None
+    state = backend.token_to_kv_pool.get_attention_compress_states(layer.layer_id)
+    ring = state.ring_size
+    key = (id(core), req.data_ptr(), pos.data_ptr(), num_tokens, ring)
+    cache = getattr(backend, "_gfx942_lr_index_cache", None)
+    # layers run in increasing id within one forward; a repeat or a lower id starts a new one
+    if cache is not None and cache[0] == key and layer.layer_id > cache[1]:
+        backend._gfx942_lr_index_cache = (key, layer.layer_id, cache[2])
+        return cache[2]
+    pad = core.raw_out_loc[:num_tokens] == 0
+    read_loc = state.translate_from_req_position_to_state_loc(
+        req, (pos - 1).masked_fill(pad, -1)
+    )
+    in_batch = torch.zeros_like(pad)
+    in_batch[1:] = (
+        (req[1:] == req[:-1]) & (pos[1:] == pos[:-1] + 1) & ~pad[1:] & ~pad[:-1]
+    )
+    keep = ~pad
+    if num_tokens > ring:
+        keep[:-ring] &= (req[:-ring] != req[ring:]) | pad[ring:]
+    write_loc = state.translate_from_req_position_to_state_loc(
+        req, pos.masked_fill(~keep, -1)
+    )
+    out_loc = core.c2_out_loc[:num_tokens]
+    idx = {
+        "pad": pad,
+        "read_loc": read_loc,
+        "in_batch": in_batch,
+        "write_loc": write_loc,
+        "group_pos": torch.where(pos % 2 == 1, pos - 1, pos),
+        "slots": torch.where(out_loc >= 0, out_loc, torch.zeros_like(out_loc)),
+    }
+    backend._gfx942_lr_index_cache = (key, layer.layer_id, idx)
+    return idx

@@ -2192,6 +2192,37 @@ def apply_fp8_linear(
     compressed_tensor_quant: bool = False,
     pre_quant_output_dtype: Optional[torch.dtype] = None,
 ) -> torch.Tensor:
+    if isinstance(input, tuple):
+        # (fp8 [M, K], fp32 per-token scale [M, 1]) quantized by the producer exactly as the
+        # per_token_group_quant_fp8 call below would; only the rowwise GEMM path takes it
+        qinput, x_scale = input
+        assert (
+            use_per_token_if_dynamic
+            and weight_scale.numel() > 1
+            and (USE_ROWWISE_TORCH_SCALED_MM or _use_aiter)
+        ), "a pre-quantized per-token input needs the rowwise fp8 GEMM"
+        output_dtype = pre_quant_output_dtype or torch.bfloat16
+        output_shape = [*qinput.shape[:-1], weight.shape[1]]
+        if use_aiter_bpreshuffle_gemm(weight.shape[1], weight.shape[0]):
+            output = gemm_a8w8_bpreshuffle(
+                XQ=qinput,
+                WQ=weight.T,
+                x_scale=x_scale,
+                w_scale=weight_scale,
+                dtype=output_dtype,
+            )
+            if bias is not None:
+                output += bias
+            return _process_scaled_mm_output(output, qinput.shape, output_shape)
+        output = torch._scaled_mm(
+            qinput,
+            weight,
+            out_dtype=output_dtype,
+            scale_a=x_scale,
+            scale_b=weight_scale.t(),
+            bias=bias,
+        )
+        return _process_scaled_mm_output(output, qinput.shape, output_shape)
     # Note: we pad the input because torch._scaled_mm is more performant
     # for matrices with batch dimension > 16.
     # This could change in the future.

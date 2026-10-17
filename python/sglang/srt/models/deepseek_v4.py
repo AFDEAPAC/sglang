@@ -2616,8 +2616,23 @@ class MQALayer(MqaAttentionBase):
         from sglang.srt.layers.moe.mhc_post_fusion import current_mhc_post_fusion
 
         mhc = current_mhc_post_fusion()
+        from sglang.kernels.ops.quantization import gfx942_decode_fuse as _gfx942_fuse
+
+        if (
+            _gfx942_fuse.WOB_STRIDED_QUANT
+            and isinstance(o, torch.Tensor)
+            and o.dim() == 3
+            and o.dtype == torch.bfloat16
+            and o.stride(-1) == 1
+            and not o.is_contiguous()
+            and _gfx942_fuse.rowwise_fp8_linear_takes_prequant(self.wo_b)
+        ):
+            # quantize the strided wo_a output in place of flatten(1)'s copy and wo_b's quant
+            wo_b_input = _gfx942_fuse.strided_per_token_quant_fp8(o)
+        else:
+            wo_b_input = o.flatten(1) if isinstance(o, torch.Tensor) else o
         o, _ = self.wo_b(
-            o.flatten(1) if isinstance(o, torch.Tensor) else o,
+            wo_b_input,
             skip_all_reduce=mhc is not None,
         )
         if mhc is not None and mhc.overlap_only:
