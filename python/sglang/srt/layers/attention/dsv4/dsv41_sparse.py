@@ -6,6 +6,8 @@ share that storage.
 
 from __future__ import annotations
 
+import functools
+import os
 from typing import Optional, Tuple
 
 import torch
@@ -28,6 +30,16 @@ def _fused_dsv41_kernels(x: torch.Tensor) -> bool:
     return x.is_cuda and (torch.version.cuda is not None or is_gfx95_supported())
 
 
+@functools.lru_cache(maxsize=None)
+def _gfx942_fused_dsv41_opt_in() -> bool:
+    return (
+        os.environ.get("SGLANG_GFX942_FUSED_DSV41", "0") == "1"
+        and torch.version.hip is not None
+        and "gfx942"
+        in torch.cuda.get_device_properties(torch.cuda.current_device()).gcnArchName
+    )
+
+
 def _rope_fq4(x, freqs, rope_dim, *, compressed_kv=False, positions=None):
     """RoPE plus fake FP4 quantization, fused for bf16 inputs on CUDA and ROCm. With
     positions, freqs is the whole table and the fused kernel gathers freqs[positions]."""
@@ -41,6 +53,16 @@ def _rope_fq4(x, freqs, rope_dim, *, compressed_kv=False, positions=None):
         )
     if positions is not None:
         freqs = freqs[positions]
+    if x.is_cuda and x.dtype == torch.bfloat16 and _gfx942_fused_dsv41_opt_in():
+        from sglang.kernels.ops.attention.dsv4.fp4_rope_fake_quant import (
+            rope_tail_fake_quant_fp4,
+        )
+
+        # torch's complex multiply rounds differently per kernel it picks, so the RoPE stays on
+        # torch; with rope_dim=0 the fused kernel is only the (exact) fake quantization
+        return rope_tail_fake_quant_fp4(
+            rope_tail(x, freqs, rope_dim), freqs, 0, compressed_kv=compressed_kv
+        )
     quant = fake_quant_compressed_kv if compressed_kv else fake_quant_fp4
     return quant(rope_tail(x, freqs, rope_dim))
 
@@ -56,7 +78,14 @@ class RMSNorm(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # the Triton kernel is bitwise this fallback for bf16 rows on CUDA and ROCm (gfx950)
         if (
-            _fused_dsv41_kernels(x)
+            (
+                _fused_dsv41_kernels(x)
+                or (
+                    x.is_cuda
+                    and _gfx942_fused_dsv41_opt_in()
+                    and os.environ.get("SGLANG_GFX942_FUSED_DSV41_RMS", "0") == "1"
+                )
+            )
             and x.dtype in (torch.bfloat16, torch.float32)
             and self.weight.dtype in (torch.bfloat16, torch.float32)
             and x.shape[-1] in (128, 512)
