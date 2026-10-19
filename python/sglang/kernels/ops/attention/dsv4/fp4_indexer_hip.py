@@ -53,6 +53,8 @@ _DECODE_CTA_INFO_WIDTH = 4
 _LOGITS_BUDGET_ELEMS = (
     int(os.environ.get("SGLANG_DSV4_FP4_LOGITS_BUDGET_MB", "2048")) * 2**20 // 4
 )
+# KV positions per program iteration of the Triton decode indexer; 64 is the previous tile.
+_DECODE_BLOCK_L = int(os.environ.get("SGLANG_DSV41_DECODE_INDEXER_BLOCK_L", "128"))
 _LOGITS_POOL: dict = {}
 
 
@@ -343,8 +345,9 @@ def triton_fp4_split_paged_mqa_logits(
     logits = _alloc_logits(q.shape[0], max_seq_len, q.device, is_decode)
     if q.shape[0] == 0 or max_seq_len == 0:
         return logits
+    block_l = _DECODE_BLOCK_L if is_decode else 64
     workers = min(
-        triton.cdiv(max_seq_len, 64),
+        triton.cdiv(max_seq_len, block_l),
         max(
             1,
             triton.cdiv(
@@ -373,7 +376,7 @@ def triton_fp4_split_paged_mqa_logits(
         HEADS=q.shape[1],
         HALF_D=_HEAD_DIM // 2,
         HAS_CANDIDATE_MASK=candidate_mask is not None,
-        BLOCK_L=64,
+        BLOCK_L=block_l,
         num_warps=4,
     )
     return logits
