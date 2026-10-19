@@ -2144,7 +2144,29 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     scale = getattr(layer, scale_name)
                     num_experts, num_rows, _ = scale.shape
                     is_w13_scale = scale_name == "w13_weight_scale_inv"
-                    if gfx942_exact_native_a16w4:
+                    if (
+                        gfx942_exact_native_a16w4_ep1
+                        and not is_w13_scale
+                        and get_bool_env_var("AITER_GFX942_DSV41_A16WMIX", "false")
+                    ):
+                        # aiter's a16wmix stage2 reads the w2 scale in e8m0_shuffle
+                        # layout, not the exact-path guinterleave one.
+                        # Pad groups (inter 576->640 => groups 18,19) hold zero
+                        # weights and e8m0=0; fill with the row's max real-group
+                        # byte so get_sref_u8's residual check (>= -6) accepts
+                        # FP8 stage2 (AITER_A16WMIX_FP8_S2). Zero pad weights
+                        # make this a no-op for the bf16 stage2 path.
+                        from aiter.utility.fp4_utils import e8m0_shuffle
+
+                        scale_2d = scale.reshape(-1, scale.shape[-1]).contiguous()
+                        pad_groups = int(getattr(layer, "intermediate_pad", 0)) // 32
+                        if pad_groups > 0:
+                            s_u8 = scale_2d.view(torch.uint8)
+                            s_u8[..., -pad_groups:] = s_u8[..., :-pad_groups].amax(
+                                dim=-1, keepdim=True
+                            )
+                        scale.data = e8m0_shuffle(scale_2d)
+                    elif gfx942_exact_native_a16w4:
                         scale_2d = scale.reshape(-1, scale.shape[-1])
                         scale.data = shuffle_scale(
                             scale_2d,
