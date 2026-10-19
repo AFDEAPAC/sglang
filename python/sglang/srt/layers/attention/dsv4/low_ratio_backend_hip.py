@@ -50,6 +50,55 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 _NATIVE_TRITON_INDEXER_LOGGED = False
+_INDEXER_TP_SPLIT_LOGGED = False
+_INDEXER_CAPTURED: set = set()
+
+
+def _maybe_capture_indexer_inputs(
+    layer_id, query, weights, k_payload, k_scale, page_table, lengths
+) -> None:
+    """Save one prefill indexer call's inputs for offline kernel A/B.
+
+    Enabled by SGLANG_DSV41_INDEXER_CAPTURE_DIR; layers from
+    SGLANG_DSV41_INDEXER_CAPTURE_LAYERS (comma list). TP rank 0 only, calls with
+    at least SGLANG_DSV41_INDEXER_CAPTURE_MIN_ROWS rows, once per (layer, max len).
+    Only the referenced K pages are kept; the page table is remapped to them.
+    """
+    cap_dir = os.environ.get("SGLANG_DSV41_INDEXER_CAPTURE_DIR")
+    if not cap_dir:
+        return
+    layers = os.environ.get("SGLANG_DSV41_INDEXER_CAPTURE_LAYERS", "")
+    if str(layer_id) not in layers.split(","):
+        return
+    if query.shape[0] < int(
+        os.environ.get("SGLANG_DSV41_INDEXER_CAPTURE_MIN_ROWS", "4096")
+    ):
+        return
+    if torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
+        return
+    max_len = int(lengths.max().item())
+    key = (int(layer_id), max_len)
+    if key in _INDEXER_CAPTURED:
+        return
+    _INDEXER_CAPTURED.add(key)
+    pages, inv = torch.unique(page_table.to(torch.int64), return_inverse=True)
+    pages = pages.clamp(min=0)
+    import pathlib
+
+    pathlib.Path(cap_dir).mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "layer_id": int(layer_id),
+            "query": query.detach().cpu(),
+            "weights": weights.detach().cpu(),
+            "k_payload": k_payload.view(torch.uint8)[pages].detach().cpu(),
+            "k_scale": k_scale[pages].detach().cpu(),
+            "page_table": inv.to(torch.int32).cpu(),
+            "orig_pages": pages.cpu(),
+            "lengths": lengths.detach().cpu(),
+        },
+        f"{cap_dir}/L{int(layer_id)}_len{max_len}_rows{query.shape[0]}.pt",
+    )
 
 
 _E2M1_VALUES = (0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6)
@@ -174,6 +223,141 @@ def _fp8_mqa_logits_extend(
                 stream,
             )
     return out[:rows]
+
+
+class _IndexerTpSplit:
+    """Contiguous row ownership for noCP TP indexer split + all-gather."""
+
+    __slots__ = ("rank", "size", "group", "own_lo", "own_hi", "chunk")
+
+    def __init__(self, rank, size, group, own_lo, own_hi, chunk):
+        self.rank = rank
+        self.size = size
+        self.group = group
+        self.own_lo = own_lo
+        self.own_hi = own_hi
+        self.chunk = chunk
+
+
+def _try_indexer_tp_split(
+    num_tokens: int, rows_per_request: Optional[List[int]]
+) -> Optional[_IndexerTpSplit]:
+    """Enable with SGLANG_DSV41_INDEXER_TP_SPLIT=1. Skips when CP already shards rows."""
+    if os.environ.get("SGLANG_DSV41_INDEXER_TP_SPLIT", "0") not in (
+        "1",
+        "true",
+        "True",
+    ):
+        return None
+    if rows_per_request is not None:
+        # Prefill CP already gives each rank a token shard; do not double-split.
+        return None
+    if num_tokens <= 0:
+        return None
+    from sglang.srt.distributed.parallel_state import get_parallel, get_tp_group
+
+    parallel = get_parallel()
+    if parallel.attn_cp_size > 1 or parallel.attn_tp_size <= 1:
+        return None
+    chunk = (num_tokens + parallel.attn_tp_size - 1) // parallel.attn_tp_size
+    own_lo = parallel.attn_tp_rank * chunk
+    own_hi = min(num_tokens, own_lo + chunk)
+    global _INDEXER_TP_SPLIT_LOGGED
+    if not _INDEXER_TP_SPLIT_LOGGED:
+        logger.info(
+            "DSV4.1 indexer TP split enabled: rank=%s/%s owns rows [%s, %s) of %s",
+            parallel.attn_tp_rank,
+            parallel.attn_tp_size,
+            own_lo,
+            own_hi,
+            num_tokens,
+        )
+        _INDEXER_TP_SPLIT_LOGGED = True
+    return _IndexerTpSplit(
+        parallel.attn_tp_rank,
+        parallel.attn_tp_size,
+        get_tp_group(),
+        own_lo,
+        own_hi,
+        chunk,
+    )
+
+
+def _all_gather_row_shard(
+    full: torch.Tensor, num_tokens: int, split: _IndexerTpSplit
+) -> None:
+    """All-gather equal padded chunks along dim 0 into ``full[:num_tokens]``."""
+    chunk = split.chunk
+    local = full[split.own_lo : split.own_hi]
+    if local.shape[0] < chunk:
+        pad = torch.full(
+            (chunk - local.shape[0],) + local.shape[1:],
+            -1,
+            dtype=local.dtype,
+            device=local.device,
+        )
+        local = torch.cat([local, pad], dim=0)
+    else:
+        local = local.contiguous()
+    gathered = split.group.all_gather(local, dim=0)
+    full[:num_tokens].copy_(gathered[:num_tokens])
+
+
+def _all_gather_candidate_publish(
+    publish: List[Optional[CandidateBlocks]],
+    extend_lens_cpu: List[int],
+    num_tokens: int,
+    split: _IndexerTpSplit,
+) -> List[Optional[CandidateBlocks]]:
+    """Reassemble per-request CandidateBlocks after each rank published only its rows."""
+    if not publish:
+        return publish
+    sample = next((p for p in publish if p is not None), None)
+    if sample is None:
+        return publish
+    topk_b = sample.ids.shape[1]
+    device = sample.ids.device
+    ids = torch.full((num_tokens, topk_b), -1, dtype=torch.int32, device=device)
+    compact_lens = torch.zeros((num_tokens, 1), dtype=torch.int32, device=device)
+    compact_pt = torch.zeros((num_tokens, 1), dtype=torch.int32, device=device)
+    tok = 0
+    for t_len, block in zip(extend_lens_cpu, publish):
+        if block is not None and t_len > 0:
+            n_local = block.ids.shape[0]
+            req_lo, req_hi = tok, tok + t_len
+            a = max(req_lo, split.own_lo)
+            b = min(req_hi, split.own_hi)
+            if b > a and n_local == b - a:
+                ids[a:b] = block.ids
+                compact_lens[a:b, 0] = block.compact_lens
+                compact_pt[a:b] = block.compact_page_table
+            elif n_local == t_len:
+                ids[req_lo:req_hi] = block.ids
+                compact_lens[req_lo:req_hi, 0] = block.compact_lens
+                compact_pt[req_lo:req_hi] = block.compact_page_table
+        tok += t_len
+    _all_gather_row_shard(ids, num_tokens, split)
+    _all_gather_row_shard(compact_lens, num_tokens, split)
+    _all_gather_row_shard(compact_pt, num_tokens, split)
+    cl = compact_lens.view(num_tokens)
+    out: List[Optional[CandidateBlocks]] = []
+    tok = 0
+    for t_len in extend_lens_cpu:
+        rows = slice(tok, tok + t_len)
+        if t_len == 0 or (cl[rows] <= 0).all():
+            out.append(None)
+        else:
+            out.append(
+                CandidateBlocks(
+                    ids=ids[rows],
+                    compact_lens=cl[rows],
+                    compact_page_table=compact_pt[rows],
+                    compact_page_size=sample.compact_page_size,
+                    block_size=sample.block_size,
+                )
+            )
+        tok += t_len
+    return out
 
 
 # fp32 logits scored per candidate-block chunk stay under this many bytes
@@ -662,15 +846,21 @@ def low_ratio_index_topk_hip_extend(
             if publish is not None:
                 publish.append(None)
 
+    num_tokens = int(pos.shape[0])
+    tp_split = _try_indexer_tp_split(num_tokens, rows_per_request)
+
     if all(is_identity):
         fill_identity_requests(0, len(extend_lens_cpu), 0)
+        if tp_split is not None:
+            _all_gather_row_shard(page_indices, num_tokens, tp_split)
+            if raw_indices is not None:
+                _all_gather_row_shard(raw_indices, num_tokens, tp_split)
         if publish is not None:
             backend.candidate_masks = publish
         return
 
     indexer_metadata = metadata.low_ratio_indexer_metadata(ratio)
     assert indexer_metadata is not None, f"no prefill indexer metadata for {ratio = }"
-    num_tokens = pos.shape[0]
     assert indexer_metadata.page_table.shape[0] >= num_tokens
     use_triton_native = (
         os.environ.get("SGLANG_DSV41_TRITON_FP4_INDEXER", "0") == "1"
@@ -716,6 +906,15 @@ def low_ratio_index_topk_hip_extend(
                 segments,
             )
         if use_triton_native:
+            _maybe_capture_indexer_inputs(
+                layer.layer_id,
+                query[rows],
+                weights[rows],
+                pool.get_index_k_fp4_payload_buffer(layer.layer_id),
+                pool.get_index_k_fp4_scale_buffer(layer.layer_id),
+                indexer_metadata.page_table[rows],
+                indexer_metadata.compressed_seq_lens[rows],
+            )
             return triton_fp4_split_paged_mqa_logits(
                 q=query[rows],
                 weights=weights[rows],
@@ -774,26 +973,74 @@ def low_ratio_index_topk_hip_extend(
         indexer_metadata.page_table, LOW_RATIO_PAGE_TABLE_BUCKET
     )
     groups = _request_groups(extend_lens_cpu, rows_per_chunk)
+
+    def owned_slice(rows: slice) -> Optional[slice]:
+        if tp_split is None:
+            return rows
+        a = max(rows.start, tp_split.own_lo)
+        b = min(rows.stop, tp_split.own_hi)
+        return None if a >= b else slice(a, b)
+
     for req_lo, req_hi, tok_lo, tok_hi in groups:
         group_is_identity = is_identity[req_lo:req_hi]
         if all(group_is_identity):
-            fill_identity_requests(req_lo, req_hi, tok_lo)
+            if tp_split is None or (
+                tok_hi > tp_split.own_lo and tok_lo < tp_split.own_hi
+            ):
+                fill_identity_requests(req_lo, req_hi, tok_lo)
+            elif publish is not None:
+                # Keep per-request slots so all-gather can reassemble.
+                for _ in range(req_lo, req_hi):
+                    publish.append(None)
             continue
         if tok_hi - tok_lo <= rows_per_chunk:
-            select_rows(
-                slice(tok_lo, tok_hi),
-                req_lo,
-                req_hi,
-                group_is_identity,
-                None if consume is None else consume[req_lo:req_hi],
-                publish,
+            # Under TP split, multi-request groups can straddle rank boundaries;
+            # process one request at a time so clipped rows match extend_lens.
+            req_ranges = (
+                [
+                    (
+                        r,
+                        r + 1,
+                        tok_lo + sum(extend_lens_cpu[req_lo:r]),
+                        tok_lo + sum(extend_lens_cpu[req_lo : r + 1]),
+                    )
+                    for r in range(req_lo, req_hi)
+                ]
+                if tp_split is not None and req_hi > req_lo + 1
+                else [(req_lo, req_hi, tok_lo, tok_hi)]
             )
+            for r_lo, r_hi, t_lo, t_hi in req_ranges:
+                rows = owned_slice(slice(t_lo, t_hi))
+                if rows is None:
+                    if publish is not None:
+                        for _ in range(r_lo, r_hi):
+                            publish.append(None)
+                    continue
+                if consume is not None and r_hi == r_lo + 1:
+                    rel = slice(rows.start - t_lo, rows.stop - t_lo)
+                    consume_rows = [
+                        None
+                        if consume[r_lo] is None
+                        else slice_candidate_blocks(consume[r_lo], rel)
+                    ]
+                else:
+                    consume_rows = None if consume is None else consume[r_lo:r_hi]
+                select_rows(
+                    rows,
+                    r_lo,
+                    r_hi,
+                    is_identity[r_lo:r_hi],
+                    consume_rows,
+                    publish,
+                )
             continue
         # a request wider than the logits block: scored in row chunks, its mask published in one piece
         assert req_hi == req_lo + 1, (req_lo, req_hi)
         pieces = []
         for lo in range(tok_lo, tok_hi, rows_per_chunk):
-            rows = slice(lo, min(lo + rows_per_chunk, tok_hi))
+            rows = owned_slice(slice(lo, min(lo + rows_per_chunk, tok_hi)))
+            if rows is None:
+                continue
             piece = [] if publish is not None else None
             consume_rows = None
             if consume is not None:
@@ -801,16 +1048,38 @@ def low_ratio_index_topk_hip_extend(
                     None
                     if consume[req_lo] is None
                     else slice_candidate_blocks(
-                        consume[req_lo], slice(lo - tok_lo, rows.stop - tok_lo)
+                        consume[req_lo], slice(rows.start - tok_lo, rows.stop - tok_lo)
                     )
                 ]
             select_rows(rows, req_lo, req_hi, group_is_identity, consume_rows, piece)
             if piece:
                 pieces.append(piece[0])
         if publish is not None:
-            publish.append(cat_candidate_blocks(pieces))
+            publish.append(cat_candidate_blocks(pieces) if pieces else None)
+    if tp_split is not None:
+        _all_gather_row_shard(page_indices, num_tokens, tp_split)
+        if raw_indices is not None:
+            _all_gather_row_shard(raw_indices, num_tokens, tp_split)
+        if publish is not None:
+            publish = _all_gather_candidate_publish(
+                publish, extend_lens_cpu, num_tokens, tp_split
+            )
     if publish is not None:
         backend.candidate_masks = publish
+    dump_dir = os.environ.get("SGLANG_DSV41_INDEXER_DUMP_DIR")
+    if dump_dir:
+        import pathlib
+        pathlib.Path(dump_dir).mkdir(parents=True, exist_ok=True)
+        rank = tp_split.rank if tp_split is not None else 0
+        torch.save(
+            {
+                "page_indices": page_indices[:num_tokens].detach().cpu(),
+                "raw_indices": None if raw_indices is None else raw_indices[:num_tokens].detach().cpu(),
+                "layer_id": int(layer.layer_id),
+                "num_tokens": num_tokens,
+            },
+            f"{dump_dir}/L{int(layer.layer_id)}_rank{rank}.pt",
+        )
 
 
 def _select_topk_extend_hip(
