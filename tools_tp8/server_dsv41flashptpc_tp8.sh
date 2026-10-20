@@ -6,17 +6,22 @@
 # tile 128 (SGLANG_DSV41_DECODE_INDEXER_BLOCK_L=128), with our prefill setting (PREFILL_CP=1 / CP4, GRAPH=full).
 # Every switch stays overridable by exporting it before the launcher. Two documented fall-backs (see --help):
 #   our image default (INT4 + fq7) and the exact FP4 fq7 variant.
-# TP8 defaults differ from TP4: EP_SIZE=8, MEMFRAC=0.80, PREFILL_CP=0.
-#   EP_SIZE=8 keeps per-rank MoE at full inter_dim=2304 with E=48 experts, which routes
-#   the gfx942 DSV4.1 MoE to the already-covered exact-a16w4 FlyDSL kernel
-#   (flydsl_moe1/2_abf16_wfp4_bf16_t32x128x256). This bypasses both TP8-EP1 boot bugs on
-#   this image: the fp4x2 quant-sort abort (fused_dynamic_mx_quant_moe_sort_hip, gfx942 has
-#   no __Float4_e2m1fn_x2) and the wint4 "Invalid FlyDSL kernel name ..._kb5" INT4 failure.
-#   MEMFRAC=0.80 (vs TP4 0.90): EP8 holds the full MoE intermediate per rank, so 0.90 OOMs
-#   during prefill CUDA-graph capture; 0.80 leaves ~34 GB headroom. PREFILL_CP=0 is the
-#   validated TP8 default (CP under TP8 is a tuning candidate, not yet validated here).
-# Defaults: DSPARK=0, PREFILL_CP=0, EP_SIZE=8, MEMFRAC=0.80. Set DSPARK=1 for spec decoding;
-# set EP_SIZE=1 only with the TP8-EP1 source fix (not in this image) or it will not boot.
+# TP8 defaults differ from TP4: EP_SIZE=1, MEMFRAC=0.80, PREFILL_CP=0.
+#   EP_SIZE=1 (all 384 routed experts per rank, intermediate tensor-sharded to 288)
+#   runs the a16wmix FP8 MoE pair -- the same winning kernel the TP4 path uses -- and
+#   is throughput-best on TP8 (measured 119-138% of EP8 at every sample point, GSM8K
+#   194/200). It REQUIRES the env-gated TP8-EP1 source fix committed on this branch:
+#   sglang fp8.py extends gfx942_exact_native_a16w4_ep1 to w13=(384,576,2560)/
+#   w2=(384,5120,144) so the loader preshuffles (guinterleave + e8m0 w2 scale); aiter
+#   fused_moe.py extends the a16wmix gate to (5120,384,384,6). Both behind
+#   AITER_GFX942_DSV41_A16WMIX_TP8EP1 (default-ON here, off elsewhere -> TP4 unchanged).
+#   Without that source fix EP1 aborts on gfx942 (fp4x2 quant-sort: no __Float4_e2m1fn_x2).
+#   Fallback: EP_SIZE=8 routes MoE to the exact-a16w4 FlyDSL kernel and boots with ZERO
+#   source change (slower, but needs no patch) -- use it on an unpatched image.
+#   MEMFRAC=0.80 (vs TP4 0.90): 0.90 OOMs during prefill CUDA-graph capture; 0.80 leaves
+#   ~14 GB headroom at EP1. PREFILL_CP=0 is the validated TP8 default (CP is a candidate).
+# Defaults: DSPARK=0, PREFILL_CP=0, EP_SIZE=1, MEMFRAC=0.80. Set DSPARK=1 for spec decoding;
+# set EP_SIZE=8 for the zero-source-change exact-a16w4 fallback.
 set -euo pipefail
 
 if [[ "${1:-}" == "--help" ]]; then
@@ -86,7 +91,7 @@ DSPARK="${DSPARK:-0}"
 PREFILL_CP="${PREFILL_CP:-0}"
 CP_SIZE="${CP_SIZE:-8}"
 CP_STRATEGY="${CP_STRATEGY:-interleave}"
-EP_SIZE="${EP_SIZE:-8}"
+EP_SIZE="${EP_SIZE:-1}"
 BLOCK_SIZE="${BLOCK_SIZE:-5}"
 SPEC_MOE_BACKEND="${SPEC_MOE_BACKEND:-aiter}"
 GRAPH="${GRAPH:-full}"
@@ -156,6 +161,12 @@ export AITER_GFX942_DSV41_EXACT_MXFP4_A16W4=1
 export AITER_GFX942_DSV41_EXACT_MXFP4_A16W4_EP1=0
 export AITER_GFX942_DSV41_EP1_LARGEM_SPLITK_BF16=1
 export AITER_GFX942_DSV41_EP1_TUNED_FLYDSL=1
+# TP8-EP1 a16wmix fix (env-gated, default-ON for this best-version TP8 default):
+#   A16WMIX_TP8EP1 extends the sglang fp8 preshuffle gate + aiter a16wmix dispatch
+#   gate to the TP8-EP1 shape; TP8_KSPLIT_COMPILED clamps wint4 split-K to compiled
+#   kb {2,4}. Both match only TP8 shapes on gfx942, so TP4/EP8 stay byte-identical.
+export AITER_GFX942_DSV41_A16WMIX_TP8EP1="${AITER_GFX942_DSV41_A16WMIX_TP8EP1:-1}"
+export AITER_GFX942_DSV41_TP8_KSPLIT_COMPILED="${AITER_GFX942_DSV41_TP8_KSPLIT_COMPILED:-1}"
 export SGLANG_USE_AITER_MOE_GU_ITLV=0
 export AITER_GFX942_REUSE_MOE_TMP=1 AITER_GFX942_MOE_TMP_TOKENS=512
 export SGLANG_DSV41_HIP_TORCH_HC_COMBINE=0

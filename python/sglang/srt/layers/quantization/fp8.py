@@ -1790,9 +1790,21 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 )
             )
             and w13_shape[0] == 384
-            and w13_shape[1:] == (1152, 2560)
             and w2_shape[0] == 384
-            and w2_shape[1:] == (5120, 288)
+            and (
+                (w13_shape[1:] == (1152, 2560) and w2_shape[1:] == (5120, 288))
+                or (
+                    # TP8/EP1: intermediate tensor-sharded to 288 (w13 N=576,
+                    # w2 Kpacked=144). Same guinterleave+e8m0 preshuffle contract
+                    # as the TP4/EP1 a16wmix path above; behind its own env so the
+                    # TP4 (1152/288) shape stays byte-for-byte unchanged.
+                    get_bool_env_var(
+                        "AITER_GFX942_DSV41_A16WMIX_TP8EP1", "false"
+                    )
+                    and w13_shape[1:] == (576, 2560)
+                    and w2_shape[1:] == (5120, 144)
+                )
+            )
         )
         if gfx942_exact_native_a16w4_ep1:
             gfx942_exact_native_a16w4 = True
