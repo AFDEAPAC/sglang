@@ -1409,6 +1409,7 @@ class ModelRunner:
                 is_ep_joiner=get_exec().moe.is_ep_joiner,
             )
 
+
     def start_startup_weight_load(self) -> None:
         assert self.startup_weight_load is not None
         self.startup_weight_load.start_prefetch()
@@ -2657,3 +2658,4 @@ def _gather_block_fp8_linear(layer: torch.nn.Module, group) -> torch.nn.Module:
     replica.quant_method = layer.quant_method
     layer.quant_method.process_weights_after_loading(replica)
     return replica
+

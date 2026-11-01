@@ -17,10 +17,12 @@ from typing import Optional, Tuple
 import torch
 
 from .triton_mla_kernels_decode_fused import (
+    SMALL_HEAD_PREFILL_SPLITK,
     DSV4_D_QK,
     fused_gather_attn_decode_dsv4,
     fused_gather_attn_decode_dsv4_dual_scope,
     fused_gather_attn_decode_dsv4_dual_scope_low_overhead,
+    _apply_inv_rope_standalone,
 )
 
 
@@ -54,8 +56,10 @@ def triton_sparse_attn_decode(
     sm_scale: float,
     d_v: int = 512,
     attn_sink: Optional[torch.Tensor] = None,
+    inv_rope: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Optimized sparse attention decode for DeepSeek V4 (d_qk=512)."""
+    """Optimized sparse attention decode for DeepSeek V4 (d_qk=512). inv_rope=(freqs_real, positions) applies
+    the model's inverse RoPE to the output."""
     d_qk = q.shape[-1]
 
     if d_qk != DSV4_D_QK:
@@ -64,7 +68,7 @@ def triton_sparse_attn_decode(
         )
 
     return _triton_sparse_attn_decode_dsv4(
-        q, kv_scope, extra_kv_scope, sm_scale, d_v, attn_sink
+        q, kv_scope, extra_kv_scope, sm_scale, d_v, attn_sink, inv_rope
     )
 
 
@@ -75,6 +79,7 @@ def _triton_sparse_attn_decode_dsv4(
     sm_scale: float,
     d_v: int,
     attn_sink: Optional[torch.Tensor],
+    inv_rope: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Sparse attention decode for DeepSeek V4 (d_qk=512).
 
@@ -109,6 +114,8 @@ def _triton_sparse_attn_decode_dsv4(
             attn_sink=attn_sink,
             s_q=s_q,
         )
+        if inv_rope is not None:
+            _apply_inv_rope_standalone(output, inv_rope)
         return output.view(b, s_q, h_q, d_v), lse.view(b, s_q, h_q).transpose(1, 2)
 
     # Dual scope case
@@ -140,6 +147,7 @@ def _triton_sparse_attn_decode_dsv4(
             topk_length_extra=extra_kv_scope.topk_length,
             attn_sink=attn_sink,
             s_q=s_q,
+            inv_rope=inv_rope,
         )
     else:
         # Large batch / extend / prefill: fused no-splitk kernel
@@ -156,7 +164,9 @@ def _triton_sparse_attn_decode_dsv4(
             topk_length_extra=extra_kv_scope.topk_length,
             attn_sink=attn_sink,
             s_q=s_q,
-            force_no_splitk=True,
+            force_no_splitk=not (SMALL_HEAD_PREFILL_SPLITK and h_q <= 16),
         )
+        if inv_rope is not None:
+            _apply_inv_rope_standalone(output, inv_rope)
 
     return output.view(b, s_q, h_q, d_v), lse.view(b, s_q, h_q).transpose(1, 2)

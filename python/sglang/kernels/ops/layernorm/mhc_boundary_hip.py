@@ -1,6 +1,7 @@
 """HIP mHC sublayer boundary: hc_post + collapse + mixing statistics, with the
 reduce + sinkhorn launched alone or hosted by the layer's next RMSNorm (HcCoefficients)."""
 
+import os
 from typing import Optional, Tuple, Union
 
 import torch
@@ -40,6 +41,35 @@ _HC_BOUNDARY_WIDE = dict(
 )
 # the reduce + sinkhorn row uses the norm kernel's warp count whether hosted there or launched alone
 _HC_SINKHORN_NUM_WARPS = 4
+
+
+def _hc_boundary_env_cfg(name: str) -> Optional[Tuple[int, int, int]]:
+    raw = os.environ.get(name, "")
+    if raw in ("", "0") or is_gfx95_supported():
+        return None
+    block_m, block_k, num_warps = (int(v) for v in raw.split(","))
+    return block_m, block_k, num_warps
+
+
+# gfx942 tile overrides of the Triton partial kernel as "BLOCK_M,BLOCK_K,NUM_WARPS": DECODE for M <= 16 rows,
+# PREFILL from SGLANG_GFX942_HC_BOUNDARY_PREFILL_MIN_M rows; BLOCK_K also sets the slice count the reduce sums
+_HC_BOUNDARY_GFX942_DECODE = _hc_boundary_env_cfg("SGLANG_GFX942_HC_BOUNDARY_DECODE")
+_HC_BOUNDARY_GFX942_PREFILL = _hc_boundary_env_cfg("SGLANG_GFX942_HC_BOUNDARY_PREFILL")
+_HC_BOUNDARY_GFX942_PREFILL_MIN_M = int(
+    os.environ.get("SGLANG_GFX942_HC_BOUNDARY_PREFILL_MIN_M", "256")
+)
+
+
+def _hc_boundary_cfg(m: int) -> Tuple[int, int, int]:
+    """(BLOCK_M, BLOCK_K, num_warps) of the partial kernel at m rows."""
+    if _HC_BOUNDARY_GFX942_DECODE is not None and m <= 16:
+        return _HC_BOUNDARY_GFX942_DECODE
+    if (
+        _HC_BOUNDARY_GFX942_PREFILL is not None
+        and m >= _HC_BOUNDARY_GFX942_PREFILL_MIN_M
+    ):
+        return _HC_BOUNDARY_GFX942_PREFILL
+    return _HC_BOUNDARY_BLOCK_M, _HC_BOUNDARY_BLOCK_K, _HC_BOUNDARY_NUM_WARPS
 
 
 @triton.jit
@@ -639,7 +669,8 @@ def _hc_boundary_partials(
     dev = residual.device
     has_post = x is not None
     has_combine = pre_prev is not None
-    num_slices = h // _HC_BOUNDARY_BLOCK_K
+    block_m, block_k, num_warps = _hc_boundary_cfg(m)
+    num_slices = h // block_k
     part_mix = torch.empty((num_slices, m, mix), dtype=torch.float32, device=dev)
     part_sq = torch.empty((num_slices, m), dtype=torch.float32, device=dev)
     if m == 0:
@@ -680,6 +711,17 @@ def _hc_boundary_partials(
             num_stages=_HC_BOUNDARY_NUM_STAGES,
             enable_fp_fusion=False,
         )
+    if (_HC_BOUNDARY_GFX942_DECODE is not None and m <= 16) or (
+        _HC_BOUNDARY_GFX942_PREFILL is not None
+        and m >= _HC_BOUNDARY_GFX942_PREFILL_MIN_M
+    ):
+        # an explicit gfx942 tile outranks the wide-tile heuristic
+        launch = dict(
+            BLOCK_M=block_m,
+            num_warps=num_warps,
+            num_stages=_HC_BOUNDARY_NUM_STAGES,
+            enable_fp_fusion=False,
+        )
     block_m = launch["BLOCK_M"]
     grid_m = triton.cdiv(m, block_m)
     _hc_boundary_partial_kernel[(grid_m, num_slices)](
@@ -701,7 +743,7 @@ def _hc_boundary_partials(
         HC=hc_mult,
         MIX=mix,
         MIX_PAD=mix_pad,
-        BLOCK_K=_HC_BOUNDARY_BLOCK_K,
+        BLOCK_K=block_k,
         DOT_PRECISION=_HC_MIX_DOT_PRECISION,
         HAS_POST=has_post,
         HAS_COMBINE=has_combine,
@@ -736,7 +778,7 @@ def hc_boundary_fused_deferred(
     k = hc_mult * h
     mix = hc_fn.shape[0]
     assert mix == (2 + hc_mult) * hc_mult and hc_fn.shape[1] == k
-    assert h % _HC_BOUNDARY_BLOCK_K == 0, h
+    assert h % _hc_boundary_cfg(m)[1] == 0, h
     dev = residual.device
     has_post = x is not None
     has_combine = pre_prev is not None
@@ -778,3 +820,133 @@ def hc_boundary_fused_deferred(
         hc_eps=hc_eps,
     )
     return residual_out, y, coefficients
+
+
+@triton.jit
+def _rmsnorm_ptq_sinkhorn_kernel(
+    x_ptr,
+    w_ptr,
+    out_ptr,
+    q_ptr,
+    s_ptr,
+    K,
+    stride_xm,
+    eps,
+    fp8_max,
+    part_mix_ptr,
+    part_sq_ptr,
+    scratch_ptr,
+    scale_ptr,
+    base_ptr,
+    pre_ptr,
+    post_ptr,
+    comb_ptr,
+    M,
+    m,
+    inv_k,
+    rms_eps,
+    BLOCK: tl.constexpr,
+    MIX: tl.constexpr,
+    HC: tl.constexpr,
+    NUM_SLICES: tl.constexpr,
+    SLICES_PAD: tl.constexpr,
+    ITERS: tl.constexpr,
+    EPS: tl.constexpr,
+):
+    """Grid (M + m,): programs [0, M) run the residual-free bf16 RMSNorm of a row and the per-token fp8 quant
+    of its bf16 output (gfx942_decode_fuse.rmsnorm_with_per_token_quant), programs [M, M + m)
+    _hc_mix_reduce_sinkhorn_row on the pending boundary's rows with its standalone arithmetic."""
+    pid = tl.program_id(0)
+    if pid < M:
+        row = pid.to(tl.int64)
+        offs = tl.arange(0, BLOCK)
+        mask = offs < K
+        x = tl.load(x_ptr + row * stride_xm + offs, mask=mask, other=0.0).to(tl.float32)
+        rcp = tl.rsqrt(tl.sum(x * x, axis=0) / K + eps)
+        w = tl.load(w_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+        y = (x * rcp * w).to(out_ptr.dtype.element_ty)
+        tl.store(out_ptr + row * K + offs, y, mask=mask)
+        yf = y.to(tl.float32)
+        y_s = tl.maximum(tl.max(tl.abs(yf), axis=0), 1e-10) / fp8_max
+        y_s_inv = 1.0 / y_s
+        y_q = tl.clamp(yf * y_s_inv, -fp8_max, fp8_max).to(q_ptr.dtype.element_ty)
+        tl.store(q_ptr + row * K + offs, y_q, mask=mask)
+        tl.store(s_ptr + row, y_s)
+    else:
+        _hc_mix_reduce_sinkhorn_row(
+            pid - M,
+            part_mix_ptr,
+            part_sq_ptr,
+            scratch_ptr,
+            scale_ptr,
+            base_ptr,
+            pre_ptr,
+            post_ptr,
+            comb_ptr,
+            m,
+            inv_k,
+            rms_eps,
+            MIX=MIX,
+            HC=HC,
+            NUM_SLICES=NUM_SLICES,
+            SLICES_PAD=SLICES_PAD,
+            ITERS=ITERS,
+            EPS=EPS,
+        )
+
+
+def rmsnorm_ptq_with_sinkhorn(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    coefficients: HcCoefficients,
+) -> torch.Tensor:
+    """gfx942_decode_fuse.rmsnorm_with_per_token_quant(x, weight, eps) with the pending reduce + sinkhorn of
+    coefficients in the same launch: the bf16 norm, carrying its (fp8 [M, K], fp32 scale [M, 1]) as _gfx942_ptq."""
+    from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype, fp8_max
+
+    assert x.dim() == 2 and x.stride(1) == 1, (x.shape, x.stride())
+    M, K = x.shape
+    assert coefficients.num_rows == M, (
+        f"coefficients hold {coefficients.num_rows} rows, the norm input {M}"
+    )
+    dev = x.device
+    out = torch.empty((M, K), dtype=x.dtype, device=dev)
+    q = torch.empty((M, K), dtype=fp8_dtype, device=dev)
+    s = torch.empty((M, 1), dtype=torch.float32, device=dev)
+    m = 0 if coefficients.materialized else M
+    coefficients.materialized = True
+    if M:
+        _rmsnorm_ptq_sinkhorn_kernel[(M + m,)](
+            x,
+            weight,
+            out,
+            q,
+            s,
+            K,
+            x.stride(0),
+            eps,
+            fp8_max,
+            coefficients.part_mix,
+            coefficients.part_sq,
+            coefficients.scratch,
+            coefficients.hc_scale,
+            coefficients.hc_base,
+            coefficients._pre,
+            coefficients._post,
+            coefficients._comb,
+            M,
+            m,
+            1.0 / coefficients.k,
+            coefficients.rms_eps,
+            BLOCK=triton.next_power_of_2(K),
+            MIX=coefficients.mix,
+            HC=coefficients.hc_mult,
+            NUM_SLICES=coefficients.num_slices,
+            SLICES_PAD=triton.next_power_of_2(coefficients.num_slices),
+            ITERS=coefficients.sinkhorn_iters,
+            EPS=coefficients.hc_eps,
+            num_warps=_HC_SINKHORN_NUM_WARPS,
+        )
+    out._gfx942_ptq = (q, s, out._version)
+    return out

@@ -4,6 +4,8 @@ included."""
 
 from __future__ import annotations
 
+import os
+
 from typing import Optional, Tuple
 
 import torch
@@ -34,7 +36,10 @@ def rocm_router_max_tokens(
     if num_experts != _GATE_NUM_EXPERTS or not 0 < topk <= _MAX_TOPK:
         return -1
     return rocm_gemv_split_k_max_tokens(
-        n=num_experts, k=hidden_size, weight_dtype=weight_dtype
+        n=num_experts,
+        k=hidden_size,
+        weight_dtype=weight_dtype,
+        allow_gfx942=os.environ.get("SGLANG_GFX942_ROUTER_SPLITK", "0") == "1",
     )
 
 

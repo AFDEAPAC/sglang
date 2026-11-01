@@ -26,6 +26,7 @@ from functools import partial
 from typing import Any, Callable, NamedTuple, Optional, Tuple, TypeAlias, Union
 
 import msgspec
+import os
 import torch
 import torch.nn.functional as F
 
@@ -363,9 +364,13 @@ def _mix_stats_impl(hc: HcSubLayer, x: torch.Tensor) -> HcTriplet:
         x.shape[0] == 1 or (bf16_parts is not None and 32 <= x.shape[0] <= 65536)
     )
     # gfx950 uses the fused Triton port at every row count (MI350X).
-    use_fused_stats = _is_gfx95_supported or (
-        torch.version.cuda is not None
-        and (get_platform().is_blackwell or hopper_fused_stats)
+    use_fused_stats = (
+        os.environ.get("SGLANG_GFX942_HC_MIX_STATS") == "full"
+        or _is_gfx95_supported
+        or (
+            torch.version.cuda is not None
+            and (get_platform().is_blackwell or hopper_fused_stats)
+        )
     )
     if x.is_cuda and use_fused_stats and x.dtype == torch.bfloat16:
         # The default split-K/Sinkhorn fusion preserves batch invariance;
@@ -410,7 +415,10 @@ def _mix_stats_impl(hc: HcSubLayer, x: torch.Tensor) -> HcTriplet:
                 cfg.eps,
             )
         return pre, post, comb
-    if x.is_cuda and torch.version.cuda is not None:
+    if x.is_cuda and (
+        torch.version.cuda is not None
+        or os.environ.get("SGLANG_GFX942_HC_MIX_STATS") == "partial"
+    ):
         # cuBLAS/torch reductions can change order with num_tokens; this kernel
         # keeps the mixing and RMS reductions batch-invariant.
         mixes = hc_mix_stats(x_flat, hc.fn, cfg.rms_eps).unsqueeze(1)

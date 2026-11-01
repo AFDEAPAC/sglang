@@ -1875,6 +1875,46 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         logger.warning_once("Dequantized FP4 MoE expert weights to FP8.")
 
     def process_weights_after_loading_block_quant(self, layer: Module) -> None:
+        # DSV4.1 TP4/EP1: all 384 routed experts per rank, intermediate
+        # tensor-sharded by TP=4 to a true 576 (pre-pad w13 N=1152, w2
+        # Kpacked=288). Use the same exact-path guinterleave shuffle the gfx942
+        # a16w4 kernel expects; otherwise the loader falls through to the
+        # non-exact (gu_intv/gate_up) shuffle layout and the kernel reads
+        # mismatched weights/scales (coherent-looking boot, gibberish output).
+        # The LARGEM env shares this loader-side exact shuffle; the
+        # BF16-activation split-K dispatch itself is selected in AITER by the
+        # separate largem env.
+        w13_shape = tuple(layer.w13_weight.shape)
+        w2_shape = tuple(layer.w2_weight.shape)
+        gfx942_exact_native_a16w4_ep1 = (
+            _is_hip
+            and (
+                get_bool_env_var("AITER_GFX942_DSV41_EXACT_MXFP4_A16W4_EP1", "false")
+                or get_bool_env_var("AITER_GFX942_DSV41_EP1_LARGEM_SPLITK_BF16", "false")
+            )
+            and w13_shape[0] == 384
+            and w2_shape[0] == 384
+            and (
+                (w13_shape[1:] == (1152, 2560) and w2_shape[1:] == (5120, 288))
+                or (
+                    # TP8/EP1: intermediate tensor-sharded to 288 (w13 N=576,
+                    # w2 Kpacked=144). Same guinterleave+e8m0 preshuffle contract
+                    # as the TP4/EP1 a16wmix path above; behind its own env so the
+                    # TP4 (1152/288) shape stays byte-for-byte unchanged.
+                    get_bool_env_var("AITER_GFX942_DSV41_A16WMIX_TP8EP1", "false")
+                    and w13_shape[1:] == (576, 2560)
+                    and w2_shape[1:] == (5120, 144)
+                )
+            )
+        )
+        gfx942_exact_native_a16w4 = gfx942_exact_native_a16w4_ep1
+        if gfx942_exact_native_a16w4_ep1:
+            logger.info(
+                "[dsv41-ep1] exact a16w4 guinterleave shuffle enabled for "
+                "w13=%s w2=%s",
+                w13_shape,
+                w2_shape,
+            )
         if _use_aiter and self.is_fp4_expert:
             # aiter MegaMoEv2 builds from the packed FP4 layout, so it has to
             # claim the experts before the native-MXFP4 and dequant arms.
@@ -1986,7 +2026,37 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     scale = getattr(layer, scale_name)
                     num_experts, num_rows, _ = scale.shape
                     is_w13_scale = scale_name == "w13_weight_scale_inv"
-                    if _is_gfx1250_supported:
+                    if (
+                        gfx942_exact_native_a16w4_ep1
+                        and not is_w13_scale
+                        and get_bool_env_var("AITER_GFX942_DSV41_A16WMIX", "false")
+                    ):
+                        # aiter's a16wmix stage2 reads the w2 scale in e8m0_shuffle
+                        # layout, not the exact-path guinterleave one.
+                        # Pad groups (inter 576->640 => groups 18,19) hold zero
+                        # weights and e8m0=0; fill with the row's max real-group
+                        # byte so get_sref_u8's residual check (>= -6) accepts
+                        # FP8 stage2 (AITER_A16WMIX_FP8_S2). Zero pad weights
+                        # make this a no-op for the bf16 stage2 path.
+                        from aiter.utility.fp4_utils import e8m0_shuffle
+
+                        scale_2d = scale.reshape(-1, scale.shape[-1]).contiguous()
+                        pad_groups = int(getattr(layer, "intermediate_pad", 0)) // 32
+                        if pad_groups > 0:
+                            s_u8 = scale_2d.view(torch.uint8)
+                            s_u8[..., -pad_groups:] = s_u8[..., :-pad_groups].amax(
+                                dim=-1, keepdim=True
+                            )
+                        scale.data = e8m0_shuffle(scale_2d)
+                    elif gfx942_exact_native_a16w4:
+                        scale_2d = scale.reshape(-1, scale.shape[-1])
+                        scale.data = shuffle_scale(
+                            scale_2d,
+                            experts_cnt=num_experts,
+                            is_guinterleave=True,
+                            gate_up=False,
+                        )
+                    elif _is_gfx1250_supported:
                         scale.data = moe_shuffle_scale(
                             scale.contiguous(),
                             experts_cnt=num_experts,
@@ -2002,7 +2072,19 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 layer.w13_weight.data = layer.w13_weight.data.view(fp4_weight_dtype)
                 layer.w2_weight.data = layer.w2_weight.data.view(fp4_weight_dtype)
 
-                if _is_gfx1250_supported:
+                if gfx942_exact_native_a16w4:
+                    is_shuffled = True
+                    layer.w13_weight.data = shuffle_weight(
+                        layer.w13_weight,
+                        is_guinterleave=True,
+                        gate_up=False,
+                    )
+                    layer.w2_weight.data = shuffle_weight(
+                        layer.w2_weight,
+                        is_guinterleave=True,
+                        gate_up=False,
+                    )
+                elif _is_gfx1250_supported:
                     is_shuffled = True
                     layer.w13_weight.data = moe_shuffle_weight(
                         layer.w13_weight,

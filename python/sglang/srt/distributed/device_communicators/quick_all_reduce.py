@@ -172,7 +172,10 @@ class QuickAllReduce:
         self.use_fp16_kernels = int(
             os.environ.get("ROCM_QUICK_REDUCE_CAST_BF16_TO_FP16", 1)
         )
-        regime_str = os.environ.get("ROCM_QUICK_REDUCE_QUANTIZATION", "NONE")
+        # SGLANG_GFX942_QUICK_REDUCE_QUANT overrides the launcher's ROCM_QUICK_REDUCE_QUANTIZATION
+        regime_str = os.environ.get("SGLANG_GFX942_QUICK_REDUCE_QUANT") or os.environ.get(
+            "ROCM_QUICK_REDUCE_QUANTIZATION", "NONE"
+        )
         if regime_str not in QuickReduceRegime.__members__:
             logger.warning(
                 "Custom quick allreduce:",

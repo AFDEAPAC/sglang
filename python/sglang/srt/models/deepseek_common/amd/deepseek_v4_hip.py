@@ -21,15 +21,19 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context
 from sglang.srt.models.deepseek_common.amd import deepseek_v4_gfx95_dense as gfx95_dense
 from sglang.srt.models.deepseek_common.amd.deepseek_v4_fused_mhc import (  # noqa: F401  deepseek_v4 reaches apply_attention_mhc through this module
     apply_attention_mhc,
+    gfx942_norm_hosting_sinkhorn,
 )
 from sglang.srt.runtime_context import get_exec
-from sglang.srt.utils import is_gfx95_supported
+from sglang.srt.utils import get_bool_env_var, is_gfx95_supported
 
 live_rows = gfx95_dense.live_rows
 wo_a_fp8_grid_matmul = gfx95_dense.wo_a_fp8_grid_matmul
 wo_b_emits_mxfp8 = gfx95_dense.wo_b_emits_mxfp8
 
 _is_gfx95_supported = is_gfx95_supported()
+# gfx942 opt-ins for the gfx950 attention front/back-end fusions (Triton attention backend)
+_GFX942_FUSE_Q_ROPE = get_bool_env_var("SGLANG_GFX942_FUSE_Q_ROPE_K_STORE", "false")
+_GFX942_TRITON_INV_ROPE = get_bool_env_var("SGLANG_GFX942_TRITON_ATTN_INV_ROPE", "false")
 
 
 # ---- MqaAttentionBase / MQALayer ----
@@ -45,6 +49,11 @@ def init_mqa_layer(attn, quant_config) -> None:
     attn._wq_b_native_consumer_checked = False
     attn._wq_b_native_consumer = False
     attn._wo_b_fp8_grid_operand = None
+    from sglang.kernels.ops.quantization import gfx942_decode_fuse as _gfx942_fuse
+
+    if _gfx942_fuse.RMSNORM_PTQ and not _is_gfx95_supported and hasattr(attn, "q_norm"):
+        # wq_b and the indexer's wq_b quantize q_norm's output per token
+        attn.q_norm._gfx942_ptq = True
 
 
 def wo_a_emits_fp8_grid(attn) -> bool:
@@ -107,7 +116,7 @@ def compute_q_b(
     """attn._compute_q_b(q_for_wqb, positions, q_out) as (q, the q_lora the indexer reads,
     whether the K norm-rope-store launch ropes q). The indexer takes the fused operand:
     its wq_b would re-round onto the same grid."""
-    fuse_q_rope = _is_gfx95_supported and fuses_q_rope_into_k_store(
+    fuse_q_rope = (_is_gfx95_supported or _GFX942_FUSE_Q_ROPE) and fuses_q_rope_into_k_store(
         attn, q_out, unified=unified, use_cp=use_cp
     )
     if fuse_q_rope:
@@ -133,10 +142,15 @@ def attention_inv_rope(
     """(freqs_real, positions) for aiter's gfx950 sparse kernel to apply the inverse RoPE
     itself; None for the other kernels, and where the fp8 wo_a front end or the prefill
     graph op keeps it."""
+    gfx942_triton = (
+        _GFX942_TRITON_INV_ROPE
+        and not _is_gfx95_supported
+        and resolve_hip_flashmla_backend() == "triton"
+    )
     if (
         unified
-        or not _is_gfx95_supported
-        or resolve_hip_flashmla_backend() != "aiter_sparse"
+        or not (gfx942_triton or _is_gfx95_supported)
+        or (not gfx942_triton and resolve_hip_flashmla_backend() != "aiter_sparse")
         or wo_a_applies_inv_rope
     ):
         return None
@@ -162,8 +176,29 @@ def init_decoder_layer(layer, quant_config) -> None:
     layer._wqkv_a_native_consumer_checked = False
     layer._wqkv_a_native_consumer = False
     layer.hc_boundary_fused = (
-        _is_gfx95_supported and layer.hc_pre_from_prev_sublayer and layer.hc_mult == 4
+        (_is_gfx95_supported or get_bool_env_var("SGLANG_GFX942_HC_BOUNDARY_FUSED", "false"))
+        and layer.hc_pre_from_prev_sublayer
+        and layer.hc_mult == 4
     )
+    from sglang.kernels.ops.quantization import gfx942_decode_fuse as _gfx942_fuse
+
+    if _gfx942_fuse.RMSNORM_PTQ and not _is_gfx95_supported:
+        # wqkv_a and the shared experts' gate_up quantize these outputs per token
+        layer.input_layernorm._gfx942_ptq = True
+        layer.post_attention_layernorm._gfx942_ptq = True
+        if _gfx942_fuse.MOE_REUSE_PTQ:
+            # and the a16wmix routed experts' fp8 stage1 takes
+            # post_attention_layernorm's pair
+            from aiter.ops.flydsl import a16wmix_fused_moe
+
+            a16wmix_fused_moe.prequant_provider = _gfx942_fuse.moe_input_prequant
+    if not _is_gfx95_supported and get_bool_env_var("SGLANG_GFX942_SMALL_MOE_SORT", "false"):
+        # one Triton launch sorts decode-sized routes (and zeroes moe_buf) for aiter's moe_sorting callers
+        from sglang.kernels.ops.moe.moe_sorting_small import (
+            apply_aiter_small_moe_sort_patch,
+        )
+
+        apply_aiter_small_moe_sort_patch()
 
 
 def hc_post(cfg, x, residual, post, comb) -> Optional[torch.Tensor]:
@@ -223,5 +258,10 @@ def input_norm(
     if layer.fused_rmsnorm_fake_quant:
         return gfx95_dense.input_norm_fake_quant(layer, hidden_states, coefficients)
     if coefficients is not None:
+        hosted = gfx942_norm_hosting_sinkhorn(
+            layer.input_layernorm, hidden_states, coefficients
+        )
+        if hosted is not None:
+            return hosted, None
         coefficients.materialize()
     return layer.input_layernorm(hidden_states), None

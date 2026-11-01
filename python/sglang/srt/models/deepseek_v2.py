@@ -474,7 +474,21 @@ class DeepseekV2MLP(nn.Module):
 
         # Fallback: fused silu+clamp kernel (still faster than unfused)
         elif self.swiglu_limit is not None:
-            if _is_hip:
+            from sglang.kernels.ops.quantization import gfx942_decode_fuse as _gfx942_fuse
+
+            if (
+                _is_hip
+                and _gfx942_fuse.SHARED_ACT_QUANT
+                and not getattr(self, "_hip_act_fp8_grid", False)
+                and not getattr(self, "_hip_act_native_consumer", False)
+                and _gfx942_fuse.silu_and_mul_clamp_quant_supported(gate_up)
+                and _gfx942_fuse.rowwise_fp8_linear_takes_prequant(self.down_proj)
+            ):
+                # down_proj's per-token fp8 quant folded into the activation launch
+                x = _gfx942_fuse.silu_and_mul_clamp_per_token_quant_fp8(
+                    gate_up, float(self.swiglu_limit)
+                )
+            elif _is_hip:
                 x = _hip_act.silu_and_mul_clamp(self, gate_up)
             elif _is_npu:
                 x = torch.ops.npu.npu_clipped_swiglu(
@@ -955,12 +969,16 @@ class DeepseekV2MoE(nn.Module):
                 and shared_gate_up_weight.dtype == torch.float8_e4m3fn
             )
             if self.shared_experts_is_fp8 and not _is_npu:
+                _shared_quant_method = (config.quantization_config or {}).get(
+                    "quant_method"
+                )
                 if (
-                    _use_aiter
-                    and config.quantization_config.get("quant_method")
-                    == "compressed-tensors"
-                ):
-                    # For compressed-tensors ptpc model, don't need to check the weight_block_size
+                    _use_aiter and _shared_quant_method == "compressed-tensors"
+                ) or _shared_quant_method == "w8a8_fp8":
+                    # Per-channel FP8 methods (compressed-tensors ptpc, w8a8_fp8) do
+                    # not expose block-size metadata, so there is nothing to compare.
+                    # DSv4.1-Flash-PTPC declares w8a8_fp8 with expert_dtype fp4; its
+                    # linears get W8A8Fp8LinearMethod, which has no .quant_config.
                     pass
                 else:
                     assert (

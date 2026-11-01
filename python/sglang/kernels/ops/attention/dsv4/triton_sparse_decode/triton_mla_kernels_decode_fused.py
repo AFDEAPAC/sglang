@@ -1,3 +1,4 @@
+import os
 """
 Fused Gather+Dequant+Attention Kernel for DSV4 (d_qk=512)
 
@@ -57,8 +58,62 @@ NOSPLITK_TOKEN_THRESHOLD_LOW_TOPK = (
     64  # For total_topk < DUAL_SCOPE_SPLITK_TOPK_THRESHOLD
 )
 
+# With h_q <= 16 (DeepSeek-V4.1 at TP4) the non-split grid is one program per
+# token, so the topk axis is the only parallelism a batch of a few tokens has;
+# measured on gfx942 at topk 512 + 128. Ported from the ali-private 20261030
+# image, env-var names included.
+SMALL_HEAD_DECODE_SPLITK = os.environ.get("SGLANG_DSV41_TRITON_ATTN_SPLITK", "0") == "1"
+SMALL_HEAD_PREFILL_SPLITK = (
+    os.environ.get("SGLANG_DSV41_TRITON_ATTN_PREFILL_SPLITK", "0") == "1"
+)
+
 # Small batch threshold: below this, split-K=4/8 for parallelism
 SMALL_BATCH_TOKEN_THRESHOLD = 8
+
+# Round-3 gfx942 small-head options, all default off. SPLITK_N: decode split counts by batch size, "split:max_tokens"
+# tiers such as "20:4,10:8" (20 splits of 640 = one BLOCK_N 32 step each, cut on the 128 / 512 scope boundary); a
+# bare count applies up to SPLITK_N_MAX_TOKENS tokens.
+def _parse_splitk_tiers(spec: str, default_max_tokens: int):
+    tiers = []
+    for item in filter(None, (s.strip() for s in spec.split(","))):
+        split, _, max_tokens = item.partition(":")
+        tiers.append((int(max_tokens) if max_tokens else default_max_tokens, int(split)))
+    return sorted(tiers)
+
+
+SMALL_HEAD_DECODE_SPLITK_N_TIERS = _parse_splitk_tiers(
+    os.environ.get("SGLANG_DSV41_TRITON_ATTN_SPLITK_N", ""),
+    int(os.environ.get("SGLANG_DSV41_TRITON_ATTN_SPLITK_N_MAX_TOKENS", "8")),
+)
+# PAR_COMBINE: decode combine over (token, head block, 64-wide d block) programs, any split count
+PAR_COMBINE = os.environ.get("SGLANG_DSV41_TRITON_ATTN_PAR_COMBINE", "0") == "1"
+PAR_COMBINE_BLOCK_H = int(os.environ.get("SGLANG_DSV41_TRITON_ATTN_PAR_COMBINE_BLOCK_H", "4"))
+PAR_COMBINE_WARPS = int(os.environ.get("SGLANG_DSV41_TRITON_ATTN_PAR_COMBINE_WARPS", "1"))
+# SINGLE_SPLITK: split-K 4 for the single-scope (SWA only) kernel at small batches
+SINGLE_SCOPE_SPLITK = os.environ.get("SGLANG_DSV41_TRITON_ATTN_SINGLE_SPLITK", "0") == "1"
+# LEAN: 8-byte scale load, 16-bit rope load and truncating fp8 * 2^k -> bf16 (exact for normal results);
+# PREFILL_LEAN applies it to the prefill split-K launch only, where its VGPR use pairs with the EXTRA_CFGS
+# (BLOCK_N 32 / 1 warp, BLOCK_N 16 / 2 warps) that keep more programs resident
+_LEAN_KV = tl.constexpr(os.environ.get("SGLANG_DSV41_TRITON_ATTN_LEAN", "0") == "1")
+PREFILL_LEAN = os.environ.get("SGLANG_DSV41_TRITON_ATTN_PREFILL_LEAN", "0") == "1"
+_SPLITK_EXTRA_CONFIGS = (
+    [
+        triton.Config({"BLOCK_H": 16, "BLOCK_N": 32}, num_warps=1, num_stages=1),
+        triton.Config({"BLOCK_H": 16, "BLOCK_N": 16}, num_warps=2, num_stages=1),
+    ]
+    if os.environ.get("SGLANG_DSV41_TRITON_ATTN_EXTRA_CFGS", "0") == "1"
+    else []
+)
+_SPLITK_EXTRA_KEYS = {(32, 1), (16, 2)}
+
+
+def _prune_splitk_configs(configs, named_args, **kwargs):
+    """The EXTRA_CFGS shapes are for prefill; decode buckets keep the original list."""
+    if named_args.get("total_tokens_bucket", 0) > 256:
+        return configs
+    return [
+        c for c in configs if (c.kwargs.get("BLOCK_N"), c.num_warps) not in _SPLITK_EXTRA_KEYS
+    ]
 
 # Topk threshold for split-K value selection within the split-K path
 SPLITK_HIGH_TOPK_THRESHOLD = 512
@@ -74,6 +129,14 @@ def _decide_splitk_dual_scope(total_tokens: int, h_q: int, total_topk: int) -> i
     Returns:
         split_k value (0 means no split-K, use non-splitk kernel).
     """
+    if h_q <= 16 and total_topk >= 256:
+        if total_tokens <= 256 and SMALL_HEAD_DECODE_SPLITK:
+            for max_tokens, split in SMALL_HEAD_DECODE_SPLITK_N_TIERS:
+                if total_tokens <= max_tokens:
+                    return split
+            return 8 if total_tokens <= 16 else 4
+        if total_tokens > 256 and SMALL_HEAD_PREFILL_SPLITK:
+            return 2
     # Conditions under which split-K is beneficial:
     use_splitk_for_small_bs = total_tokens <= SMALL_BATCH_TOKEN_THRESHOLD and (
         h_q >= 128 or total_topk >= 1024
@@ -130,6 +193,13 @@ DSV4_BYTES_PER_TOKEN_SCALE = 8  # 7 scales + 1 padding
 
 
 @triton.jit
+def _fp8_pow2_to_bf16(nope_uint8, scale_f32):
+    """fp8 * 2^k is exact in bf16 for normal results, so dropping the low 16 bits of the f32 product equals RNE."""
+    x = nope_uint8.to(_KV_FP8_TY, bitcast=True).to(tl.float32) * scale_f32[:, None]
+    return (x.to(tl.uint32, bitcast=True) >> 16).to(tl.uint16).to(tl.bfloat16, bitcast=True)
+
+
+@triton.jit
 def _process_kv_block_aggressive(
     # KV cache parameters
     kv_block_base,
@@ -167,6 +237,7 @@ def _process_kv_block_aggressive(
     LOG2E: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    LEAN: tl.constexpr = False,
 ):
     """
     Process one block of KV tokens with batch loading.
@@ -174,89 +245,130 @@ def _process_kv_block_aggressive(
     """
     NEG_INF = float("-inf")
 
-    scale_ptrs = kv_block_base + scale_base_offset
-    scale_uint8_0 = tl.load(scale_ptrs, mask=valid, other=127).to(tl.uint8)
-    scale_uint8_1 = tl.load(scale_ptrs + 1, mask=valid, other=127).to(tl.uint8)
-    scale_uint8_2 = tl.load(scale_ptrs + 2, mask=valid, other=127).to(tl.uint8)
-    scale_uint8_3 = tl.load(scale_ptrs + 3, mask=valid, other=127).to(tl.uint8)
-    scale_uint8_4 = tl.load(scale_ptrs + 4, mask=valid, other=127).to(tl.uint8)
-    scale_uint8_5 = tl.load(scale_ptrs + 5, mask=valid, other=127).to(tl.uint8)
-    scale_uint8_6 = tl.load(scale_ptrs + 6, mask=valid, other=127).to(tl.uint8)
+    if _LEAN_KV or LEAN:
+        scale_ptrs32 = (kv_block_base + scale_base_offset).to(tl.pointer_type(tl.uint32))
+        sc_lo = tl.load(scale_ptrs32, mask=valid, other=0x7F7F7F7F)
+        sc_hi = tl.load(scale_ptrs32 + 1, mask=valid, other=0x7F7F7F7F)
+        tile_base = kv_block_base[:, None] + nope_rope_offset[:, None]
+        nope_uint8_0 = tl.load(tile_base + offs_tile[None, :], mask=valid_2d, other=0)
+        nope_uint8_1 = tl.load(tile_base + TILE_SIZE + offs_tile[None, :], mask=valid_2d, other=0)
+        nope_uint8_2 = tl.load(tile_base + 2 * TILE_SIZE + offs_tile[None, :], mask=valid_2d, other=0)
+        nope_uint8_3 = tl.load(tile_base + 3 * TILE_SIZE + offs_tile[None, :], mask=valid_2d, other=0)
+        nope_uint8_4 = tl.load(tile_base + 4 * TILE_SIZE + offs_tile[None, :], mask=valid_2d, other=0)
+        nope_uint8_5 = tl.load(tile_base + 5 * TILE_SIZE + offs_tile[None, :], mask=valid_2d, other=0)
+        nope_uint8_6 = tl.load(tile_base + 6 * TILE_SIZE + offs_tile[None, :], mask=valid_2d, other=0)
+        rope_ptrs16 = (tile_base + D_NOPE).to(tl.pointer_type(tl.uint16)) + offs_tile[None, :]
+        kv_7 = tl.load(rope_ptrs16, mask=valid_2d, other=0).to(tl.bfloat16, bitcast=True)
 
-    tile_base = kv_block_base[:, None] + nope_rope_offset[:, None]
+        scale_0 = tl.math.exp2((sc_lo & 0xFF).to(tl.float32) - 127.0)
+        scale_1 = tl.math.exp2(((sc_lo >> 8) & 0xFF).to(tl.float32) - 127.0)
+        scale_2 = tl.math.exp2(((sc_lo >> 16) & 0xFF).to(tl.float32) - 127.0)
+        scale_3 = tl.math.exp2(((sc_lo >> 24) & 0xFF).to(tl.float32) - 127.0)
+        scale_4 = tl.math.exp2((sc_hi & 0xFF).to(tl.float32) - 127.0)
+        scale_5 = tl.math.exp2(((sc_hi >> 8) & 0xFF).to(tl.float32) - 127.0)
+        scale_6 = tl.math.exp2(((sc_hi >> 16) & 0xFF).to(tl.float32) - 127.0)
 
-    # Batch load all tiles
-    nope_uint8_0 = tl.load(tile_base + offs_tile[None, :], mask=valid_2d, other=0)
-    nope_uint8_1 = tl.load(
-        tile_base + TILE_SIZE + offs_tile[None, :], mask=valid_2d, other=0
-    )
-    nope_uint8_2 = tl.load(
-        tile_base + 2 * TILE_SIZE + offs_tile[None, :], mask=valid_2d, other=0
-    )
-    nope_uint8_3 = tl.load(
-        tile_base + 3 * TILE_SIZE + offs_tile[None, :], mask=valid_2d, other=0
-    )
-    nope_uint8_4 = tl.load(
-        tile_base + 4 * TILE_SIZE + offs_tile[None, :], mask=valid_2d, other=0
-    )
-    nope_uint8_5 = tl.load(
-        tile_base + 5 * TILE_SIZE + offs_tile[None, :], mask=valid_2d, other=0
-    )
-    nope_uint8_6 = tl.load(
-        tile_base + 6 * TILE_SIZE + offs_tile[None, :], mask=valid_2d, other=0
-    )
-    rope_ptrs = tile_base + D_NOPE + offs_tile[None, :] * 2
-    rope_lo = tl.load(rope_ptrs, mask=valid_2d, other=0).to(tl.uint16)
-    rope_hi = tl.load(rope_ptrs + 1, mask=valid_2d, other=0).to(tl.uint16)
+        # masked rows load zero bytes and a unit scale, so kv is already zero there
+        qk = tl.zeros([BLOCK_H, BLOCK_N], dtype=tl.float32)
+        kv_0 = _fp8_pow2_to_bf16(nope_uint8_0, scale_0)
+        qk += tl.dot(q_0, tl.trans(kv_0)).to(tl.float32)
+        kv_1 = _fp8_pow2_to_bf16(nope_uint8_1, scale_1)
+        qk += tl.dot(q_1, tl.trans(kv_1)).to(tl.float32)
+        kv_2 = _fp8_pow2_to_bf16(nope_uint8_2, scale_2)
+        qk += tl.dot(q_2, tl.trans(kv_2)).to(tl.float32)
+        kv_3 = _fp8_pow2_to_bf16(nope_uint8_3, scale_3)
+        qk += tl.dot(q_3, tl.trans(kv_3)).to(tl.float32)
+        kv_4 = _fp8_pow2_to_bf16(nope_uint8_4, scale_4)
+        qk += tl.dot(q_4, tl.trans(kv_4)).to(tl.float32)
+        kv_5 = _fp8_pow2_to_bf16(nope_uint8_5, scale_5)
+        qk += tl.dot(q_5, tl.trans(kv_5)).to(tl.float32)
+        kv_6 = _fp8_pow2_to_bf16(nope_uint8_6, scale_6)
+        qk += tl.dot(q_6, tl.trans(kv_6)).to(tl.float32)
+        qk += tl.dot(q_7, tl.trans(kv_7)).to(tl.float32)
+    else:
+        scale_ptrs = kv_block_base + scale_base_offset
+        scale_uint8_0 = tl.load(scale_ptrs, mask=valid, other=127).to(tl.uint8)
+        scale_uint8_1 = tl.load(scale_ptrs + 1, mask=valid, other=127).to(tl.uint8)
+        scale_uint8_2 = tl.load(scale_ptrs + 2, mask=valid, other=127).to(tl.uint8)
+        scale_uint8_3 = tl.load(scale_ptrs + 3, mask=valid, other=127).to(tl.uint8)
+        scale_uint8_4 = tl.load(scale_ptrs + 4, mask=valid, other=127).to(tl.uint8)
+        scale_uint8_5 = tl.load(scale_ptrs + 5, mask=valid, other=127).to(tl.uint8)
+        scale_uint8_6 = tl.load(scale_ptrs + 6, mask=valid, other=127).to(tl.uint8)
 
-    scale_bf16_0 = tl.math.exp2(scale_uint8_0.to(tl.float32) - 127.0).to(tl.bfloat16)
-    scale_bf16_1 = tl.math.exp2(scale_uint8_1.to(tl.float32) - 127.0).to(tl.bfloat16)
-    scale_bf16_2 = tl.math.exp2(scale_uint8_2.to(tl.float32) - 127.0).to(tl.bfloat16)
-    scale_bf16_3 = tl.math.exp2(scale_uint8_3.to(tl.float32) - 127.0).to(tl.bfloat16)
-    scale_bf16_4 = tl.math.exp2(scale_uint8_4.to(tl.float32) - 127.0).to(tl.bfloat16)
-    scale_bf16_5 = tl.math.exp2(scale_uint8_5.to(tl.float32) - 127.0).to(tl.bfloat16)
-    scale_bf16_6 = tl.math.exp2(scale_uint8_6.to(tl.float32) - 127.0).to(tl.bfloat16)
+        tile_base = kv_block_base[:, None] + nope_rope_offset[:, None]
 
-    qk = tl.zeros([BLOCK_H, BLOCK_N], dtype=tl.float32)
+        # Batch load all tiles
+        nope_uint8_0 = tl.load(tile_base + offs_tile[None, :], mask=valid_2d, other=0)
+        nope_uint8_1 = tl.load(
+            tile_base + TILE_SIZE + offs_tile[None, :], mask=valid_2d, other=0
+        )
+        nope_uint8_2 = tl.load(
+            tile_base + 2 * TILE_SIZE + offs_tile[None, :], mask=valid_2d, other=0
+        )
+        nope_uint8_3 = tl.load(
+            tile_base + 3 * TILE_SIZE + offs_tile[None, :], mask=valid_2d, other=0
+        )
+        nope_uint8_4 = tl.load(
+            tile_base + 4 * TILE_SIZE + offs_tile[None, :], mask=valid_2d, other=0
+        )
+        nope_uint8_5 = tl.load(
+            tile_base + 5 * TILE_SIZE + offs_tile[None, :], mask=valid_2d, other=0
+        )
+        nope_uint8_6 = tl.load(
+            tile_base + 6 * TILE_SIZE + offs_tile[None, :], mask=valid_2d, other=0
+        )
+        rope_ptrs = tile_base + D_NOPE + offs_tile[None, :] * 2
+        rope_lo = tl.load(rope_ptrs, mask=valid_2d, other=0).to(tl.uint16)
+        rope_hi = tl.load(rope_ptrs + 1, mask=valid_2d, other=0).to(tl.uint16)
 
-    nope_fp8_0 = nope_uint8_0.to(_KV_FP8_TY, bitcast=True)
-    kv_0 = (nope_fp8_0.to(tl.bfloat16) * scale_bf16_0[:, None]).to(tl.bfloat16)
-    kv_0 = tl.where(valid_2d, kv_0, 0.0)
-    qk += tl.dot(q_0, tl.trans(kv_0)).to(tl.float32)
+        scale_bf16_0 = tl.math.exp2(scale_uint8_0.to(tl.float32) - 127.0).to(tl.bfloat16)
+        scale_bf16_1 = tl.math.exp2(scale_uint8_1.to(tl.float32) - 127.0).to(tl.bfloat16)
+        scale_bf16_2 = tl.math.exp2(scale_uint8_2.to(tl.float32) - 127.0).to(tl.bfloat16)
+        scale_bf16_3 = tl.math.exp2(scale_uint8_3.to(tl.float32) - 127.0).to(tl.bfloat16)
+        scale_bf16_4 = tl.math.exp2(scale_uint8_4.to(tl.float32) - 127.0).to(tl.bfloat16)
+        scale_bf16_5 = tl.math.exp2(scale_uint8_5.to(tl.float32) - 127.0).to(tl.bfloat16)
+        scale_bf16_6 = tl.math.exp2(scale_uint8_6.to(tl.float32) - 127.0).to(tl.bfloat16)
 
-    nope_fp8_1 = nope_uint8_1.to(_KV_FP8_TY, bitcast=True)
-    kv_1 = (nope_fp8_1.to(tl.bfloat16) * scale_bf16_1[:, None]).to(tl.bfloat16)
-    kv_1 = tl.where(valid_2d, kv_1, 0.0)
-    qk += tl.dot(q_1, tl.trans(kv_1)).to(tl.float32)
+        qk = tl.zeros([BLOCK_H, BLOCK_N], dtype=tl.float32)
 
-    nope_fp8_2 = nope_uint8_2.to(_KV_FP8_TY, bitcast=True)
-    kv_2 = (nope_fp8_2.to(tl.bfloat16) * scale_bf16_2[:, None]).to(tl.bfloat16)
-    kv_2 = tl.where(valid_2d, kv_2, 0.0)
-    qk += tl.dot(q_2, tl.trans(kv_2)).to(tl.float32)
+        nope_fp8_0 = nope_uint8_0.to(_KV_FP8_TY, bitcast=True)
+        kv_0 = (nope_fp8_0.to(tl.bfloat16) * scale_bf16_0[:, None]).to(tl.bfloat16)
+        kv_0 = tl.where(valid_2d, kv_0, 0.0)
+        qk += tl.dot(q_0, tl.trans(kv_0)).to(tl.float32)
 
-    nope_fp8_3 = nope_uint8_3.to(_KV_FP8_TY, bitcast=True)
-    kv_3 = (nope_fp8_3.to(tl.bfloat16) * scale_bf16_3[:, None]).to(tl.bfloat16)
-    kv_3 = tl.where(valid_2d, kv_3, 0.0)
-    qk += tl.dot(q_3, tl.trans(kv_3)).to(tl.float32)
+        nope_fp8_1 = nope_uint8_1.to(_KV_FP8_TY, bitcast=True)
+        kv_1 = (nope_fp8_1.to(tl.bfloat16) * scale_bf16_1[:, None]).to(tl.bfloat16)
+        kv_1 = tl.where(valid_2d, kv_1, 0.0)
+        qk += tl.dot(q_1, tl.trans(kv_1)).to(tl.float32)
 
-    nope_fp8_4 = nope_uint8_4.to(_KV_FP8_TY, bitcast=True)
-    kv_4 = (nope_fp8_4.to(tl.bfloat16) * scale_bf16_4[:, None]).to(tl.bfloat16)
-    kv_4 = tl.where(valid_2d, kv_4, 0.0)
-    qk += tl.dot(q_4, tl.trans(kv_4)).to(tl.float32)
+        nope_fp8_2 = nope_uint8_2.to(_KV_FP8_TY, bitcast=True)
+        kv_2 = (nope_fp8_2.to(tl.bfloat16) * scale_bf16_2[:, None]).to(tl.bfloat16)
+        kv_2 = tl.where(valid_2d, kv_2, 0.0)
+        qk += tl.dot(q_2, tl.trans(kv_2)).to(tl.float32)
 
-    nope_fp8_5 = nope_uint8_5.to(_KV_FP8_TY, bitcast=True)
-    kv_5 = (nope_fp8_5.to(tl.bfloat16) * scale_bf16_5[:, None]).to(tl.bfloat16)
-    kv_5 = tl.where(valid_2d, kv_5, 0.0)
-    qk += tl.dot(q_5, tl.trans(kv_5)).to(tl.float32)
+        nope_fp8_3 = nope_uint8_3.to(_KV_FP8_TY, bitcast=True)
+        kv_3 = (nope_fp8_3.to(tl.bfloat16) * scale_bf16_3[:, None]).to(tl.bfloat16)
+        kv_3 = tl.where(valid_2d, kv_3, 0.0)
+        qk += tl.dot(q_3, tl.trans(kv_3)).to(tl.float32)
 
-    nope_fp8_6 = nope_uint8_6.to(_KV_FP8_TY, bitcast=True)
-    kv_6 = (nope_fp8_6.to(tl.bfloat16) * scale_bf16_6[:, None]).to(tl.bfloat16)
-    kv_6 = tl.where(valid_2d, kv_6, 0.0)
-    qk += tl.dot(q_6, tl.trans(kv_6)).to(tl.float32)
+        nope_fp8_4 = nope_uint8_4.to(_KV_FP8_TY, bitcast=True)
+        kv_4 = (nope_fp8_4.to(tl.bfloat16) * scale_bf16_4[:, None]).to(tl.bfloat16)
+        kv_4 = tl.where(valid_2d, kv_4, 0.0)
+        qk += tl.dot(q_4, tl.trans(kv_4)).to(tl.float32)
 
-    kv_7 = (rope_lo | (rope_hi << 8)).to(tl.bfloat16, bitcast=True)
-    kv_7 = tl.where(valid_2d, kv_7, 0.0)
-    qk += tl.dot(q_7, tl.trans(kv_7)).to(tl.float32)
+        nope_fp8_5 = nope_uint8_5.to(_KV_FP8_TY, bitcast=True)
+        kv_5 = (nope_fp8_5.to(tl.bfloat16) * scale_bf16_5[:, None]).to(tl.bfloat16)
+        kv_5 = tl.where(valid_2d, kv_5, 0.0)
+        qk += tl.dot(q_5, tl.trans(kv_5)).to(tl.float32)
+
+        nope_fp8_6 = nope_uint8_6.to(_KV_FP8_TY, bitcast=True)
+        kv_6 = (nope_fp8_6.to(tl.bfloat16) * scale_bf16_6[:, None]).to(tl.bfloat16)
+        kv_6 = tl.where(valid_2d, kv_6, 0.0)
+        qk += tl.dot(q_6, tl.trans(kv_6)).to(tl.float32)
+
+        kv_7 = (rope_lo | (rope_hi << 8)).to(tl.bfloat16, bitcast=True)
+        kv_7 = tl.where(valid_2d, kv_7, 0.0)
+        qk += tl.dot(q_7, tl.trans(kv_7)).to(tl.float32)
 
     qk = qk * sm_scale
     qk = tl.where(valid[None, :], qk, NEG_INF)
@@ -632,8 +744,15 @@ def fused_gather_attn_decode_dsv4(
     disable_buffer_ops = kv_cache_size > BUFFER_OPS_DISABLE_THRESHOLD
 
     # Use Split-K for large topk
-    if topk >= SPLITK_TOPK_THRESHOLD:
-        split_k = _select_split_k(topk, h_q, total_tokens)
+    small_head_split = (
+        SINGLE_SCOPE_SPLITK and h_q <= 16 and total_tokens <= 32 and topk >= 128
+    )
+    if topk >= SPLITK_TOPK_THRESHOLD or small_head_split:
+        split_k = (
+            4
+            if small_head_split and topk < SPLITK_TOPK_THRESHOLD
+            else _select_split_k(topk, h_q, total_tokens)
+        )
         topk_per_split = (topk + split_k - 1) // split_k
 
         partial_output = torch.empty(
@@ -1263,8 +1382,10 @@ def _fused_gather_attn_dsv4_dual_scope_kernel(
         triton.Config({"BLOCK_H": 16, "BLOCK_N": 64}, num_warps=8, num_stages=1),
         triton.Config({"BLOCK_H": 16, "BLOCK_N": 128}, num_warps=8, num_stages=1),
         triton.Config({"BLOCK_H": 16, "BLOCK_N": 32}, num_warps=8, num_stages=1),
-    ],
+    ]
+    + _SPLITK_EXTRA_CONFIGS,
     key=["total_tokens_bucket", "h_q", "topk_per_split"],
+    prune_configs_by={"early_config_prune": _prune_splitk_configs},
 )
 @triton.jit
 def _fused_gather_attn_dsv4_dual_scope_splitk_kernel(
@@ -1309,6 +1430,7 @@ def _fused_gather_attn_dsv4_dual_scope_splitk_kernel(
     HAS_TOPK_LENGTH_EXTRA: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    LEAN_SPLIT: tl.constexpr = False,
 ):
     """
     Split-K fused gather+dequant+attention kernel for DSV4 with dual scope.
@@ -1475,6 +1597,7 @@ def _fused_gather_attn_dsv4_dual_scope_splitk_kernel(
                     LOG2E,
                     BLOCK_H,
                     BLOCK_N,
+                    LEAN=LEAN_SPLIT,
                 )
             )
 
@@ -1555,6 +1678,7 @@ def _fused_gather_attn_dsv4_dual_scope_splitk_kernel(
                     LOG2E,
                     BLOCK_H,
                     BLOCK_N,
+                    LEAN=LEAN_SPLIT,
                 )
             )
 
@@ -1779,6 +1903,7 @@ def fused_gather_attn_decode_dsv4_dual_scope(
                 partial_lse.stride(2),
                 HAS_TOPK_LENGTH_MAIN=topk_length_main is not None,
                 HAS_TOPK_LENGTH_EXTRA=topk_length_extra is not None,
+                LEAN_SPLIT=PREFILL_LEAN and total_tokens > 256,
             )
 
         if disable_buffer_ops:
@@ -2746,6 +2871,187 @@ def _select_split_k(topk: int, h_q: int, total_tokens: int = 64) -> int:
 # ============================================================================
 
 
+@triton.jit
+def _combine_splitk_kernel_par(
+    PartialOutput,
+    PartialLSE,
+    AttnSink,
+    Output,
+    LSE,
+    FreqsReal,
+    Positions,
+    h_q,
+    stride_po_s,
+    stride_po_t,
+    stride_po_h,
+    stride_po_d,
+    stride_plse_s,
+    stride_plse_t,
+    stride_plse_h,
+    stride_o_t,
+    stride_o_h,
+    stride_o_d,
+    stride_lse_t,
+    stride_lse_h,
+    stride_fr_pos,
+    stride_fr_d,
+    SPLIT_K: tl.constexpr,
+    HAS_ATTN_SINK: tl.constexpr,
+    INV_ROPE: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    """Split-K combine over (token, head block, d block) programs, with the split order and arithmetic of the
+    2/4/8-way kernels. INV_ROPE applies apply_rotary_emb_flat_kernel's inverse RoPE to the bf16 output's last 64
+    dims (BLOCK_D 64, so the last d block is the rope part)."""
+    LOG2E: tl.constexpr = 1.4426950408889634
+    NEG_INF = float("-inf")
+    POS_INF = float("+inf")
+    INF_THRESHOLD = 1e30
+
+    pid_t = tl.program_id(0).to(tl.int64)
+    pid_h = tl.program_id(1)
+    pid_d = tl.program_id(2)
+    offs_h = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
+    mask_h = offs_h < h_q
+    stride_plse_s_64 = tl.cast(stride_plse_s, tl.int64)
+    stride_po_s_64 = tl.cast(stride_po_s, tl.int64)
+    lse_base = PartialLSE + pid_t * stride_plse_t + offs_h * stride_plse_h
+
+    max_lse = tl.full([BLOCK_H], NEG_INF, dtype=tl.float32)
+    for s in tl.static_range(SPLIT_K):
+        lse_s = tl.load(lse_base + s * stride_plse_s_64, mask=mask_h, other=POS_INF)
+        max_lse = tl.maximum(max_lse, tl.where(tl.abs(lse_s) < INF_THRESHOLD, lse_s, NEG_INF))
+
+    sum_exp = tl.zeros([BLOCK_H], dtype=tl.float32)
+    for s in tl.static_range(SPLIT_K):
+        lse_s = tl.load(lse_base + s * stride_plse_s_64, mask=mask_h, other=POS_INF)
+        valid_s = tl.abs(lse_s) < INF_THRESHOLD
+        exp_s = tl.where(
+            valid_s, tl.math.exp2((tl.where(valid_s, lse_s, NEG_INF) - max_lse) * LOG2E), 0.0
+        )
+        if s == 0:
+            sum_exp = exp_s
+        else:
+            sum_exp = sum_exp + exp_s
+    all_invalid = sum_exp == 0.0
+    sum_exp_safe = tl.where(all_invalid, 1.0, sum_exp)
+    combined_lse = max_lse + tl.math.log2(sum_exp_safe) / LOG2E
+    combined_lse = tl.where(all_invalid, POS_INF, combined_lse)
+
+    if HAS_ATTN_SINK:
+        attn_sink_vals = tl.load(AttnSink + offs_h, mask=mask_h, other=0.0)
+        is_lonely = combined_lse > INF_THRESHOLD
+        lse_safe_for_sink = tl.where(is_lonely, 0.0, combined_lse)
+        diff = attn_sink_vals - lse_safe_for_sink
+        diff_clamped = tl.minimum(tl.maximum(diff, -100.0), 100.0)
+        exp_diff = tl.math.exp2(diff_clamped * LOG2E)
+        exp_diff = tl.where(is_lonely, 0.0, exp_diff)
+        denominator = 1.0 + exp_diff
+        sink_scale = 1.0 / denominator
+        sink_scale = tl.where(is_lonely, 1.0, sink_scale)
+
+    offs_d = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
+    mask_hd = mask_h[:, None] & (offs_d < 512)[None, :]
+    po_base = (
+        PartialOutput
+        + pid_t * stride_po_t
+        + offs_h[:, None] * stride_po_h
+        + offs_d[None, :] * stride_po_d
+    )
+    combined = tl.zeros([BLOCK_H, BLOCK_D], dtype=tl.float32)
+    for s in tl.static_range(SPLIT_K):
+        lse_s = tl.load(lse_base + s * stride_plse_s_64, mask=mask_h, other=POS_INF)
+        valid_s = tl.abs(lse_s) < INF_THRESHOLD
+        exp_s = tl.where(
+            valid_s, tl.math.exp2((tl.where(valid_s, lse_s, NEG_INF) - max_lse) * LOG2E), 0.0
+        )
+        if HAS_ATTN_SINK:
+            scale_s = (exp_s / sum_exp_safe) * sink_scale
+        else:
+            scale_s = exp_s / sum_exp_safe
+        scale_s = tl.where(all_invalid, 0.0, scale_s)
+        po_s = tl.load(po_base + s * stride_po_s_64, mask=mask_hd, other=0.0)
+        if s == 0:
+            combined = scale_s[:, None] * po_s
+        else:
+            combined = combined + scale_s[:, None] * po_s
+
+    o_ptrs = Output + pid_t * stride_o_t + offs_h[:, None] * stride_o_h + offs_d[None, :] * stride_o_d
+    if INV_ROPE:
+        if pid_d * BLOCK_D >= 448:
+            x = combined.to(tl.bfloat16).to(tl.float32)
+            pos = tl.load(Positions + pid_t)
+            d = tl.arange(0, BLOCK_D)
+            cos_idx = (d // 2) * 2
+            cos = tl.load(FreqsReal + pos * stride_fr_pos + cos_idx * stride_fr_d)
+            sin = tl.load(FreqsReal + pos * stride_fr_pos + (cos_idx + 1) * stride_fr_d)
+            x_sin = x * sin[None, :]
+            even = (d % 2 == 0)[None, :]
+            x_neg = tl.where(even, -x_sin, x_sin)
+            x_neg = tl.reshape(x_neg, (BLOCK_H, BLOCK_D // 2, 2))
+            x_neg = tl.flip(x_neg, 2)
+            x_rot = tl.reshape(x_neg, (BLOCK_H, BLOCK_D))
+            combined = x * cos[None, :] + x_rot
+    tl.store(o_ptrs, combined.to(tl.bfloat16), mask=mask_hd)
+    if pid_d == 0:
+        tl.store(
+            LSE + pid_t * stride_lse_t + offs_h * stride_lse_h, combined_lse, mask=mask_h
+        )
+
+
+def _launch_par_combine(
+    partial_output: torch.Tensor,
+    partial_lse: torch.Tensor,
+    attn_sink: Optional[torch.Tensor],
+    output: torch.Tensor,
+    lse: torch.Tensor,
+    split_k: int,
+    h_q: int,
+    inv_rope: Optional[Tuple[torch.Tensor, torch.Tensor]],
+) -> None:
+    total_tokens = output.shape[0]
+    if inv_rope is not None:
+        freqs_real, positions = inv_rope
+        assert freqs_real.shape[-1] == DSV4_D_ROPE and freqs_real.dtype == torch.float32
+        positions = positions.view(-1)
+        fr_strides = (freqs_real.stride(0), freqs_real.stride(1))
+    else:
+        freqs_real, positions, fr_strides = lse, lse, (0, 0)
+    attn_sink_tensor = attn_sink if attn_sink is not None else lse[0, :]
+    grid = (total_tokens, triton.cdiv(h_q, PAR_COMBINE_BLOCK_H), DSV4_D_V // 64)
+    _combine_splitk_kernel_par[grid](
+        partial_output,
+        partial_lse,
+        attn_sink_tensor,
+        output,
+        lse,
+        freqs_real,
+        positions,
+        h_q,
+        *partial_output.stride(),
+        *partial_lse.stride(),
+        *output.stride(),
+        *lse.stride(),
+        *fr_strides,
+        SPLIT_K=split_k,
+        HAS_ATTN_SINK=attn_sink is not None,
+        INV_ROPE=inv_rope is not None,
+        BLOCK_H=PAR_COMBINE_BLOCK_H,
+        BLOCK_D=64,
+        num_warps=PAR_COMBINE_WARPS,
+        num_stages=1,
+    )
+
+
+def _apply_inv_rope_standalone(
+    out: torch.Tensor, inv_rope: Tuple[torch.Tensor, torch.Tensor]
+) -> None:
+    from sglang.srt.layers.attention.hip_flash_mla import _apply_inverse_rope
+
+    _apply_inverse_rope(out, inv_rope)
+
+
 class SplitKBufferPool:
     """
     Pre-allocated buffer pool for split-K intermediate tensors.
@@ -2801,6 +3107,7 @@ def fused_gather_attn_decode_dsv4_dual_scope_low_overhead(
     topk_length_extra: Optional[torch.Tensor] = None,
     attn_sink: Optional[torch.Tensor] = None,
     s_q: int = 1,
+    inv_rope: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Low-overhead version of fused_gather_attn_decode_dsv4_dual_scope.
@@ -2842,7 +3149,7 @@ def fused_gather_attn_decode_dsv4_dual_scope_low_overhead(
 
     if split_k == 0:
         # Fall back to non-splitk version
-        return fused_gather_attn_decode_dsv4_dual_scope(
+        out = fused_gather_attn_decode_dsv4_dual_scope(
             q,
             kv_cache_main,
             indices_main,
@@ -2857,6 +3164,9 @@ def fused_gather_attn_decode_dsv4_dual_scope_low_overhead(
             s_q,
             force_no_splitk=True,
         )
+        if inv_rope is not None:
+            _apply_inv_rope_standalone(out[0], inv_rope)
+        return out
 
     topk_per_split = (total_topk + split_k - 1) // split_k
 
@@ -2987,6 +3297,12 @@ def fused_gather_attn_decode_dsv4_dual_scope_low_overhead(
             HAS_TOPK_LENGTH_MAIN=topk_length_main is not None,
             HAS_TOPK_LENGTH_EXTRA=topk_length_extra is not None,
         )
+
+    if PAR_COMBINE or inv_rope is not None or split_k not in (2, 4, 8):
+        _launch_par_combine(
+            partial_output, partial_lse, attn_sink, output, lse, split_k, h_q, inv_rope
+        )
+        return output, lse
 
     # Run combine kernel
     if split_k == 8:

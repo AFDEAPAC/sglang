@@ -57,6 +57,7 @@ import copy
 import dataclasses
 import hashlib
 import logging
+import os
 import re
 import sys
 from array import array
@@ -171,6 +172,90 @@ _MM_WIDE_PAD_TAG = b"sglang-mm-wide-pad-v1"
 _MM_WIDE_PAD_MASK = (1 << 62) - 1
 
 logger = logging.getLogger(__name__)
+
+# A CPU-side safety net for long generations. The setting is resolved for each
+# Req (and can be overridden with custom_params.lazy_ng20), so ON/OFF requests
+# can share one server boot. The normal path never enters the evidence scan.
+_LAZY_NG20_MIN_TOKENS = 2048
+_LAZY_NG20_SIZE = 20
+_LAZY_NG20_WINDOW = 90
+_LAZY_NG20_EVIDENCE_TOKENS = 8192
+_LAZY_NG20_DISTINCT4_MAX = 0.60
+_LAZY_NG20_TAIL_REPEATS_MIN = 4
+_LAZY_NG20_TAIL_PERIOD_CHARS = 400
+
+
+def _lazy_bool_setting(value, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() not in {"", "0", "false", "no", "off"}
+
+
+def _lazy_ng20_enabled_for_request(sampling_params) -> bool:
+    custom_params = getattr(sampling_params, "custom_params", None)
+    if isinstance(custom_params, dict) and "lazy_ng20" in custom_params:
+        return _lazy_bool_setting(custom_params["lazy_ng20"])
+    return _lazy_bool_setting(os.environ.get("SGLANG_LAZY_NG20"), default=False)
+
+
+# The ng20 mask only arms after 2048 tokens and corroborating loop evidence,
+# because a repeated 20-gram inside a 90-token window is common in healthy
+# reasoning, DSML tool-call scaffolding, and markdown tables.
+#
+# A strictly periodic tail is a different signal: the last K copies of one short
+# unit are byte-identical back to back. Mask the next token that would extend
+# the period rather than truncating the response.
+def _lazy_tail_enabled_for_request(sampling_params) -> bool:
+    custom_params = getattr(sampling_params, "custom_params", None)
+    if isinstance(custom_params, dict) and "lazy_tail_loop" in custom_params:
+        return _lazy_bool_setting(custom_params["lazy_tail_loop"])
+    return _lazy_bool_setting(os.environ.get("SGLANG_LAZY_TAIL_LOOP"), default=False)
+
+
+# A 32-token floor keeps the previously observed token-56 short-loop catch, but
+# prevents a four-copy coincidence in the opening few tokens from taking action.
+_LAZY_TAIL_MIN_TOKENS = 32
+# 32 tokens covers a repeating markdown table row or a "1, 2, 3, ..." list cycle;
+# below that the guard misses loops whose unit is a whole line.
+_LAZY_TAIL_MAX_PERIOD = 32
+_LAZY_TAIL_MIN_REPEATS = 4
+# Four copies is only enough evidence when the unit looks like prose. Markdown
+# table rules and short deliberate repetition are periodic too, so a unit that
+# is short or has no alphanumeric character needs a longer run before it counts.
+_LAZY_TAIL_MIN_UNIT_CHARS = 6
+_LAZY_TAIL_LONG_SPAN = 64
+
+# The ali scorer collapses whitespace runs before measuring tail periodicity, so
+# a loop whose last copy ends "\n\n" where the others ended "\n" still counts.
+# Mirror that by treating any two whitespace-only tokens as equal. Built once per
+# process rather than decoding on demand, so a stream of unseen token ids cannot
+# turn every comparison into a detokenizer call.
+_WS_ONLY_TOKEN_IDS = None
+
+# Cheap build-wide test so an unguarded build skips the per-step refresh.
+_LAZY_GUARDS_ENABLED = _lazy_bool_setting(
+    os.environ.get("SGLANG_LAZY_NG20"), default=False
+) or _lazy_bool_setting(os.environ.get("SGLANG_LAZY_TAIL_LOOP"), default=False)
+
+
+def _ws_only_token_ids(tokenizer):
+    global _WS_ONLY_TOKEN_IDS
+    if _WS_ONLY_TOKEN_IDS is None:
+        found = set()
+        try:
+            for tid in range(len(tokenizer)):
+                piece = tokenizer.convert_ids_to_tokens(tid)
+                if piece is None:
+                    continue
+                text = tokenizer.convert_tokens_to_string([piece])
+                if text and not text.strip():
+                    found.add(tid)
+        except Exception:
+            logger.warning("lazy tail loop: could not scan vocab for whitespace tokens")
+        _WS_ONLY_TOKEN_IDS = frozenset(found)
+    return _WS_ONLY_TOKEN_IDS
 
 _is_hip = is_hip()
 
@@ -1161,6 +1246,10 @@ class Req(ReqDllmMixin):
 
         # Require reasoning for the request
         self.require_reasoning = require_reasoning
+        self.lazy_ng20_enabled = _lazy_ng20_enabled_for_request(sampling_params)
+        self.lazy_ng20_banned_token_ids = ()
+        self.lazy_tail_enabled = _lazy_tail_enabled_for_request(sampling_params)
+        self.lazy_tail_banned_token_ids = ()
 
         # State indicating whether the reasoning phase has finished (only meaningful when require_reasoning is True)
         self._is_reasoning_over = False
@@ -2026,6 +2115,159 @@ class Req(ReqDllmMixin):
         if self.finished_len is not None and self.finished_len > max_new_tokens:
             self.finished_reason = FINISH_LENGTH(length=max_new_tokens)
             self.finished_len = max_new_tokens
+
+    @staticmethod
+    def _lazy_ng20_tail_repeats(text: str) -> int:
+        normalized = " ".join(text.split())
+        if len(normalized) < 24:
+            return 0
+        best = 0
+        limit = min(_LAZY_NG20_TAIL_PERIOD_CHARS, len(normalized) // 2)
+        for period in range(4, limit + 1):
+            unit = normalized[-period:]
+            copies = 1
+            pos = len(normalized) - period
+            while pos - period >= 0 and normalized[pos - period : pos] == unit:
+                copies += 1
+                pos -= period
+            best = max(best, copies)
+        return best
+
+    @staticmethod
+    def _lazy_ng20_distinct4(text: str) -> float:
+        words = " ".join(text.split()).casefold().split(" ")
+        if len(words) < 5:
+            return 1.0
+        grams = [tuple(words[idx : idx + 4]) for idx in range(len(words) - 3)]
+        return len(set(grams)) / len(grams)
+
+    def _update_lazy_ng20_mask(self) -> bool:
+        """Prepare an evidence-gated token mask for the next decode step.
+
+        A token is masked only after reasoning has closed and the generated tail
+        is independently degenerate. This never terminates or trims a request.
+        """
+        previous = self.lazy_ng20_banned_token_ids
+        banned = ()
+        ids = self.output_ids
+
+        eligible = (
+            self.lazy_ng20_enabled
+            and not self.finished()
+            and len(ids) > _LAZY_NG20_MIN_TOKENS
+            and (not self.require_reasoning or self._is_reasoning_over)
+            and self.tokenizer is not None
+        )
+        if eligible:
+            prefix = ids[-(_LAZY_NG20_SIZE - 1) :]
+            search_start = max(0, len(ids) - _LAZY_NG20_WINDOW)
+            candidates = {
+                ids[idx + _LAZY_NG20_SIZE - 1]
+                for idx in range(search_start, len(ids) - _LAZY_NG20_SIZE + 1)
+                if ids[idx : idx + _LAZY_NG20_SIZE - 1] == prefix
+            }
+            if candidates:
+                evidence_ids = ids[-_LAZY_NG20_EVIDENCE_TOKENS:]
+                text = self.tokenizer.decode(evidence_ids)
+                tail_repeats = self._lazy_ng20_tail_repeats(text)
+                distinct4 = self._lazy_ng20_distinct4(text)
+                if (
+                    tail_repeats >= _LAZY_NG20_TAIL_REPEATS_MIN
+                    or distinct4 < _LAZY_NG20_DISTINCT4_MAX
+                ):
+                    banned = tuple(sorted(int(token) for token in candidates))
+                    logger.info(
+                        "Request %s armed lazy ng20 mask at output token %d: "
+                        "banned=%s tail_repeats=%d distinct4=%.4f",
+                        self.rid,
+                        len(ids),
+                        banned,
+                        tail_repeats,
+                        distinct4,
+                    )
+
+        self.lazy_ng20_banned_token_ids = banned
+        return banned != previous
+
+    def _update_lazy_tail_mask(self) -> bool:
+        """Mask the next token that would extend a strictly periodic tail."""
+        previous = self.lazy_tail_banned_token_ids
+        banned = ()
+        ids = self.output_ids
+        n = len(ids)
+        eligible = (
+            self.lazy_tail_enabled
+            and not self.finished()
+            and n >= _LAZY_TAIL_MIN_TOKENS
+            and (not self.require_reasoning or self._is_reasoning_over)
+            and self.tokenizer is not None
+        )
+        if not eligible:
+            self.lazy_tail_banned_token_ids = banned
+            return banned != previous
+
+        max_period = min(_LAZY_TAIL_MAX_PERIOD, n // _LAZY_TAIL_MIN_REPEATS)
+        ws = _ws_only_token_ids(self.tokenizer)
+
+        # A period only works if the last token recurs that far back, so find
+        # the candidate distances with one containment test rather than trying
+        # every period. Most steps end here, which is what keeps this affordable
+        # at every decode step.
+        last = ids[n - 1]
+        window = ids[n - 1 - max_period : n - 1]
+        if last in ws:
+            periods = [max_period - i for i, t in enumerate(window) if t in ws]
+        elif last in window:
+            periods = [max_period - i for i, t in enumerate(window) if t == last]
+        else:
+            periods = []
+
+        for period in periods:
+            # Count back-to-back copies, but only as far as any rule below can
+            # care about, so a 2000-token loop still costs a bounded scan.
+            cap = max(_LAZY_TAIL_MIN_REPEATS, -(-_LAZY_TAIL_LONG_SPAN // period))
+            copies = 1
+            while copies < cap and (copies + 1) * period <= n:
+                base = n - copies * period
+                prev, cur = ids[base - period : base], ids[base : base + period]
+                if prev != cur and not all(
+                    a == b or (a in ws and b in ws) for a, b in zip(prev, cur)
+                ):
+                    break
+                copies += 1
+            if copies < _LAZY_TAIL_MIN_REPEATS:
+                continue
+
+            unit = self.tokenizer.decode(ids[n - period :])
+            looks_like_prose = len(
+                " ".join(unit.split())
+            ) >= _LAZY_TAIL_MIN_UNIT_CHARS and any(ch.isalnum() for ch in unit)
+            if not looks_like_prose and copies * period < _LAZY_TAIL_LONG_SPAN:
+                continue
+
+            expected = ids[n - period]
+            # Whitespace tokens are equivalent to the detector and ali scorer,
+            # so mask every whitespace-only spelling when whitespace is next.
+            if expected in ws:
+                banned = tuple(sorted(ws))
+                banned_desc = "whitespace-only (%d ids)" % len(banned)
+            else:
+                banned = (int(expected),)
+                banned_desc = banned
+            if banned != previous:
+                logger.info(
+                    "Request %s armed lazy tail mask at output token %d: "
+                    "%d-token unit repeated %d times, banned=%s",
+                    self.rid,
+                    n,
+                    period,
+                    copies,
+                    banned_desc,
+                )
+            break
+
+        self.lazy_tail_banned_token_ids = banned
+        return banned != previous
 
     def update_finish_state(self, new_accepted_len: int = 1):
         if self.finished():
@@ -3758,6 +4000,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def prepare_for_decode(self):
         self.forward_mode = ForwardMode.DECODE
+        # The guards update their per-request masks in the result processor,
+        # which in overlap mode is handed a temporary batch with no
+        # sampling_info. Refresh here instead: this batch owns the
+        # sampling_info that is about to be used.
+        if _LAZY_GUARDS_ENABLED and self.sampling_info is not None:
+            self.sampling_info.refresh_lazy_ng20_mask(self.reqs)
         self.mamba_track_seqlens_cpu = None
         self.mamba_prefill_track_mask_cpu = None
         # Decode embeds the last output token via embed_tokens; clear the stale

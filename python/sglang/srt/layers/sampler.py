@@ -142,6 +142,8 @@ class Sampler(nn.Module):
         """Apply custom logit processors and sanitize non-finite logits."""
         if sampling_info.has_custom_logit_processor:
             apply_custom_logit_processor(logits, sampling_info)
+        if getattr(sampling_info, "lazy_ng20_token_ids", None) is not None:
+            sampling_info.apply_lazy_ng20_mask(logits)
         sanitize_nan_logits(logits, "sampler: next_token_logits")
         return logits
 

@@ -79,7 +79,13 @@ _is_hip = is_hip()
 def _cuda_kernels(t: torch.Tensor) -> bool:
     """True where the Triton kernels apply (CUDA and gfx950); other ROCm GPUs and CPU
     take the torch paths."""
-    return t.is_cuda and (is_cuda() or is_gfx95_supported())
+    return t.is_cuda and (
+        is_cuda()
+        or is_gfx95_supported()
+        # gfx942 runs the same Triton kernels; the exclusion reads as
+        # untested rather than unsupported, as it did for HC mix-stats.
+        or (_is_hip and os.environ.get("SGLANG_GFX942_ENGRAM_TRITON") == "1")
+    )
 
 
 def _is_prime(n: int) -> bool:

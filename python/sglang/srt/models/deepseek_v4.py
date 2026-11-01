@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import os
 import functools
 import logging
 import time
@@ -375,6 +376,19 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_gfx95_supported = is_gfx95_supported()
 _is_gfx942_supported = is_gfx942_supported()
 _is_gfx1250_supported = is_gfx1250_supported()
+# gfx942 opt-ins: V4.1's Triton wo_a decode / verify kernels and strided prefill bmm, and the side-stream
+# prepare of the compress ratio 1/2 layers at decode
+_GFX942_WO_A_TRITON = _is_gfx942_supported and get_bool_env_var("SGLANG_GFX942_WO_A_TRITON", "false")
+_GFX942_WO_A_PREFILL_BMM = _is_gfx942_supported and get_bool_env_var(
+    "SGLANG_GFX942_WO_A_PREFILL_BMM", "false"
+)
+# the split-K small-batch wo_a measured slower than hipBLASLt at T 2-8 on gfx942: verify opts in on its own
+_GFX942_WO_A_TRITON_VERIFY = _is_gfx942_supported and get_bool_env_var(
+    "SGLANG_GFX942_WO_A_TRITON_VERIFY", "false"
+)
+_GFX942_LOW_RATIO_MULTI_STREAM = _is_gfx942_supported and get_bool_env_var(
+    "SGLANG_GFX942_LOW_RATIO_MULTI_STREAM", "false"
+)
 
 
 if _use_aiter:
@@ -491,6 +505,35 @@ def _apply_wo_a_bf16_matmul(
     # the gfx950 routes, like the CUDA ones, are V4.1's (fast_path); DSv4 keeps the
     # aiter batched GEMM / einsum below
     hip_fast_path = fast_path and _is_hip and _is_gfx95_supported
+    gfx942_shape = (
+        (_GFX942_WO_A_TRITON or _GFX942_WO_A_TRITON_VERIFY or _GFX942_WO_A_PREFILL_BMM)
+        and fast_path
+        and o.shape[1:] == (2, 4096)
+        and wo_a.shape == (2, 1024, 4096)
+        and o.dtype == wo_a.dtype == torch.bfloat16
+        and o.stride(2) == 1
+        and o.stride(1) == 4096
+        and o.stride(0) >= 8192
+        and wo_a.is_contiguous()
+    )
+    if (
+        gfx942_shape
+        and not fuse_mxfp8_quant
+        and _hip.wo_a_split_k_allowed()
+    ):
+        if _GFX942_WO_A_TRITON and is_decode and o.shape[0] == 1 and o.is_contiguous():
+            return wo_a_bf16_gemv(o, wo_a)
+        if _GFX942_WO_A_TRITON_VERIFY and is_target_verify and 2 <= o.shape[0] <= 8:
+            return wo_a_bf16_small_batch(o, wo_a)
+    if gfx942_shape and _GFX942_WO_A_PREFILL_BMM and is_prefill and 4096 <= o.shape[0] <= 65536:
+        result = torch.empty(
+            (o.shape[0], wo_a.shape[0], wo_a.shape[1]), dtype=o.dtype, device=o.device
+        )
+        with torch.no_grad():
+            torch.bmm(
+                o.transpose(0, 1), wo_a.transpose(1, 2), out=result.transpose(0, 1)
+            )
+        return result
     hip_decode_verify = (
         hip_fast_path
         and (
@@ -1403,6 +1446,7 @@ class MQALayer(MqaAttentionBase):
                 and envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get()
             )
             or (_is_npu and envs.SGLANG_NPU_USE_MULTI_STREAM.get())
+            or (_GFX942_LOW_RATIO_MULTI_STREAM and self.is_dsv41)
         ):
             self.alt_streams = alt_streams[:3]
             self.alt_streams_indexer = alt_streams[-2:]
@@ -2608,7 +2652,11 @@ class MQALayer(MqaAttentionBase):
         )
 
         low_ratio_multi_stream = (
-            ((_is_cuda and get_platform().is_blackwell) or _is_gfx95_supported)
+            (
+                (_is_cuda and get_platform().is_blackwell)
+                or _is_gfx95_supported
+                or _GFX942_LOW_RATIO_MULTI_STREAM
+            )
             and self.compress_ratio in (1, 2)
             and self.alt_streams is not None
             and (
@@ -3042,8 +3090,23 @@ class MQALayer(MqaAttentionBase):
             )
             and not should_skip_mlp_all_reduce()
         )
+        from sglang.kernels.ops.quantization import gfx942_decode_fuse as _gfx942_fuse
+
+        if (
+            _gfx942_fuse.WOB_STRIDED_QUANT
+            and isinstance(o, torch.Tensor)
+            and o.dim() == 3
+            and o.dtype == torch.bfloat16
+            and o.stride(-1) == 1
+            and not o.is_contiguous()
+            and _gfx942_fuse.rowwise_fp8_linear_takes_prequant(self.wo_b)
+        ):
+            # quantize the strided wo_a output in place of flatten(1)'s copy and wo_b's quant
+            wo_b_input = _gfx942_fuse.strided_per_token_quant_fp8(o)
+        else:
+            wo_b_input = o.flatten(1) if isinstance(o, torch.Tensor) else o
         o, _ = self.wo_b(
-            o.flatten(1) if isinstance(o, torch.Tensor) else o,
+            wo_b_input,
             skip_all_reduce=defer_all_reduce,
         )
         if defer_all_reduce:
@@ -3475,6 +3538,21 @@ class DeepseekV4DecoderLayerBase(nn.Module):
         post: torch.Tensor,
         comb: torch.Tensor,
     ) -> torch.Tensor:
+        # P2a: on gfx942 the source image's hc_post falls past its gfx950-only
+        # split-H path to aiter's mhc_post. The same call exists in
+        # kernels/ops/layernorm/mhc.py but is gated on is_gfx95_supported(),
+        # so on gfx942 it never runs.
+        if _is_hip and not get_bool_env_var("SGLANG_DSV41_HIP_TORCH_MHC", "false"):
+            try:
+                from aiter.ops.mhc import mhc_post as _aiter_mhc_post
+
+                result = torch.empty_like(residual)
+                _aiter_mhc_post(result, x, residual, post, comb)
+                return result
+            except Exception as err:  # noqa: BLE001 - degrade, do not kill the server
+                logger.warning(
+                    "aiter mHC post unavailable, falling back to mhc.post: %s", err
+                )
         return mhc.post(self.hc_cfg, x, residual, post, comb)
 
     @functools.cached_property
@@ -3750,6 +3828,7 @@ class DeepseekV4Model(nn.Module):
                 and (
                     envs.SGLANG_ROCM_USE_MULTI_STREAM.get()
                     or envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get()
+                    or _GFX942_LOW_RATIO_MULTI_STREAM
                 )
             )
             or (_is_npu and envs.SGLANG_NPU_USE_MULTI_STREAM.get())
@@ -3774,8 +3853,10 @@ class DeepseekV4Model(nn.Module):
         # reusing its residual.
         self.hc_stats_stream = (
             device_module.Stream()
-            if _is_cuda
-            and (get_platform().is_blackwell or get_platform().is_sm90)
+            if (
+                (_is_cuda and (get_platform().is_blackwell or get_platform().is_sm90))
+                or (_is_hip and get_bool_env_var("SGLANG_GFX942_HC_STATS_STREAM", "false"))
+            )
             and envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get()
             and config.hc_pre_from_prev_sublayer
             else None
@@ -5482,8 +5563,10 @@ class DeepseekV4ForCausalLM(nn.Module):
                                 and (
                                     name.endswith(".wq_a.weight")
                                     or name.endswith(".wq_a.weight_scale_inv")
+                                    or name.endswith(".wq_a.weight_scale")
                                     or name.endswith(".wkv.weight")
                                     or name.endswith(".wkv.weight_scale_inv")
+                                    or name.endswith(".wkv.weight_scale")
                                     or name.endswith(".wq_a.qweight")
                                     or name.endswith(".wkv.qweight")
                                     or name.endswith(".wq_a.qweight_type")
@@ -5527,6 +5610,16 @@ class DeepseekV4ForCausalLM(nn.Module):
                                                 f"{scale[0]}_proj", "attn_mqa"
                                             )
                                             break
+                                # Per-channel PTPC checkpoints use
+                                # ``weight_scale`` while this model stores the
+                                # same parameter as ``scale``.
+                                if (
+                                    name not in params_dict
+                                    and name.endswith(".weight_scale")
+                                    and name[: -len(".weight_scale")] + ".scale"
+                                    in params_dict
+                                ):
+                                    name = name[: -len(".weight_scale")] + ".scale"
                                 if name not in params_dict:
                                     if not name.startswith("mtp"):
                                         logger.warning(

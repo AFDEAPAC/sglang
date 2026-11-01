@@ -113,6 +113,8 @@ class SamplingBatchInfo:
 
     # Handle logit bias
     logit_bias: Optional[torch.Tensor] = None
+    # Sparse per-request token bans from the lazy loop guards; -1 pads the rows.
+    lazy_ng20_token_ids: Optional[torch.Tensor] = None
 
     # Host-side eligibility for torch_npu.npu_top_k_top_p. Keeping this off the
     # device avoids a scalar synchronization in the per-token sampling path.
@@ -440,6 +442,67 @@ class SamplingBatchInfo:
         if self.logit_bias is not None:
             logits.add_(self.logit_bias)
 
+    @staticmethod
+    def merge_sparse_token_ids(lhs, rhs, bs1: int, bs2: int, device: str):
+        if lhs is None and rhs is None:
+            return None
+        width = max(
+            0 if lhs is None else lhs.shape[1],
+            0 if rhs is None else rhs.shape[1],
+        )
+
+        def padded(value, batch_size):
+            if value is None:
+                return torch.full(
+                    (batch_size, width), -1, dtype=torch.int64, device=device
+                )
+            if value.shape[1] == width:
+                return value
+            padding = torch.full(
+                (batch_size, width - value.shape[1]),
+                -1,
+                dtype=value.dtype,
+                device=device,
+            )
+            return torch.cat([value, padding], dim=1)
+
+        return torch.cat([padded(lhs, bs1), padded(rhs, bs2)], dim=0)
+
+    def refresh_lazy_ng20_mask(self, reqs) -> None:
+        """Copy changed per-request lazy-loop bans to the device."""
+        bans = [
+            tuple(
+                sorted(
+                    set(getattr(req, "lazy_ng20_banned_token_ids", ()))
+                    | set(getattr(req, "lazy_tail_banned_token_ids", ()))
+                )
+            )
+            for req in reqs
+        ]
+        max_bans = max((len(tokens) for tokens in bans), default=0)
+        if max_bans == 0:
+            self.lazy_ng20_token_ids = None
+            return
+
+        padded = [list(tokens) + [-1] * (max_bans - len(tokens)) for tokens in bans]
+        self.lazy_ng20_token_ids = torch.tensor(
+            padded, dtype=torch.int64, device=self.device
+        )
+
+    def apply_lazy_ng20_mask(self, logits: torch.Tensor) -> None:
+        """Apply sparse bans without dynamic indexing or a host synchronization."""
+        token_ids = self.lazy_ng20_token_ids
+        if token_ids is None:
+            return
+
+        repeat = logits.shape[0] // len(self)
+        if repeat > 1:
+            token_ids = torch.repeat_interleave(token_ids, repeat, dim=0)
+        safe_ids = token_ids.clamp_min(0)
+        penalties = torch.zeros_like(token_ids, dtype=logits.dtype)
+        penalties.masked_fill_(token_ids >= 0, -float("inf"))
+        logits.scatter_add_(1, safe_ids, penalties)
+
     def apply_logits_bias(self, logits: torch.Tensor):
         self._apply_pre_grammar_logits_transforms(logits)
 
@@ -491,6 +554,8 @@ class SamplingBatchInfo:
 
         if self.logit_bias is not None:
             self.logit_bias = self.logit_bias[keep_indices_device]
+        if self.lazy_ng20_token_ids is not None:
+            self.lazy_ng20_token_ids = self.lazy_ng20_token_ids[keep_indices_device]
         if self.return_sampling_masks is not None:
             self.return_sampling_masks = [
                 self.return_sampling_masks[i] for i in keep_indices
@@ -567,6 +632,13 @@ class SamplingBatchInfo:
 
         # Merge logit bias - note this has to come before the temperatures tensor update! Otherwise will cause crashes.
         # See note below on len(self) and len(other).
+        self.lazy_ng20_token_ids = SamplingBatchInfo.merge_sparse_token_ids(
+            self.lazy_ng20_token_ids,
+            other.lazy_ng20_token_ids,
+            self_len,
+            other_len,
+            self.device,
+        )
         self.logit_bias = merge_bias_tensor(
             self.logit_bias, other.logit_bias, self_len, other_len, self.device, 0.0
         )

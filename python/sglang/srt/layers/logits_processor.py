@@ -1081,6 +1081,10 @@ class LogitsProcessor(nn.Module):
             logits = lm_head(hidden_states)
         elif should_apply_lm_head_quant_method(lm_head, quant_method):
             logits = quant_method.apply(lm_head, hidden_states, embedding_bias)
+        elif hasattr(lm_head, "weight") and (
+            gemv_logits := _gfx942_lm_head_gemv(self, hidden_states, lm_head)
+        ) is not None:
+            logits = gemv_logits
         elif hasattr(lm_head, "weight"):
             # Normal linear layer
             if out is not None and out.shape != (
@@ -1587,3 +1591,17 @@ def should_apply_lm_head_quant_method(lm_head, quant_method) -> bool:
         )
 
     return True
+
+
+def _gfx942_lm_head_gemv(processor, hidden_states, lm_head):
+    """The bf16 lm_head of a few decode rows as a Triton GEMV (gfx942 opt-in,
+    SGLANG_GFX942_LM_HEAD_GEMV_MAX_M); None where the matmul applies."""
+    from sglang.kernels.ops.gemm import gfx942_gemv
+
+    if not gfx942_gemv.LM_HEAD_GEMV_MAX_M or processor.rl_on_policy_target is not None:
+        return None
+    weight = lm_head.weight
+    if hidden_states.dtype != weight.dtype or use_intel_amx_backend(lm_head):
+        return None
+    out_dtype = torch.float32 if processor.use_fp32_lm_head else weight.dtype
+    return gfx942_gemv.bf16_gemv(hidden_states, weight, out_dtype)

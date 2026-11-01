@@ -19,11 +19,13 @@ _BLOCK_K = 512
 _MAX_SPLIT_K = 32
 
 
-def rocm_gemv_split_k_max_tokens(*, n: int, k: int, weight_dtype: torch.dtype) -> int:
+def rocm_gemv_split_k_max_tokens(
+    *, n: int, k: int, weight_dtype: torch.dtype, allow_gfx942: bool = False
+) -> int:
     """Rows up to which rocm_router_gemv_split_k serves an [M, k] @ [n, k].T bf16
     GEMV (one 16-wide N tile per 512 of K, 16-row tiles), -1 when the device or the shape
-    rules it out."""
-    if not (is_hip() and is_gfx95_supported()):
+    rules it out; allow_gfx942 admits gfx942, where the caller opts in."""
+    if not (is_hip() and (is_gfx95_supported() or allow_gfx942)):
         return -1
     if weight_dtype != torch.bfloat16:
         return -1
