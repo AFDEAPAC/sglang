@@ -8,6 +8,11 @@ the kernel.
 
 from typing import Optional, Tuple
 
+import os
+import logging
+
+_R6_LOGGED = False
+
 import torch
 import triton
 import triton.language as tl
@@ -80,6 +85,14 @@ def opus_sparse_prefill(
 ) -> torch.Tensor:
     """Attention of q [T, H, 512] bf16 over the bf16 rows of kv [R, 512] named by
     csr, then those of extend_kv named by extend_csr, with a per-head sink."""
+    global _R6_LOGGED
+    if (os.environ.get("SGLANG_GFX942_AITER6002_PREFILL", "0") == "1"
+            and torch.cuda.get_device_properties(q.device).gcnArchName.split(":")[0] == "gfx942"):
+        from .aiter6002_prefill import sparse_prefill
+        if not _R6_LOGGED:
+            logging.getLogger(__name__).warning("R6_AITER6002_PREFILL_EXECUTED q=%s kv=%s two_sources=%s", tuple(q.shape), tuple(kv.shape), extend_kv is not None)
+            _R6_LOGGED = True
+        return sparse_prefill(q, kv, csr, attn_sink, softmax_scale, extend_kv, extend_csr)
     from aiter.ops.pa_sparse_prefill_opus import pa_sparse_prefill_opus
 
     indices, indptr = csr

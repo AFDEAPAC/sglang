@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 import logging
 from enum import Enum
 from functools import lru_cache, partial
@@ -2472,13 +2474,31 @@ def _apply_fallback_scaled_mm(
     return output.to(dtype=input_dtype)
 
 
-def use_aiter_bpreshuffle_gemm(output_size: int) -> bool:
+# K values (comma list) the CK bpreshuffle GEMM also serves on gfx942 when their M rows are tuned, e.g. 576
+_GFX942_BPRESHUFFLE_EXTRA_K = frozenset(
+    int(k) for k in os.environ.get("SGLANG_GFX942_BPRESHUFFLE_EXTRA_K", "").split(",") if k.strip()
+)
+
+
+# gfx942 opt-in: rowwise fp8 linears of at most this many rows run gfx942_gemv.fp8_gemv_rowwise
+_GFX942_FP8_GEMV = _is_hip and int(os.environ.get("SGLANG_GFX942_FP8_GEMV_MAX_M", "0") or 0) > 0
+
+
+def use_aiter_bpreshuffle_gemm(
+    output_size: int, input_size: Optional[int] = None
+) -> bool:
     # aiter's CK gemm_a8w8_bpreshuffle instances are GemmSpecialization::Default
     # (pre-shuffled weights are never N-padded) with NPerBlock=64, so any N that
     # is not a multiple of 64 raises "This GEMM is not supported!". Measured on
     # gfx950 for M=16384/N=32/K=4096, torch._scaled_mm rowwise runs that shape in
     # 14us against 90us for the cktile instance that does accept it.
-    return _use_aiter and output_size % 64 == 0
+    #
+    # Its gfx942 heuristic accepts K % 64, but the compiled gfx942 instances
+    # require K <= 192 or K % 128 == 0; DSv4.1 has K=288 and K=576 linears. Keep
+    # unsupported shapes unshuffled and route them to torch._scaled_mm. Callers
+    # that omit input_size keep the previous N-only behaviour.
+    input_supported = input_size is None or input_size <= 192 or input_size % 128 == 0
+    return _use_aiter and output_size % 64 == 0 and input_supported
 
 
 def apply_fp8_linear_bmm_flashinfer(
@@ -2511,6 +2531,50 @@ def apply_fp8_linear(
     compressed_tensor_quant: bool = False,
     pre_quant_output_dtype: Optional[torch.dtype] = None,
 ) -> torch.Tensor:
+    if isinstance(input, tuple):
+        # (fp8 [M, K], fp32 per-token scale [M, 1]) quantized by the producer exactly as the
+        # per_token_group_quant_fp8 call below would; only the rowwise GEMM path takes it
+        qinput, x_scale = input
+        assert (
+            use_per_token_if_dynamic
+            and weight_scale.numel() > 1
+            and (USE_ROWWISE_TORCH_SCALED_MM or _use_aiter)
+        ), "a pre-quantized per-token input needs the rowwise fp8 GEMM"
+        output_dtype = pre_quant_output_dtype or torch.bfloat16
+        output_shape = [*qinput.shape[:-1], weight.shape[1]]
+        if _GFX942_FP8_GEMV and bias is None:
+            from sglang.kernels.ops.gemm import gfx942_gemv as _gfx942_gemv
+
+            gemv_out = _gfx942_gemv.fp8_gemv_rowwise(
+                qinput,
+                weight.T,
+                x_scale,
+                weight_scale,
+                output_dtype,
+                shuffled=use_aiter_bpreshuffle_gemm(weight.shape[1], weight.shape[0]),
+            )
+            if gemv_out is not None:
+                return _process_scaled_mm_output(gemv_out, qinput.shape, output_shape)
+        if use_aiter_bpreshuffle_gemm(weight.shape[1], weight.shape[0]):
+            output = gemm_a8w8_bpreshuffle(
+                XQ=qinput,
+                WQ=weight.T,
+                x_scale=x_scale,
+                w_scale=weight_scale,
+                dtype=output_dtype,
+            )
+            if bias is not None:
+                output += bias
+            return _process_scaled_mm_output(output, qinput.shape, output_shape)
+        output = torch._scaled_mm(
+            qinput,
+            weight,
+            out_dtype=output_dtype,
+            scale_a=x_scale,
+            scale_b=weight_scale.t(),
+            bias=bias,
+        )
+        return _process_scaled_mm_output(output, qinput.shape, output_shape)
     # Note: we pad the input because torch._scaled_mm is more performant
     # for matrices with batch dimension > 16.
     # This could change in the future.
@@ -2634,9 +2698,20 @@ def apply_fp8_linear(
                         use_per_token_if_dynamic=use_per_token_if_dynamic,
                     )
                 else:
-                    qinput, x_scale = per_token_group_quant_fp8(
-                        input_2d, group_size=input_2d.shape[1]
+                    from sglang.kernels.ops.quantization import gfx942_decode_fuse as _gfx942_fuse
+
+                    ptq = (
+                        _gfx942_fuse.attached_per_token_quant(input, input_2d)
+                        if _gfx942_fuse.RMSNORM_PTQ
+                        else None
                     )
+                    if ptq is not None:
+                        # written by the RMSNorm launch that produced input
+                        qinput, x_scale = ptq
+                    else:
+                        qinput, x_scale = per_token_group_quant_fp8(
+                            input_2d, group_size=input_2d.shape[1]
+                        )
 
     if channelwise_cutlass:
         # A tuned config exists only for shapes where tuned Triton beat the
@@ -2711,7 +2786,23 @@ def apply_fp8_linear(
         # Must agree with the load-time predicate that decides whether the
         # weight was pre-shuffled; an unshuffled weight through the aiter path
         # (or a shuffled one through torch._scaled_mm) silently returns garbage.
-        if use_aiter_bpreshuffle_gemm(weight.shape[1]):
+        # weight is [K, N] here (it is transposed into (n, k) for the call), so
+        # pass both: N decides N-padding, K decides whether a compiled gfx942
+        # instance exists.
+        if _GFX942_FP8_GEMV and bias is None:
+            from sglang.kernels.ops.gemm import gfx942_gemv as _gfx942_gemv
+
+            gemv_out = _gfx942_gemv.fp8_gemv_rowwise(
+                qinput,
+                weight.T,
+                x_scale,
+                weight_scale,
+                output_dtype,
+                shuffled=use_aiter_bpreshuffle_gemm(weight.shape[1], weight.shape[0]),
+            )
+            if gemv_out is not None:
+                return _process_scaled_mm_output(gemv_out, input_2d.shape, output_shape)
+        if use_aiter_bpreshuffle_gemm(weight.shape[1], weight.shape[0]):
             # gemm_a8w8_bpreshuffle(XQ, WQ, x_scale, w_scale, dtype)
             # XQ -> input tensor, shape = (m, k)
             # WQ -> weight tensor, shape = (n, k), with preshuffe get better perf

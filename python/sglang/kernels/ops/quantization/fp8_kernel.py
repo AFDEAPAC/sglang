@@ -432,6 +432,38 @@ def _run_per_token_group_quant_8bit_kernel(
     checks. Whole-row (per-token) quantization is a different op:
     ``sglang_per_token_quant_fp8``.
     """
+    if _is_hip and scale_ue8m0 and x_s.dtype == torch.float32:
+        # The JIT v2 kernel below needs cuda_fp8.h, the AOT v2
+        # op is absent from the ROCm sgl_kernel build, and per_token_group_quant
+        # at the end of this function is CUDA-only JIT too. The Triton
+        # column-major kernel in this module handles UE8M0 and fills
+        # caller-owned buffers.
+        if fuse_silu_and_mul or masked_m is not None:
+            raise NotImplementedError(
+                "ROCm UE8M0 group quant has no fused-SiLU / masked variant; "
+                "the Triton column-major kernel takes neither argument"
+            )
+        # Launch the kernel directly: sglang_per_token_group_quant_fp8 routes
+        # back into this function, which recurses until the stack runs out.
+        _yc_m = x.numel() // group_size
+        _yc_block = triton.next_power_of_2(group_size)
+        _per_token_group_quant_8bit_colmajor[(_yc_m,)](
+            x,
+            x_q,
+            x_s,
+            group_size,
+            x.shape[1],
+            x_s.stride(1),
+            eps,
+            bit8_min=fp8_min,
+            bit8_max=fp8_max,
+            BLOCK=_yc_block,
+            num_warps=min(max(_yc_block // 256, 1), 8),
+            num_stages=1,
+            SCALE_UE8M0=True,
+        )
+        return
+
     if scale_ue8m0 and x_s.dtype == torch.float32 and not _is_musa:
         from sglang.kernels.ops.quantization.per_token_group_quant_8bit_v2 import (
             per_token_group_quant_8bit_v2,

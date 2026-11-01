@@ -13,6 +13,8 @@ Output layouts match the aiter kernels bit-for-bit:
 
 from __future__ import annotations
 
+import os
+
 import functools
 import logging
 from contextvars import ContextVar
@@ -24,6 +26,9 @@ import triton.language as tl
 from sglang.srt.utils import is_gfx95_supported
 
 logger = logging.getLogger(__name__)
+
+# pairs (M * topk) up to which the single-launch sort serves; on gfx942 it is slower than aiter's from about 16 rows
+_SMALL_SORT_MAX_PAIRS = int(os.environ.get("SGLANG_GFX942_SMALL_MOE_SORT_MAX_PAIRS", "256"))
 
 
 # P <= 64: one sort CTA does the whole P x P rank compare
@@ -375,7 +380,7 @@ def _small_sort_supported(
     return (
         expert_mask is None
         and num_local_tokens is None
-        and p <= 256
+        and p <= _SMALL_SORT_MAX_PAIRS
         # ponytail: the distributed variant scans every 64-expert chunk per pair, so it beats
         # aiter at E=129 but loses at E=513; cutoff untuned in between. The no-quant
         # path past 32 pairs takes the histogram + bitonic sort kernel instead, which
@@ -527,7 +532,9 @@ _emitted_quant: ContextVar[tuple[torch.Tensor, torch.Tensor] | None] = ContextVa
 @functools.cache
 def apply_aiter_small_moe_sort_patch() -> None:
     """Patch a stock aiter so decode-sized MoE sorting (+ stage1 mxfp8 quant) is one launch."""
-    if not is_gfx95_supported():
+    if not (
+        is_gfx95_supported() or os.environ.get("SGLANG_GFX942_SMALL_MOE_SORT", "0") == "1"
+    ):
         return
 
     try:
@@ -651,7 +658,7 @@ def apply_aiter_small_moe_sort_patch() -> None:
             use_opus,
             return_local_topk_ids=return_local_topk_ids,
             accumulate=accumulate,
-            output_aux=output_aux,
+            **({"output_aux": output_aux} if output_aux else {}),
             **orig_kwargs,
         )
 

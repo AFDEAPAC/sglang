@@ -18,6 +18,8 @@ from functools import lru_cache
 from typing import Optional, Tuple, Union
 
 import torch
+import triton
+import triton.language as tl
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -178,6 +180,47 @@ if _is_cuda:
 
 
 logger = logging.getLogger(__name__)
+
+
+@triton.jit
+def _gfx942_contiguous_2d_kernel(
+    input_ptr,
+    output_ptr,
+    rows,
+    cols,
+    stride_row,
+    stride_col,
+    numel,
+    BLOCK: tl.constexpr,
+):
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    active = offsets < numel
+    row = offsets // cols
+    col = offsets - row * cols
+    values = tl.load(
+        input_ptr + row * stride_row + col * stride_col, mask=active, other=0.0
+    )
+    tl.store(output_ptr + offsets, values, mask=active)
+
+
+def gfx942_contiguous_2d(x: torch.Tensor) -> torch.Tensor:
+    assert x.dim() == 2
+    if x.is_contiguous():
+        return x
+    out = torch.empty(x.shape, dtype=x.dtype, device=x.device)
+    block = 256
+    _gfx942_contiguous_2d_kernel[(triton.cdiv(x.numel(), block),)](
+        x,
+        out,
+        x.shape[0],
+        x.shape[1],
+        x.stride(0),
+        x.stride(1),
+        x.numel(),
+        BLOCK=block,
+    )
+    return out
+
 
 
 if _is_npu:
@@ -710,8 +753,25 @@ class RMSNorm(BaseFusedOp):
                     -1, post_residual_addition.shape[-1]
                 )
         else:
-            if not x.is_contiguous():
-                x = x.contiguous()
+            from sglang.kernels.ops.quantization import gfx942_decode_fuse as _gfx942_fuse
+
+            # the residual-free HIP and opus RMSNorm kernels read rows by stride
+            row_strided_ok = (
+                _gfx942_fuse.RMSNORM_ROW_STRIDED
+                and residual is None
+                and post_residual_addition is None
+                and x.stride(-1) == 1
+                and not (
+                    self._fused_pad_kernel is not None and self.x_pad_to_multiple > 0
+                )
+            )
+            if not x.is_contiguous() and not row_strided_ok:
+                if _is_hip and get_bool_env_var(
+                    "SGLANG_GFX942_TRITON_CONTIGUOUS", "false"
+                ):
+                    x = gfx942_contiguous_2d(x)
+                else:
+                    x = x.contiguous()
             if residual is not None and not residual.is_contiguous():
                 residual = residual.contiguous()
 
@@ -756,6 +816,14 @@ class RMSNorm(BaseFusedOp):
                     residual_shape
                 )
             return output, residual_out
+        if self.__dict__.get("_gfx942_ptq", False) and not needs_reshape:
+            from sglang.kernels.ops.quantization import gfx942_decode_fuse as _gfx942_fuse
+
+            if _gfx942_fuse.rmsnorm_ptq_supported(x, self.weight.data):
+                # the consumer's per-token fp8 quant comes out of the same launch
+                return _gfx942_fuse.rmsnorm_with_per_token_quant(
+                    x, self.weight.data, self.variance_epsilon
+                )
         output = rms_norm(x, self.weight.data, self.variance_epsilon)
         if needs_reshape:
             output = output.reshape(original_shape)

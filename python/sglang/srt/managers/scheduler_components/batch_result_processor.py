@@ -1047,6 +1047,16 @@ class SchedulerBatchResultProcessor:
                 new_accept_len = len(next_token_id)
                 self._maybe_update_reasoning_tokens(req, next_token_id)
             req.update_finish_state(new_accept_len)
+            # Refresh at the point a mask changes rather than draining a flag
+            # after the loop: a mask only changes when a loop is detected or
+            # cleared, so this is rare enough to pay for directly.
+            # The device-side tensor is rebuilt in ScheduleBatch.prepare_for_decode;
+            # the batch here is a temporary one under the overlap scheduler and
+            # carries no sampling_info.
+            if req.lazy_ng20_enabled:
+                req._update_lazy_ng20_mask()
+            if req.lazy_tail_enabled:
+                req._update_lazy_tail_mask()
 
             if sampling_mask_finish_reason is not None:
                 self._handle_sampling_mask_abort(req)

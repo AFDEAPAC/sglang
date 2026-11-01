@@ -168,3 +168,70 @@ def rope_tail_fake_quant_fp4(
         num_warps=4,
     )
     return out
+
+
+@triton.jit
+def _rope_tail_bf16_kernel(
+    x_ptr,
+    f_ptr,
+    out_ptr,
+    x_stride_r,
+    out_stride_r,
+    f_stride_t,
+    rows_per_token,
+    D: tl.constexpr,
+    RD: tl.constexpr,
+    INVERSE: tl.constexpr,
+):
+    """rope_tail_fake_quant_fp4_row's rotation and bf16 rounding of the tail, without the fp4 round-trip."""
+    r = tl.program_id(0)
+    t = r // rows_per_token
+    x_row_ptr = x_ptr + r * x_stride_r
+    f_row_ptr = f_ptr + t * f_stride_t
+    offs = tl.arange(0, D)
+    v = tl.load(x_row_ptr + offs).to(tl.float32)
+    head_len = D - RD
+    in_tail = offs >= head_len
+    pos = offs - head_len
+    j = pos // 2
+    is_im = (pos % 2) == 1
+    re = tl.load(x_row_ptr + head_len + 2 * j, mask=in_tail, other=0.0).to(tl.float32)
+    im = tl.load(x_row_ptr + head_len + 2 * j + 1, mask=in_tail, other=0.0).to(
+        tl.float32
+    )
+    fr = tl.load(f_row_ptr + 2 * j, mask=in_tail, other=1.0)
+    fi = tl.load(f_row_ptr + 2 * j + 1, mask=in_tail, other=0.0)
+    if INVERSE:
+        fi = -fi
+    rot = tl.where(is_im, re * fi + im * fr, re * fr - im * fi)
+    v = tl.where(in_tail, rot, v)
+    tl.store(out_ptr + r * out_stride_r + offs, v.to(out_ptr.dtype.element_ty))
+
+
+def rope_tail_bf16(
+    x: torch.Tensor, freqs: torch.Tensor, rope_dim: int, inverse: bool = False
+) -> torch.Tensor:
+    """dsv41_sparse.rope_tail in one launch. x: [T, ..., D] (D a power of two), freqs: complex [T, rope_dim // 2]."""
+    x = x.contiguous()
+    d = x.shape[-1]
+    assert rope_dim % 2 == 0 and rope_dim <= d and d & (d - 1) == 0
+    x2 = x.reshape(-1, d)
+    out = torch.empty_like(x)
+    rows = x2.shape[0]
+    if rows == 0:
+        return out
+    f_real = torch.view_as_real(freqs.contiguous()).contiguous()
+    _rope_tail_bf16_kernel[(rows,)](
+        x2,
+        f_real,
+        out.reshape(-1, d),
+        x2.stride(0),
+        d,
+        f_real.stride(0),
+        rows // x.shape[0],
+        D=d,
+        RD=rope_dim,
+        INVERSE=inverse,
+        num_warps=1,
+    )
+    return out

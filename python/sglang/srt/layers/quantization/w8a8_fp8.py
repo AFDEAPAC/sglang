@@ -24,8 +24,9 @@ from sglang.srt.layers.quantization.fp8_utils import (
     cutlass_fp8_supported,
     input_to_float8,
     normalize_e4m3fn_to_e4m3fnuz,
+    use_aiter_bpreshuffle_gemm,
 )
-from sglang.srt.utils import set_weight_attrs
+from sglang.srt.utils import get_bool_env_var, is_hip, set_weight_attrs
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -34,6 +35,12 @@ if TYPE_CHECKING:
     )
 
 _is_fp8_fnuz = is_fp8_fnuz()
+
+
+# Route per-channel (PTPC) fp8 through aiter on HIP. The upstream unfused path
+# (_apply_fallback_scaled_mm: fp8->fp32 GEMM + separate dequant+cast) quantizes the
+# activation per-tensor, which is wrong against a per-channel weight scale.
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 
 
 class W8A8Fp8Config(QuantizationConfig):
@@ -57,6 +64,10 @@ class W8A8Fp8Config(QuantizationConfig):
 
     def __init__(self, is_checkpoint_fp8_serialized: bool = False):
         self.is_checkpoint_fp8_serialized = is_checkpoint_fp8_serialized
+        # Mixed DSV4 layout: body linears are per-channel fp8 while the routed
+        # experts stay mxfp4-packed. Injected by model_loader from ModelConfig.
+        self.is_fp4_experts = False
+        self._fp4_moe_config = None
 
     @classmethod
     def get_supported_act_dtypes(cls) -> List[torch.dtype]:
@@ -93,8 +104,28 @@ class W8A8Fp8Config(QuantizationConfig):
         if isinstance(layer, LinearBase):
             return W8A8Fp8LinearMethod(self)
         elif isinstance(layer, FusedMoE):
+            if self.is_fp4_experts:
+                return self._packed_moe_config().get_quant_method(layer, prefix)
             return W8A8FP8MoEMethod(self)
         return None
+
+    def _packed_moe_config(self) -> QuantizationConfig:
+        """Fp8Config for routed experts the PTPC conversion left mxfp4-packed.
+
+        weight_block_size is not optional: without it Fp8Config selects per-tensor
+        expert scales and the [7168, 96] checkpoint scale fails to load into the
+        TP-sharded [7168, 12] parameter.
+        """
+        if self._fp4_moe_config is None:
+            from sglang.srt.layers.quantization.fp8 import Fp8Config
+
+            self._fp4_moe_config = Fp8Config(
+                is_checkpoint_fp8_serialized=True,
+                activation_scheme="dynamic",
+                weight_block_size=[128, 128],
+                is_fp4_experts=True,
+            )
+        return self._fp4_moe_config
 
     def get_scaled_act_names(self) -> List[str]:
         return []
@@ -116,6 +147,12 @@ class W8A8Fp8LinearMethod(LinearMethodBase):
                     weight=weight, weight_scale=weight_scale
                 )
 
+            if use_aiter_bpreshuffle_gemm(weight.shape[0], weight.shape[1]):
+                # MFMA-preshuffle B only for shapes accepted by the gfx942 CK
+                # dispatch. Unsupported K stays row-major for torch._scaled_mm.
+                from aiter.ops.shuffle import shuffle_weight
+
+                weight = shuffle_weight(weight.contiguous(), (16, 16))
             layer.weight = Parameter(weight.t(), requires_grad=False)
             layer.weight_scale = Parameter(weight_scale, requires_grad=False)
         else:
@@ -190,6 +227,10 @@ class W8A8Fp8LinearMethod(LinearMethodBase):
             layer.weight_scale,
             bias=bias,
             cutlass_fp8_supported=self.cutlass_fp8_supported,
+            # On aiter/HIP route per-token-per-channel fp8 to per-token activation
+            # quant; the default (per-tensor) mismatches the per-channel weight
+            # scale and produces garbage logits.
+            use_per_token_if_dynamic=_use_aiter,
         )
 
 

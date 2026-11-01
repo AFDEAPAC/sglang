@@ -56,6 +56,7 @@ def triton_fp8_attention_fwd(
     extra_indices_in_kvcache: Optional[torch.Tensor] = None,
     topk_length: Optional[torch.Tensor] = None,
     extra_topk_length: Optional[torch.Tensor] = None,
+    inv_rope: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     **_unused,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Sparse MLA decode via Triton kernels.
@@ -89,6 +90,7 @@ def triton_fp8_attention_fwd(
         sm_scale=softmax_scale,
         d_v=head_dim_v,
         attn_sink=attn_sink,
+        inv_rope=inv_rope,
     )
 
     # Triton kernel returns lse as (b, h_q, s_q); transpose to

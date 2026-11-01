@@ -6,6 +6,8 @@ share that storage.
 
 from __future__ import annotations
 
+import functools
+import os
 from typing import Optional, Tuple
 
 import torch
@@ -28,10 +30,41 @@ def _fused_dsv41_kernels(x: torch.Tensor) -> bool:
     return x.is_cuda and (torch.version.cuda is not None or is_gfx95_supported())
 
 
+# the split fp4 index-K store quantizes the RoPE'd keys itself, to the values the fp4 round-trip gives
+_GFX942_FUSED_INDEX_K_STORE = (
+    os.environ.get("SGLANG_GFX942_FUSED_INDEX_K_STORE", "0") == "1" and torch.version.hip is not None
+)
+# gfx942 opt-in to the fused RoPE launches of the CUDA / gfx950 path; their in-kernel complex multiply may round a
+# rotated element one bf16 ulp away from torch's
+_GFX942_FUSED_DSV41_ROPE = (
+    os.environ.get("SGLANG_GFX942_FUSED_DSV41_ROPE", "0") == "1" and torch.version.hip is not None
+)
+# gfx942 opt-ins: the split-K head-weight GEMV of the gfx950 decode indexer, and the fused c1 / c2 / index-K
+# low-ratio compress kernels (software e2m1 packing), which also fix the ratio-2 weight layout
+_GFX942_INDEXER_WEIGHTS_SPLITK = (
+    os.environ.get("SGLANG_GFX942_INDEXER_WEIGHTS_SPLITK", "0") == "1" and torch.version.hip is not None
+)
+_GFX942_FUSED_LOW_RATIO_COMPRESS = (
+    os.environ.get("SGLANG_GFX942_FUSED_LOW_RATIO_COMPRESS", "0") == "1" and torch.version.hip is not None
+)
+
+
+@functools.lru_cache(maxsize=None)
+def _gfx942_fused_dsv41_opt_in() -> bool:
+    return (
+        os.environ.get("SGLANG_GFX942_FUSED_DSV41", "0") == "1"
+        and torch.version.hip is not None
+        and "gfx942"
+        in torch.cuda.get_device_properties(torch.cuda.current_device()).gcnArchName
+    )
+
+
 def _rope_fq4(x, freqs, rope_dim, *, compressed_kv=False, positions=None):
     """RoPE plus fake FP4 quantization, fused for bf16 inputs on CUDA and ROCm. With
     positions, freqs is the whole table and the fused kernel gathers freqs[positions]."""
-    if _fused_dsv41_kernels(x) and x.dtype == torch.bfloat16:
+    if (
+        _fused_dsv41_kernels(x) or (_GFX942_FUSED_DSV41_ROPE and x.is_cuda)
+    ) and x.dtype == torch.bfloat16:
         from sglang.kernels.ops.attention.dsv4.fp4_rope_fake_quant import (
             rope_tail_fake_quant_fp4,
         )
@@ -41,6 +74,16 @@ def _rope_fq4(x, freqs, rope_dim, *, compressed_kv=False, positions=None):
         )
     if positions is not None:
         freqs = freqs[positions]
+    if x.is_cuda and x.dtype == torch.bfloat16 and _gfx942_fused_dsv41_opt_in():
+        from sglang.kernels.ops.attention.dsv4.fp4_rope_fake_quant import (
+            rope_tail_fake_quant_fp4,
+        )
+
+        # torch's complex multiply rounds differently per kernel it picks, so the RoPE stays on
+        # torch; with rope_dim=0 the fused kernel is only the (exact) fake quantization
+        return rope_tail_fake_quant_fp4(
+            rope_tail(x, freqs, rope_dim), freqs, 0, compressed_kv=compressed_kv
+        )
     quant = fake_quant_compressed_kv if compressed_kv else fake_quant_fp4
     return quant(rope_tail(x, freqs, rope_dim))
 
@@ -56,7 +99,14 @@ class RMSNorm(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # the Triton kernel is bitwise this fallback for bf16 rows on CUDA and ROCm (gfx950)
         if (
-            _fused_dsv41_kernels(x)
+            (
+                _fused_dsv41_kernels(x)
+                or (
+                    x.is_cuda
+                    and _gfx942_fused_dsv41_opt_in()
+                    and os.environ.get("SGLANG_GFX942_FUSED_DSV41_RMS", "0") == "1"
+                )
+            )
             and x.dtype in (torch.bfloat16, torch.float32)
             and self.weight.dtype in (torch.bfloat16, torch.float32)
             and x.shape[-1] in (128, 512)
@@ -105,7 +155,7 @@ def fused_low_ratio_compress_supported() -> bool:
     if not torch.cuda.is_available():
         return False
     if torch.version.hip is not None:
-        return is_gfx95_supported()
+        return is_gfx95_supported() or _GFX942_FUSED_LOW_RATIO_COMPRESS
     return torch.cuda.get_device_capability()[0] >= 10
 
 
@@ -224,7 +274,10 @@ class DeepseekV41Indexer(nn.Module):
         )
         # -1 off gfx950 or for shapes the split-K GEMV lacks
         self.weights_proj_hip_max_tokens = rocm_gemv_split_k_max_tokens(
-            n=self.n_heads, k=config.hidden_size, weight_dtype=torch.bfloat16
+            n=self.n_heads,
+            k=config.hidden_size,
+            weight_dtype=torch.bfloat16,
+            allow_gfx942=_GFX942_INDEXER_WEIGHTS_SPLITK,
         )
         # The decode GEMM matches tiny_gemm's reduction order, not cuBLAS's.
         self.weights_proj_small_max_m = _small_weights_proj_max_m(
@@ -252,6 +305,14 @@ class DeepseekV41Indexer(nn.Module):
     def index_keys(self, latent: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
         """Pre-RoPE latents [n, D] -> fp4-rounded index keys [n, index_head_dim]."""
         k = self.k_norm(self.forward_wk(latent))
+        if _GFX942_FUSED_INDEX_K_STORE:
+            if _GFX942_FUSED_DSV41_ROPE and k.is_cuda and k.dtype == torch.bfloat16:
+                from sglang.kernels.ops.attention.dsv4.fp4_rope_fake_quant import (
+                    rope_tail_bf16,
+                )
+
+                return rope_tail_bf16(k, freqs, self.rope_head_dim)
+            return rope_tail(k, freqs, self.rope_head_dim)
         return _rope_fq4(k, freqs, self.rope_head_dim)
 
     def queries(
@@ -265,6 +326,13 @@ class DeepseekV41Indexer(nn.Module):
         q, _ = self.wq_b(q_lora)
         q = q.view(q.shape[0], self.n_local_heads, self.index_head_dim)
         return _rope_fq4(q, freqs, self.rope_head_dim, positions=positions)
+
+    def queries_roped(self, q_lora: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
+        """queries() before its fp4 round-trip, for a consumer that rounds the
+        query itself."""
+        q, _ = self.wq_b(q_lora)
+        q = q.view(q.shape[0], self.n_local_heads, self.index_head_dim)
+        return rope_tail(q, freqs, self.rope_head_dim)
 
     def head_weights_raw(self, x: torch.Tensor) -> torch.Tensor:
         """`weights_proj(x)` before the scale, [tokens, n_heads] bf16."""

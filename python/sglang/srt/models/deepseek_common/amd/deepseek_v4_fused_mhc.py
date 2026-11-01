@@ -1,6 +1,7 @@
 import logging
 from typing import TYPE_CHECKING, NamedTuple, Optional, Tuple
 
+import os
 import torch
 import triton
 
@@ -25,6 +26,20 @@ logger = logging.getLogger(__name__)
 _is_hip = is_hip()
 _is_gfx95_supported = is_gfx95_supported()
 _is_gfx1250_supported = is_gfx1250_supported()
+# gfx942 opt-ins: the fused TP4 all-reduce + hc_post of the 1-8 row decode boundary on AITER's custom all-reduce,
+# and the per-token-quant RMSNorm launch hosting the boundary's pending reduce + sinkhorn
+_GFX942_FUSED_AR_MHC = (
+    _is_hip and not _is_gfx95_supported and get_bool_env_var("SGLANG_GFX942_FUSED_AR_MHC", "false")
+)
+_GFX942_NORM_HOSTS_SINKHORN = (
+    _is_hip
+    and not _is_gfx95_supported
+    and get_bool_env_var("SGLANG_GFX942_NORM_HOSTS_SINKHORN", "false")
+)
+# the hosting launch is slower than aiter's norm + a standalone sinkhorn at prefill rows (4096: 188 vs 169 us)
+_GFX942_NORM_HOSTS_SINKHORN_MAX_M = int(
+    os.environ.get("SGLANG_GFX942_NORM_HOSTS_SINKHORN_MAX_M", "64")
+)
 
 if _is_hip:
     from sglang.kernels.ops.communication.all_reduce_mhc_hip import (
@@ -503,7 +518,7 @@ def hc_boundary(
 
 def _can_fuse_mhc(layer, residual: torch.Tensor, forward_batch) -> bool:
     return (
-        _is_gfx95_supported
+        (_is_gfx95_supported or _GFX942_FUSED_AR_MHC)
         and 1 <= residual.shape[0] <= ALL_REDUCE_MHC_MAX_ROWS
         and residual.shape[1:] == (4, MHC_HIDDEN_SIZE)
         and residual.dtype == torch.bfloat16
@@ -579,5 +594,31 @@ def _gfx95_dense_post_attention_norm(layer, x: torch.Tensor, coefficients):
     sinkhorn elsewhere."""
     if _is_gfx95_supported:
         return post_attention_norm(layer, x, coefficients)
+    hosted = gfx942_norm_hosting_sinkhorn(layer.post_attention_layernorm, x, coefficients)
+    if hosted is not None:
+        return hosted
     coefficients.materialize()
     return layer.post_attention_layernorm(x)
+
+
+def gfx942_norm_hosting_sinkhorn(norm, x: torch.Tensor, coefficients):
+    """norm(x) for a per-token-quant RMSNorm module, with the pending reduce + sinkhorn of
+    coefficients in the same launch; None where the module norm and a standalone reduce +
+    sinkhorn launch apply."""
+    if not (
+        _GFX942_NORM_HOSTS_SINKHORN
+        and coefficients is not None
+        and not coefficients.materialized
+        and norm.__dict__.get("_gfx942_ptq", False)
+        and x.dim() == 2
+        and x.shape[0] <= _GFX942_NORM_HOSTS_SINKHORN_MAX_M
+    ):
+        return None
+    from sglang.kernels.ops.layernorm.mhc_boundary_hip import rmsnorm_ptq_with_sinkhorn
+    from sglang.kernels.ops.quantization import gfx942_decode_fuse as _gfx942_fuse
+
+    if not _gfx942_fuse.rmsnorm_ptq_supported(x, norm.weight.data):
+        return None
+    return rmsnorm_ptq_with_sinkhorn(
+        x, norm.weight.data, norm.variance_epsilon, coefficients
+    )

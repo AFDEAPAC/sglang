@@ -270,6 +270,173 @@ def apply_rotary_emb_flat_kernel(
     tl.store(x_ptr + xo, out.to(x_ptr.dtype.element_ty), mask=rmask[:, None])
 
 
+@triton.jit
+def _rope_flat_rows(
+    x_ptr,
+    fr_ptr,
+    pos_ptr,
+    lpid,
+    n_rows,
+    n_heads,
+    sx_tok,
+    sx_head,
+    sx_d,
+    sfr_pos,
+    sfr_d,
+    USE_POS: tl.constexpr,
+    IS_INVERSE: tl.constexpr,
+    RD: tl.constexpr,
+    RDH: tl.constexpr,
+    BLOCK_ROWS: tl.constexpr,
+):
+    """One BLOCK_ROWS slab of apply_rotary_emb_flat_kernel, as a device function.
+
+    Lifted verbatim so the fused Q+K kernel below computes exactly what the two
+    separate launches do, in the same order."""
+    row = lpid * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
+    rmask = row < n_rows
+    tok = row // n_heads
+    head = row % n_heads
+    d = tl.arange(0, RD)
+    base = tok[:, None] * sx_tok + head[:, None] * sx_head
+    xo = base + d[None, :] * sx_d
+    x = tl.load(x_ptr + xo, mask=rmask[:, None], other=0.0).to(tl.float32)
+
+    if USE_POS:
+        pos = tl.load(pos_ptr + tok, mask=rmask, other=0)
+    else:
+        pos = tok
+    cos_idx = (d // 2) * 2
+    cos = tl.load(
+        fr_ptr + pos[:, None] * sfr_pos + cos_idx[None, :] * sfr_d,
+        mask=rmask[:, None],
+        other=0.0,
+    )
+    sin = tl.load(
+        fr_ptr + pos[:, None] * sfr_pos + (cos_idx[None, :] + 1) * sfr_d,
+        mask=rmask[:, None],
+        other=0.0,
+    )
+
+    x_sin = x * sin
+    even = (d % 2 == 0)[None, :]
+    if IS_INVERSE:
+        x_neg = tl.where(even, -x_sin, x_sin)
+    else:
+        x_neg = tl.where(even, x_sin, -x_sin)
+    x_neg = tl.reshape(x_neg, (BLOCK_ROWS, RDH, 2))
+    x_neg = tl.flip(x_neg, 2)
+    x_rot = tl.reshape(x_neg, (BLOCK_ROWS, RD))
+
+    out = x * cos + x_rot
+    tl.store(x_ptr + xo, out.to(x_ptr.dtype.element_ty), mask=rmask[:, None])
+
+
+@triton.jit
+def apply_rotary_emb_flat_qk_kernel(
+    q_ptr,
+    k_ptr,
+    fr_ptr,
+    pos_ptr,
+    nblk_q,
+    n_rows_q,
+    n_heads_q,
+    sq_tok,
+    sq_head,
+    sq_d,
+    n_rows_k,
+    n_heads_k,
+    sk_tok,
+    sk_head,
+    sk_d,
+    sfr_pos,
+    sfr_d,
+    USE_POS: tl.constexpr,
+    IS_INVERSE: tl.constexpr,
+    RD: tl.constexpr,
+    RDH: tl.constexpr,
+    BLOCK_ROWS: tl.constexpr,
+):
+    """Q and K rotary in one launch. Programs [0, nblk_q) own Q's rows and the
+    rest own K's, so a block never straddles the two tensors and each takes the
+    same path as its own single-tensor launch would."""
+    pid = tl.program_id(0)
+    if pid < nblk_q:
+        _rope_flat_rows(
+            q_ptr, fr_ptr, pos_ptr, pid, n_rows_q, n_heads_q,
+            sq_tok, sq_head, sq_d, sfr_pos, sfr_d,
+            USE_POS, IS_INVERSE, RD, RDH, BLOCK_ROWS,
+        )
+    else:
+        _rope_flat_rows(
+            k_ptr, fr_ptr, pos_ptr, pid - nblk_q, n_rows_k, n_heads_k,
+            sk_tok, sk_head, sk_d, sfr_pos, sfr_d,
+            USE_POS, IS_INVERSE, RD, RDH, BLOCK_ROWS,
+        )
+
+
+def apply_rotary_emb_triton_qk(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    freqs_cis: torch.Tensor,
+    positions=None,
+    inverse: bool = False,
+) -> bool:
+    """RoPE both Q and K in one launch; False if the shapes need the old path.
+
+    Mirrors apply_rotary_emb_triton's batched 3-D branch, which is what the
+    DeepSeek V4 decode path takes (set_batched_rope(True)). Anything else --
+    2-D inputs, differing rope_dim, batched rope off -- returns False so the
+    caller keeps the two-launch behaviour.
+    """
+    if not _USE_BATCHED_ROPE or q.ndim != 3 or k.ndim != 3:
+        return False
+    if q.shape[0] != k.shape[0] or q.shape[2] != k.shape[2]:
+        return False
+
+    batch_size, n_heads_q, rope_dim = q.shape
+    n_heads_k = k.shape[1]
+    freqs_real = torch.view_as_real(freqs_cis).flatten(-2)
+    if positions is not None:
+        assert positions.shape == (batch_size,)
+    else:
+        assert freqs_real.shape[0] == batch_size
+
+    RD = max(triton.next_power_of_2(rope_dim), 2)
+    FLAT_BLOCK_ROWS = 16
+    n_rows_q = batch_size * n_heads_q
+    n_rows_k = batch_size * n_heads_k
+    nblk_q = triton.cdiv(n_rows_q, FLAT_BLOCK_ROWS)
+    nblk_k = triton.cdiv(n_rows_k, FLAT_BLOCK_ROWS)
+
+    apply_rotary_emb_flat_qk_kernel[(nblk_q + nblk_k,)](
+        q,
+        k,
+        freqs_real,
+        positions,
+        nblk_q,
+        n_rows_q,
+        n_heads_q,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        n_rows_k,
+        n_heads_k,
+        k.stride(0),
+        k.stride(1),
+        k.stride(2),
+        freqs_real.stride(0),
+        freqs_real.stride(1),
+        USE_POS=(positions is not None),
+        IS_INVERSE=inverse,
+        RD=RD,
+        RDH=RD // 2,
+        BLOCK_ROWS=FLAT_BLOCK_ROWS,
+        num_warps=1,
+    )
+    return True
+
+
 # Use the batched / contiguous-load rope kernels (faster, coalesced) instead of the
 # per-token kernel. Default OFF; DeepseekV4 enables it via set_batched_rope(True).
 # The env var SGLANG_ROPE_BATCHED=1 still works as an override.

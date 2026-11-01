@@ -16,6 +16,9 @@ from typing import (
     Tuple,
     Union,
 )
+import os
+import re
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import torch
 import triton
@@ -37,6 +40,7 @@ from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
     FP4PrefillWorkspace,
     FP4RowgroupDecodeWorkspace,
     FP4RowgroupPrefillWorkspace,
+    _alloc_logits,
     aiter_fp4_paged_mqa_logits,
     aiter_has_fp4_rowgroup,
     index_q_rope_pack_flydsl,
@@ -50,6 +54,7 @@ from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
     rowgroup_paged_mqa_logits,
     rowgroup_prefill_query_start_loc,
     rowgroup_table_columns,
+    triton_fp4_split_paged_mqa_logits,
 )
 from sglang.kernels.ops.attention.dsv4.fp4_indexer_rope_hip import (
     index_k_norm_rope_pack_store_split,
@@ -64,6 +69,172 @@ from sglang.srt.layers.attention.deepseek_v4_backend import (
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.dsv4.metadata import PagedIndexerMetadata
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+
+
+logger = logging.getLogger(__name__)
+_NATIVE_TRITON_INDEXER_LOGGED = False
+
+
+_E2M1_VALUES = (0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6)
+_E2M1_LUT: Dict[torch.device, torch.Tensor] = {}
+_FP8_MQA_POOL: Dict[Tuple[torch.device, str], torch.Tensor] = {}
+# Fixed work chunks keep the conversion temporaries one size whatever the context
+# length or row count, so they never strand caching-allocator blocks.
+_K_CONVERT_CHUNK = 16384
+_Q_CONVERT_CHUNK = 2048
+# Ported from the ali-private 20261030 image; both default off, as it has them.
+_FP8_MQA_FUSED_Q = os.environ.get("SGLANG_DSV41_FP8_MQA_FUSED_Q", "0") == "1"
+_FP8_MQA_TRITON_KCONV = (
+    os.environ.get("SGLANG_DSV41_FP8_MQA_TRITON_KCONV", "0") == "1"
+)
+_FP8_MQA_CHECK = os.environ.get("SGLANG_DSV41_FP8_MQA_CHECK", "0") == "1"
+# gfx942 opt-in: the decode indexer's fused RoPE gathers freqs_cis[pos] itself instead of an index launch
+_GFX942_INDEXER_POS_GATHER = os.environ.get("SGLANG_GFX942_INDEXER_POS_GATHER", "0") == "1"
+
+
+def _fp8_mqa_pool(device, name, rows, tail, dtype, quantum):
+    """Grow-only scratch reused across calls (the _alloc_logits argument: a size that
+    tracks context length would strand one allocator block per length)."""
+    buf = _FP8_MQA_POOL.get((device, name))
+    if buf is None or buf.shape[0] < rows:
+        buf = torch.empty(
+            (triton.cdiv(rows, quantum) * quantum, *tail), dtype=dtype, device=device
+        )
+        _FP8_MQA_POOL[(device, name)] = buf
+    return buf[:rows]
+
+
+def _fp4_paged_k_to_fp8(k_payload, k_scale, pt_row, length):
+    """Paged split-MXFP4 index K (addressing of _fp4_split_index_logits_tile) -> contiguous
+    e4m3fnuz [length, 128] and a power-of-two per-position scale. Exact while a position's
+    four e8m0 exponents span <= 11: 6 * 2^5 = 192 <= 240, 0.5 * 2^-6 = 2^-7 (min normal).
+    Returns views of pooled buffers, valid until the next call."""
+    dev = k_payload.device
+    lut = _E2M1_LUT.get(dev)
+    if lut is None:
+        lut = _E2M1_LUT[dev] = torch.tensor(_E2M1_VALUES, dtype=torch.float32, device=dev)
+    kv = _fp8_mqa_pool(dev, "kv", length, (128,), torch.float8_e4m3fnuz, 65536)
+    kv_scale = _fp8_mqa_pool(dev, "kv_scale", length, (), torch.float32, 65536)
+    payload = k_payload.view(torch.uint8)
+    if _FP8_MQA_TRITON_KCONV:
+        from sglang.kernels.ops.attention.dsv4.fp8_mqa_pack_hip import (
+            fp4_paged_k_to_fp8,
+        )
+
+        fp4_paged_k_to_fp8(payload, k_scale, pt_row, length, kv, kv_scale)
+        if _FP8_MQA_CHECK:
+            from sglang.kernels.ops.attention.dsv4.fp8_mqa_pack_hip import (
+                check_fp4_paged_k_to_fp8,
+            )
+
+            check_fp4_paged_k_to_fp8(payload, k_scale, pt_row, length, kv, kv_scale)
+        return kv, kv_scale
+    for p0 in range(0, length, _K_CONVERT_CHUNK):
+        p1 = min(p0 + _K_CONVERT_CHUNK, length)
+        p = torch.arange(p0, p1, device=dev)
+        page = pt_row[p // 64].long()
+        off = p % 64
+        pay = payload[page, 0, :, off, :].reshape(p1 - p0, 64)
+        codes = torch.stack((pay & 0x0F, pay >> 4), dim=-1).reshape(p1 - p0, 128)
+        exps = k_scale[page, 0, :, (off % 16) * 4 + off // 16].to(torch.int32)
+        emax = exps.amax(dim=1)
+        shift = (exps - emax[:, None] + 5).repeat_interleave(32, dim=1).float()
+        kv[p0:p1] = (lut[codes.long()] * torch.exp2(shift)).to(torch.float8_e4m3fnuz)
+        kv_scale[p0:p1] = torch.exp2((emax - 132).float())
+    return kv, kv_scale
+
+
+def _fp8_mqa_logits_extend(
+    query, weights, k_payload, k_scale, page_table, lengths, segments, fused_q=False
+):
+    """Prefill index logits on aiter's gfx942 FlyDSL fp8 MQA kernel, written into the
+    pooled _alloc_logits block. Q is quantized per (row, head) and the scale folded into
+    the head weights (ReLU(s*x) = s*ReLU(x), s > 0). segments: (row_lo, row_hi, lc) per
+    request, rows relative to query; columns are each row's own compressed positions, as
+    the Triton path writes them. The kernel stores only inside each row's [start, end)
+    window, so the rows padded up to RPB (empty windows) never touch a neighbour."""
+    from aiter.ops.flydsl.kernels.fp8_mqa_logits import (
+        _BLOCK_KV,
+        _auto_num_splits,
+        _resolve_variant,
+        compile_fp8_mqa_logits,
+    )
+    from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
+
+    dev = query.device
+    rows, heads, dim = query.shape
+    max_lc = max(lc for _, _, lc in segments)
+    # Each launch covers its segment's rows padded to the variant's RPB (rows per kernel
+    # block); only the last segment's padding can reach past `rows`. Sizing the logits view
+    # to exactly that keeps the request inside _alloc_logits' budget at the chunk sizes
+    # logits_rows_per_chunk picks, so it is served from the pool, not a fresh allocation.
+    plans = []
+    for lo, hi, lc in segments:
+        if hi <= lo or lc <= 0:
+            continue
+        variant = _resolve_variant(None, hi - lo, lc)
+        rpb = int(re.match(r"mfma_r(\d+)", variant).group(1))
+        plans.append((lo, hi, lc, variant, rpb, triton.cdiv(hi - lo, rpb) * rpb))
+    need_rows = max([rows] + [lo + padded for lo, _, _, _, _, padded in plans])
+    q8 = _fp8_mqa_pool(dev, "q8", need_rows, (heads, dim), torch.float8_e4m3fnuz, 4096)
+    w8 = _fp8_mqa_pool(dev, "w8", need_rows, (heads,), torch.float32, 4096)
+    if fused_q:
+        # query is the RoPE'd query before its fp4 round-trip, which the pack
+        # kernel applies.
+        from sglang.kernels.ops.attention.dsv4.fp8_mqa_pack_hip import (
+            fake_fp4_query_to_fp8,
+        )
+
+        fake_fp4_query_to_fp8(
+            query.contiguous(), weights.contiguous(), q8[:rows], w8[:rows]
+        )
+        if _FP8_MQA_CHECK:
+            from sglang.kernels.ops.attention.dsv4.fp8_mqa_pack_hip import (
+                check_fake_fp4_query_to_fp8,
+            )
+
+            check_fake_fp4_query_to_fp8(query, weights, q8[:rows], w8[:rows])
+    else:
+        for r0 in range(0, rows, _Q_CONVERT_CHUNK):
+            r1 = min(r0 + _Q_CONVERT_CHUNK, rows)
+            qf = query[r0:r1].float()
+            q_scale = (qf.abs().amax(dim=-1) / 240.0).clamp(min=1e-12)
+            q8[r0:r1] = (qf / q_scale[..., None]).to(torch.float8_e4m3fnuz)
+            w8[r0:r1] = weights[r0:r1].float() * q_scale
+    out = _alloc_logits(need_rows, triton.cdiv(max_lc, 64) * 64, dev, False)
+    lengths = lengths.to(torch.int32)
+    stream = torch.cuda.current_stream()
+    for lo, hi, lc, variant, rpb, padded in plans:
+        kv8, kv_scale = _fp4_paged_k_to_fp8(k_payload, k_scale, page_table[hi - 1], lc)
+        cu_starts = torch.zeros(padded, dtype=torch.int32, device=dev)
+        cu_ends = torch.zeros(padded, dtype=torch.int32, device=dev)
+        cu_ends[: hi - lo] = lengths[lo:hi]
+        launcher = compile_fp8_mqa_logits(
+            num_heads=heads,
+            head_size=dim,
+            block_kv=_BLOCK_KV,
+            paged=False,
+            variant=variant,
+            convert_q_fn=False,
+            convert_kv_fn=False,
+        )
+        with torch.cuda.device(dev.index):
+            _run_compiled(
+                launcher,
+                q8[lo : lo + padded],
+                kv8,
+                kv_scale,
+                w8[lo : lo + padded],
+                cu_starts,
+                cu_ends,
+                out[lo : lo + padded, :lc],
+                int(padded),
+                int(lc),
+                int(out.stride(0)),
+                int(_auto_num_splits(padded, lc, rpb, dev.index)),
+                stream,
+            )
+    return out[:rows]
 
 
 # fp32 logits scored per candidate-block chunk stay under this many bytes
@@ -398,6 +569,13 @@ def low_ratio_index_topk_hip_decode(
     k_payload = pool.get_index_k_fp4_payload_buffer(layer.layer_id)
     k_scale = pool.get_index_k_fp4_scale_buffer(layer.layer_id)
     page8 = pool.low_ratio_index_k_page8(layer.layer_id)
+    # The source image takes the Triton gfx942 indexer on decode as well as
+    # prefill; only the prefill branch was carried over. Skipped on a page-8
+    # pool, which has its own decode kernel below.
+    use_triton_decode = (
+        not page8
+        and os.environ.get("SGLANG_DSV41_TRITON_FP4_INDEXER", "0") == "1"
+    )
     if two_level and indexer.uses_candidates:
         candidates = backend.candidate_masks
         assert (
@@ -421,23 +599,40 @@ def low_ratio_index_topk_hip_decode(
                 is_decode=True,
             )
             return
-    logits = aiter_fp4_paged_mqa_logits(
-        q_fp4=q_fp4,
-        q_scale=q_scale,
-        k_payload=k_payload,
-        k_scale=k_scale,
-        weights=weights,
-        page_table=indexer_metadata.page_table,
-        c4_seq_lens=indexer_metadata.compressed_seq_lens,
-        weight_scale=1.0,
-        page_table_bucket=LOW_RATIO_PAGE_TABLE_BUCKET,
-        is_decode=True,
-        decode_workspace=metadata.fp4_low_ratio_decode_workspaces.get(ratio),
-        page8=page8,
-        rowgroup_table_columns=rowgroup_table_columns(
-            backend.max_context_len, ratio, LOW_RATIO_PAGE_TABLE_BUCKET
-        ),
-    )
+    if use_triton_decode:
+        logits = triton_fp4_split_paged_mqa_logits(
+            q=(
+                indexer.queries(q_lora, layer.freqs_cis, positions=pos)
+                if _GFX942_INDEXER_POS_GATHER
+                else indexer.queries(q_lora, layer.freqs_cis[pos])
+            ),
+            # the split-K GEMV + scale where weights_proj_hip_max_tokens admits
+            # these rows, else head_weights
+            weights=_indexer_head_weights(indexer, x),
+            k_payload=k_payload,
+            k_scale=k_scale,
+            page_table=indexer_metadata.page_table,
+            lengths=indexer_metadata.compressed_seq_lens,
+            is_decode=True,
+        )
+    else:
+        logits = aiter_fp4_paged_mqa_logits(
+            q_fp4=q_fp4,
+            q_scale=q_scale,
+            k_payload=k_payload,
+            k_scale=k_scale,
+            weights=weights,
+            page_table=indexer_metadata.page_table,
+            c4_seq_lens=indexer_metadata.compressed_seq_lens,
+            weight_scale=1.0,
+            page_table_bucket=LOW_RATIO_PAGE_TABLE_BUCKET,
+            is_decode=True,
+            decode_workspace=metadata.fp4_low_ratio_decode_workspaces.get(ratio),
+            page8=page8,
+            rowgroup_table_columns=rowgroup_table_columns(
+                backend.max_context_len, ratio, LOW_RATIO_PAGE_TABLE_BUCKET
+            ),
+        )
     # level one is bounded on device by the compressed lengths: a captured step cannot read them back
     if two_level and indexer.uses_candidates:
         topk_within_candidate_blocks_hip(
@@ -577,6 +772,33 @@ def low_ratio_index_topk_hip_extend(
     k_scale = pool.get_index_k_fp4_scale_buffer(layer.layer_id)
     prefill_workspace = metadata.fp4_low_ratio_prefill_workspaces.get(ratio)
     page8 = pool.low_ratio_index_k_page8(layer.layer_id)
+    # gfx942 lacks mfma.scale.f32.16x16x128.f8f6f4, so the FlyDSL FP4 prefill
+    # kernel (documented gfx950) aborts in LLVM instruction selection. The
+    # source image takes the Triton kernel instead under this variable; only
+    # the branch reading it was missing here.
+    use_triton_native = (
+        not page8
+        and os.environ.get("SGLANG_DSV41_TRITON_FP4_INDEXER", "0") == "1"
+    )
+    # P6: the FlyDSL FP8 MQA logits kernel replaces the Triton FP4 one on the
+    # prefill indexer. Sits under the Triton gate, as in the source image.
+    # Resolved before tri_query because the fused-Q path needs a different one.
+    use_fp8_mqa = (
+        use_triton_native
+        and os.environ.get("SGLANG_DSV41_FP8_MQA_INDEXER", "0") == "1"
+    )
+    fused_fp8_q = use_triton_native and use_fp8_mqa and _FP8_MQA_FUSED_Q
+    # bf16 operands, not the packed fp4 pair _indexer_inputs returns
+    tri_query = (
+        (
+            indexer.queries_roped(q_lora, layer.freqs_cis[pos])
+            if fused_fp8_q
+            else indexer.queries(q_lora, layer.freqs_cis[pos])
+        )
+        if use_triton_native
+        else None
+    )
+    tri_weights = indexer.head_weights(x) if use_triton_native else None
     if page8 and not (
         isinstance(prefill_workspace, FP4RowgroupPrefillWorkspace)
         and prefill_workspace.request_page_table.shape[0] == len(extend_lens_cpu)
@@ -605,6 +827,31 @@ def low_ratio_index_topk_hip_extend(
                 req_lo=req_lo,
                 rows_per_request=rows_per_request,
                 row_ends=indexer_metadata.compressed_seq_lens[rows],
+            )
+        if use_fp8_mqa:
+            segments, seg_lo = [], 0
+            for i, n in enumerate(rows_per_request):
+                segments.append((seg_lo, seg_lo + n, lc_per_req[req_lo + i]))
+                seg_lo += n
+            return _fp8_mqa_logits_extend(
+                tri_query[rows],
+                tri_weights[rows],
+                k_payload,
+                k_scale,
+                indexer_metadata.page_table[rows],
+                indexer_metadata.compressed_seq_lens[rows],
+                segments,
+                fused_q=fused_fp8_q,
+            )
+        if use_triton_native:
+            return triton_fp4_split_paged_mqa_logits(
+                q=tri_query[rows],
+                weights=tri_weights[rows],
+                k_payload=k_payload,
+                k_scale=k_scale,
+                page_table=indexer_metadata.page_table[rows],
+                lengths=indexer_metadata.compressed_seq_lens[rows],
+                is_decode=False,
             )
         return aiter_fp4_paged_mqa_logits(
             q_fp4=q_fp4[rows],
