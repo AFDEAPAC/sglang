@@ -13,6 +13,7 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.ops.gemm.router_gemv_hip import rocm_gemv_split_k_max_tokens
+from sglang.srt.environ import envs
 
 # aiter's wave64 kernel: EPT = 384 / 64 = 6 slots per lane; the sorting network below is N == 6
 _WARP = 64
@@ -39,7 +40,7 @@ def rocm_router_max_tokens(
         n=num_experts,
         k=hidden_size,
         weight_dtype=weight_dtype,
-        allow_gfx942=os.environ.get("SGLANG_GFX942_ROUTER_SPLITK", "0") == "1",
+        allow_gfx942=envs.SGLANG_GFX942_ROUTER_SPLITK.get(),
     )
 
 

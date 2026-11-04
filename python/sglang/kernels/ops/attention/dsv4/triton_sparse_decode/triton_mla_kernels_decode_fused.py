@@ -19,6 +19,7 @@ import triton
 import triton.language as tl
 
 from sglang.srt.utils.common import is_gfx942_supported
+from sglang.srt.environ import envs
 
 # gfx942/MI300/MI325 stores e4m3fnuz (bias 8);
 # gfx950/MI350 and CUDA store OCP e4m3fn (bias 7).
@@ -62,9 +63,9 @@ NOSPLITK_TOKEN_THRESHOLD_LOW_TOPK = (
 # token, so the topk axis is the only parallelism a batch of a few tokens has;
 # measured on gfx942 at topk 512 + 128. Ported from the ali-private 20261030
 # image, env-var names included.
-SMALL_HEAD_DECODE_SPLITK = os.environ.get("SGLANG_DSV41_TRITON_ATTN_SPLITK", "0") == "1"
+SMALL_HEAD_DECODE_SPLITK = envs.SGLANG_DSV41_TRITON_ATTN_SPLITK.get()
 SMALL_HEAD_PREFILL_SPLITK = (
-    os.environ.get("SGLANG_DSV41_TRITON_ATTN_PREFILL_SPLITK", "0") == "1"
+    envs.SGLANG_DSV41_TRITON_ATTN_PREFILL_SPLITK.get()
 )
 
 # Small batch threshold: below this, split-K=4/8 for parallelism
@@ -82,26 +83,26 @@ def _parse_splitk_tiers(spec: str, default_max_tokens: int):
 
 
 SMALL_HEAD_DECODE_SPLITK_N_TIERS = _parse_splitk_tiers(
-    os.environ.get("SGLANG_DSV41_TRITON_ATTN_SPLITK_N", ""),
+    envs.SGLANG_DSV41_TRITON_ATTN_SPLITK_N.get(),
     int(os.environ.get("SGLANG_DSV41_TRITON_ATTN_SPLITK_N_MAX_TOKENS", "8")),
 )
 # PAR_COMBINE: decode combine over (token, head block, 64-wide d block) programs, any split count
-PAR_COMBINE = os.environ.get("SGLANG_DSV41_TRITON_ATTN_PAR_COMBINE", "0") == "1"
+PAR_COMBINE = envs.SGLANG_DSV41_TRITON_ATTN_PAR_COMBINE.get()
 PAR_COMBINE_BLOCK_H = int(os.environ.get("SGLANG_DSV41_TRITON_ATTN_PAR_COMBINE_BLOCK_H", "4"))
 PAR_COMBINE_WARPS = int(os.environ.get("SGLANG_DSV41_TRITON_ATTN_PAR_COMBINE_WARPS", "1"))
 # SINGLE_SPLITK: split-K 4 for the single-scope (SWA only) kernel at small batches
-SINGLE_SCOPE_SPLITK = os.environ.get("SGLANG_DSV41_TRITON_ATTN_SINGLE_SPLITK", "0") == "1"
+SINGLE_SCOPE_SPLITK = envs.SGLANG_DSV41_TRITON_ATTN_SINGLE_SPLITK.get()
 # LEAN: 8-byte scale load, 16-bit rope load and truncating fp8 * 2^k -> bf16 (exact for normal results);
 # PREFILL_LEAN applies it to the prefill split-K launch only, where its VGPR use pairs with the EXTRA_CFGS
 # (BLOCK_N 32 / 1 warp, BLOCK_N 16 / 2 warps) that keep more programs resident
 _LEAN_KV = tl.constexpr(os.environ.get("SGLANG_DSV41_TRITON_ATTN_LEAN", "0") == "1")
-PREFILL_LEAN = os.environ.get("SGLANG_DSV41_TRITON_ATTN_PREFILL_LEAN", "0") == "1"
+PREFILL_LEAN = envs.SGLANG_DSV41_TRITON_ATTN_PREFILL_LEAN.get()
 _SPLITK_EXTRA_CONFIGS = (
     [
         triton.Config({"BLOCK_H": 16, "BLOCK_N": 32}, num_warps=1, num_stages=1),
         triton.Config({"BLOCK_H": 16, "BLOCK_N": 16}, num_warps=2, num_stages=1),
     ]
-    if os.environ.get("SGLANG_DSV41_TRITON_ATTN_EXTRA_CFGS", "0") == "1"
+    if envs.SGLANG_DSV41_TRITON_ATTN_EXTRA_CFGS.get()
     else []
 )
 _SPLITK_EXTRA_KEYS = {(32, 1), (16, 2)}

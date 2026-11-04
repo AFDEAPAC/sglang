@@ -84,7 +84,7 @@ def _cuda_kernels(t: torch.Tensor) -> bool:
         or is_gfx95_supported()
         # gfx942 runs the same Triton kernels; the exclusion reads as
         # untested rather than unsupported, as it did for HC mix-stats.
-        or (_is_hip and os.environ.get("SGLANG_GFX942_ENGRAM_TRITON") == "1")
+        or (_is_hip and envs.SGLANG_GFX942_ENGRAM_TRITON.get())
     )
 
 

@@ -21,6 +21,7 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype, fp8_max
+from sglang.srt.environ import envs
 
 
 def _env_on(name: str) -> bool:
@@ -32,7 +33,7 @@ SHARED_ACT_QUANT = _env_on("SGLANG_GFX942_SHARED_ACT_QUANT")
 RMSNORM_ROW_STRIDED = _env_on("SGLANG_GFX942_RMSNORM_ROW_STRIDED")
 LOWRATIO_INDEX_CACHE = _env_on("SGLANG_GFX942_LOWRATIO_INDEX_CACHE")
 RMSNORM_PTQ = _env_on("SGLANG_GFX942_RMSNORM_PTQ")
-MOE_REUSE_PTQ = _env_on("SGLANG_GFX942_MOE_REUSE_PTQ")
+MOE_REUSE_PTQ = envs.SGLANG_GFX942_MOE_REUSE_PTQ.get()
 _RMSNORM_PTQ_LOG = _env_on("SGLANG_GFX942_RMSNORM_PTQ_LOG")
 
 logger = logging.getLogger(__name__)

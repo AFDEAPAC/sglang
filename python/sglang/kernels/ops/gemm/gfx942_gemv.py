@@ -17,6 +17,7 @@ from typing import Optional
 import torch
 import triton
 import triton.language as tl
+from sglang.srt.environ import envs
 
 
 def _env_int(name: str, default: int) -> int:
@@ -26,9 +27,9 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
-FP8_GEMV_MAX_M = _env_int("SGLANG_GFX942_FP8_GEMV_MAX_M", 0) if torch.version.hip is not None else 0
+FP8_GEMV_MAX_M = envs.SGLANG_GFX942_FP8_GEMV_MAX_M.get() if torch.version.hip is not None else 0
 # which weight layouts the GEMV takes: all, rowmajor (the unshuffled K=288 / 576 linears) or shuffled
-_FP8_GEMV_LAYOUT = os.environ.get("SGLANG_GFX942_FP8_GEMV_LAYOUT", "all")
+_FP8_GEMV_LAYOUT = envs.SGLANG_GFX942_FP8_GEMV_LAYOUT.get()
 # k-blocks of 32 per tile and the program count the split-K aims for
 _FP8_GEMV_KB = _env_int("SGLANG_GFX942_FP8_GEMV_KB", 4)
 _FP8_GEMV_PROGRAMS = _env_int("SGLANG_GFX942_FP8_GEMV_PROGRAMS", 1024)
@@ -147,7 +148,7 @@ def _split(n_blocks: int, total_tiles: int, programs=None):
     return triton.cdiv(total_tiles, tiles_per_split), tiles_per_split
 
 
-_R6_SELECTIVE = os.environ.get("SGLANG_GFX942_GEMV_SELECTIVE", "0") == "1"
+_R6_SELECTIVE = envs.SGLANG_GFX942_GEMV_SELECTIVE.get()
 _R6_LOGGED_SHAPES = set()
 
 
