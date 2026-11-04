@@ -197,7 +197,7 @@ def _lazy_ng20_enabled_for_request(sampling_params) -> bool:
     custom_params = getattr(sampling_params, "custom_params", None)
     if isinstance(custom_params, dict) and "lazy_ng20" in custom_params:
         return _lazy_bool_setting(custom_params["lazy_ng20"])
-    return _lazy_bool_setting(os.environ.get("SGLANG_LAZY_NG20"), default=False)
+    return _lazy_bool_setting(envs.SGLANG_LAZY_NG20.get(), default=False)
 
 
 # The ng20 mask only arms after 2048 tokens and corroborating loop evidence,
@@ -211,7 +211,7 @@ def _lazy_tail_enabled_for_request(sampling_params) -> bool:
     custom_params = getattr(sampling_params, "custom_params", None)
     if isinstance(custom_params, dict) and "lazy_tail_loop" in custom_params:
         return _lazy_bool_setting(custom_params["lazy_tail_loop"])
-    return _lazy_bool_setting(os.environ.get("SGLANG_LAZY_TAIL_LOOP"), default=False)
+    return _lazy_bool_setting(envs.SGLANG_LAZY_TAIL_LOOP.get(), default=False)
 
 
 # A 32-token floor keeps the previously observed token-56 short-loop catch, but
@@ -236,8 +236,8 @@ _WS_ONLY_TOKEN_IDS = None
 
 # Cheap build-wide test so an unguarded build skips the per-step refresh.
 _LAZY_GUARDS_ENABLED = _lazy_bool_setting(
-    os.environ.get("SGLANG_LAZY_NG20"), default=False
-) or _lazy_bool_setting(os.environ.get("SGLANG_LAZY_TAIL_LOOP"), default=False)
+    envs.SGLANG_LAZY_NG20.get(), default=False
+) or _lazy_bool_setting(envs.SGLANG_LAZY_TAIL_LOOP.get(), default=False)
 
 
 def _ws_only_token_ids(tokenizer):

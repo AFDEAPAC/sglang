@@ -67,7 +67,7 @@ C4_ROWGROUP_MIN_VERIFY_ROWS = 64
 # buy more row chunks. 2 GiB covers 4096 rows over ~512K tokens of context.
 _LOGITS_BUDGET_ELEMS = envs.SGLANG_DSV4_FP4_LOGITS_BUDGET_MB.get() * 2**20 // 4
 # KV positions per program iteration of the Triton decode indexer; 64 is the previous tile.
-_DECODE_BLOCK_L = int(os.environ.get("SGLANG_DSV41_DECODE_INDEXER_BLOCK_L", "128"))
+_DECODE_BLOCK_L = envs.SGLANG_DSV41_DECODE_INDEXER_BLOCK_L.get()
 _LOGITS_POOL: dict = {}
 
 

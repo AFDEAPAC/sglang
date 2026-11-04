@@ -34,7 +34,7 @@ _GFX942_FUSED_AR_MHC = (
 _GFX942_NORM_HOSTS_SINKHORN = (
     _is_hip
     and not _is_gfx95_supported
-    and get_bool_env_var("SGLANG_GFX942_NORM_HOSTS_SINKHORN", "false")
+    and envs.SGLANG_GFX942_NORM_HOSTS_SINKHORN.get()
 )
 # the hosting launch is slower than aiter's norm + a standalone sinkhorn at prefill rows (4096: 188 vs 169 us)
 _GFX942_NORM_HOSTS_SINKHORN_MAX_M = int(

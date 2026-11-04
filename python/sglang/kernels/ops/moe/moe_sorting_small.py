@@ -24,11 +24,12 @@ import triton
 import triton.language as tl
 
 from sglang.srt.utils import is_gfx95_supported
+from sglang.srt.environ import envs
 
 logger = logging.getLogger(__name__)
 
 # pairs (M * topk) up to which the single-launch sort serves; on gfx942 it is slower than aiter's from about 16 rows
-_SMALL_SORT_MAX_PAIRS = int(os.environ.get("SGLANG_GFX942_SMALL_MOE_SORT_MAX_PAIRS", "256"))
+_SMALL_SORT_MAX_PAIRS = envs.SGLANG_GFX942_SMALL_MOE_SORT_MAX_PAIRS.get()
 
 
 # P <= 64: one sort CTA does the whole P x P rank compare
@@ -533,7 +534,7 @@ _emitted_quant: ContextVar[tuple[torch.Tensor, torch.Tensor] | None] = ContextVa
 def apply_aiter_small_moe_sort_patch() -> None:
     """Patch a stock aiter so decode-sized MoE sorting (+ stage1 mxfp8 quant) is one launch."""
     if not (
-        is_gfx95_supported() or os.environ.get("SGLANG_GFX942_SMALL_MOE_SORT", "0") == "1"
+        is_gfx95_supported() or envs.SGLANG_GFX942_SMALL_MOE_SORT.get()
     ):
         return
 

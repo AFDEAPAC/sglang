@@ -32,8 +32,8 @@ wo_b_emits_mxfp8 = gfx95_dense.wo_b_emits_mxfp8
 
 _is_gfx95_supported = is_gfx95_supported()
 # gfx942 opt-ins for the gfx950 attention front/back-end fusions (Triton attention backend)
-_GFX942_FUSE_Q_ROPE = get_bool_env_var("SGLANG_GFX942_FUSE_Q_ROPE_K_STORE", "false")
-_GFX942_TRITON_INV_ROPE = get_bool_env_var("SGLANG_GFX942_TRITON_ATTN_INV_ROPE", "false")
+_GFX942_FUSE_Q_ROPE = envs.SGLANG_GFX942_FUSE_Q_ROPE_K_STORE.get()
+_GFX942_TRITON_INV_ROPE = envs.SGLANG_GFX942_TRITON_ATTN_INV_ROPE.get()
 
 
 # ---- MqaAttentionBase / MQALayer ----
@@ -176,7 +176,7 @@ def init_decoder_layer(layer, quant_config) -> None:
     layer._wqkv_a_native_consumer_checked = False
     layer._wqkv_a_native_consumer = False
     layer.hc_boundary_fused = (
-        (_is_gfx95_supported or get_bool_env_var("SGLANG_GFX942_HC_BOUNDARY_FUSED", "false"))
+        (_is_gfx95_supported or envs.SGLANG_GFX942_HC_BOUNDARY_FUSED.get())
         and layer.hc_pre_from_prev_sublayer
         and layer.hc_mult == 4
     )
@@ -192,7 +192,7 @@ def init_decoder_layer(layer, quant_config) -> None:
             from aiter.ops.flydsl import a16wmix_fused_moe
 
             a16wmix_fused_moe.prequant_provider = _gfx942_fuse.moe_input_prequant
-    if not _is_gfx95_supported and get_bool_env_var("SGLANG_GFX942_SMALL_MOE_SORT", "false"):
+    if not _is_gfx95_supported and envs.SGLANG_GFX942_SMALL_MOE_SORT.get():
         # one Triton launch sorts decode-sized routes (and zeroes moe_buf) for aiter's moe_sorting callers
         from sglang.kernels.ops.moe.moe_sorting_small import (
             apply_aiter_small_moe_sort_patch,

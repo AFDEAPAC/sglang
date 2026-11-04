@@ -378,10 +378,8 @@ _is_gfx942_supported = is_gfx942_supported()
 _is_gfx1250_supported = is_gfx1250_supported()
 # gfx942 opt-ins: V4.1's Triton wo_a decode / verify kernels and strided prefill bmm, and the side-stream
 # prepare of the compress ratio 1/2 layers at decode
-_GFX942_WO_A_TRITON = _is_gfx942_supported and get_bool_env_var("SGLANG_GFX942_WO_A_TRITON", "false")
-_GFX942_WO_A_PREFILL_BMM = _is_gfx942_supported and get_bool_env_var(
-    "SGLANG_GFX942_WO_A_PREFILL_BMM", "false"
-)
+_GFX942_WO_A_TRITON = _is_gfx942_supported and envs.SGLANG_GFX942_WO_A_TRITON.get()
+_GFX942_WO_A_PREFILL_BMM = _is_gfx942_supported and envs.SGLANG_GFX942_WO_A_PREFILL_BMM.get()
 # the split-K small-batch wo_a measured slower than hipBLASLt at T 2-8 on gfx942: verify opts in on its own
 _GFX942_WO_A_TRITON_VERIFY = _is_gfx942_supported and get_bool_env_var(
     "SGLANG_GFX942_WO_A_TRITON_VERIFY", "false"

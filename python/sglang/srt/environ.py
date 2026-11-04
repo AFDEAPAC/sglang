@@ -25,6 +25,26 @@ def _default_hip() -> bool:
         return False
 
 
+
+@functools.lru_cache(maxsize=1)
+def _default_gfx942() -> bool:
+    """Lazy gfx942 (CDNA3 / MI300X / MI325X) detection for env defaults.
+
+    Same contract as _default_hip: this module is stdlib-only and loaded very
+    early, so torch is imported inside and any failure resolves to False. Used
+    for DeepSeek-V4.1 fused paths that are validated on gfx942 and left off
+    elsewhere.
+    """
+    try:
+        import torch
+
+        if not torch.version.hip:
+            return False
+        return "gfx942" in torch.cuda.get_device_properties(0).gcnArchName
+    except Exception:
+        return False
+
+
 _NON_UTF8_PREFIX = "base64:"
 
 
@@ -1846,6 +1866,92 @@ class Envs:
     # V4.1 low-ratio decode / target-verify indexer: score with aiter's schedule-free row-group
     # FP4 MQA logits kernel, a request's verify rows sharing each key load.
     SGLANG_HIP_FP4_INDEXER_ROWGROUP = EnvBool(_default_hip)
+
+    # ------------------------------------------------------------------
+    # DeepSeek-V4.1 on gfx942 (MI300X / MI325X)
+    #
+    # Fused and split-K paths that upstream ships off because they are only
+    # validated on this architecture and model. Each was measured on the
+    # customer's 32/35-point grid; the group is worth +41.8% at batch 1,
+    # +15.4% at 16 and +9.7% at 32 against having them all off (TP4, 4096).
+    #
+    # Declared with a gfx942 default so a deployment does not have to export
+    # twenty-five variables; set any of them to 0 to isolate one for an A/B.
+    # ------------------------------------------------------------------
+
+    # Attention: split-K over the KV dimension, and the combine that follows.
+    SGLANG_DSV41_TRITON_ATTN_SPLITK = EnvBool(_default_gfx942)
+    SGLANG_DSV41_TRITON_ATTN_PREFILL_SPLITK = EnvBool(_default_gfx942)
+    SGLANG_DSV41_TRITON_ATTN_SINGLE_SPLITK = EnvBool(_default_gfx942)
+    SGLANG_DSV41_TRITON_ATTN_PAR_COMBINE = EnvBool(_default_gfx942)
+    SGLANG_DSV41_TRITON_ATTN_PREFILL_LEAN = EnvBool(_default_gfx942)
+    SGLANG_DSV41_TRITON_ATTN_EXTRA_CFGS = EnvBool(_default_gfx942)
+    SGLANG_GFX942_TRITON_ATTN_INV_ROPE = EnvBool(_default_gfx942)
+
+    # Fused kernels: fewer launches and fewer round trips through memory.
+    SGLANG_GFX942_FUSED_DSV41_RMS = EnvBool(_default_gfx942)
+    SGLANG_GFX942_FUSED_DSV41_ROPE = EnvBool(_default_gfx942)
+    SGLANG_GFX942_FUSE_Q_ROPE_K_STORE = EnvBool(_default_gfx942)
+    SGLANG_GFX942_FUSED_LOW_RATIO_COMPRESS = EnvBool(_default_gfx942)
+    SGLANG_GFX942_NORM_HOSTS_SINKHORN = EnvBool(_default_gfx942)
+
+    # Hidden-channel boundary.
+    SGLANG_GFX942_HC_BOUNDARY_FUSED = EnvBool(_default_gfx942)
+
+    # Router and sparse indexer.
+    SGLANG_GFX942_ROUTER_SPLITK = EnvBool(_default_gfx942)
+    SGLANG_GFX942_INDEXER_WEIGHTS_SPLITK = EnvBool(_default_gfx942)
+    SGLANG_GFX942_INDEXER_POS_GATHER = EnvBool(_default_gfx942)
+    SGLANG_DSV41_FP8_MQA_INDEXER = EnvBool(_default_gfx942)
+
+    # Decode-time GEMV for the non-MoE linear layers at small batch.
+    SGLANG_GFX942_GEMV_SELECTIVE = EnvBool(_default_gfx942)
+
+    # wo_a projection via Triton; the aiter batched-GEMM variant is NOT this one
+    # and regressed batch 32 from 1192.7 to 300.4, so its gfx95 gate is correct.
+    SGLANG_GFX942_WO_A_TRITON = EnvBool(_default_gfx942)
+    SGLANG_GFX942_WO_A_PREFILL_BMM = EnvBool(_default_gfx942)
+
+    # MoE expert sorting.
+    SGLANG_GFX942_SMALL_MOE_SORT = EnvBool(_default_gfx942)
+    SGLANG_GFX942_MOE_REUSE_PTQ = EnvBool(_default_gfx942)
+
+    # Fused Triton paths upstream gates to gfx95/CUDA; confirmed correct here.
+    SGLANG_GFX942_ENGRAM_TRITON = EnvBool(_default_gfx942)
+
+    # Output-quality guards taken from the GLM-5.3-Flash branch; they mask the
+    # token that would extend a degenerate tail and never truncate. Stage 1
+    # output-cap runaways 7/153 -> 4/153 at no measurable cost.
+    SGLANG_LAZY_NG20 = EnvBool(_default_gfx942)
+    SGLANG_LAZY_TAIL_LOOP = EnvBool(_default_gfx942)
+
+    # Tuned values for the same configuration. Not feature switches: each is a
+    # number swept on this model, carried here because no aiter tuned table
+    # describes attention- or sort-side parameters.
+    #
+    # split-K tiers "split:max_tokens"; batches above the last tier fall back to
+    # the kernel's own 8 (<=16) / 4 (>16), which measured best and is left alone.
+    SGLANG_DSV41_TRITON_ATTN_SPLITK_N = EnvStr(
+        lambda: "20:4,10:8" if _default_gfx942() else ""
+    )
+    # Hidden-channel decode boundary tiles.
+    SGLANG_GFX942_HC_BOUNDARY_DECODE = EnvStr(
+        lambda: "16,32,2" if _default_gfx942() else ""
+    )
+    # Decode GEMV: upper bound on M, and the weight layout. MAX_M defaults to 0
+    # upstream, which disables the path even when the switch is on.
+    SGLANG_GFX942_FP8_GEMV_MAX_M = EnvInt(lambda: 8 if _default_gfx942() else 0)
+    SGLANG_GFX942_FP8_GEMV_LAYOUT = EnvStr(
+        lambda: "rowmajor" if _default_gfx942() else "all"
+    )
+    # Small-MoE sort threshold, 256 upstream.
+    SGLANG_GFX942_SMALL_MOE_SORT_MAX_PAIRS = EnvInt(
+        lambda: 60 if _default_gfx942() else 256
+    )
+    # KV positions per decode-indexer iteration. 128 everywhere: 64 cost 29.5%
+    # and 256/512 cost 3.4%/8.3% at 63488 batch 32, so this is the measured
+    # optimum rather than an override.
+    SGLANG_DSV41_DECODE_INDEXER_BLOCK_L = EnvInt(128)
     # DeepSeek-V4 C4 decode / target-verify indexer: the same row-group kernel (aiter >= #6145),
     # its workspace built in the graph without a schedule; a request's verify rows share each
     # key load.

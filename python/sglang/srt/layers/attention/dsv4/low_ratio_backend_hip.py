@@ -89,7 +89,7 @@ _FP8_MQA_TRITON_KCONV = (
 )
 _FP8_MQA_CHECK = os.environ.get("SGLANG_DSV41_FP8_MQA_CHECK", "0") == "1"
 # gfx942 opt-in: the decode indexer's fused RoPE gathers freqs_cis[pos] itself instead of an index launch
-_GFX942_INDEXER_POS_GATHER = os.environ.get("SGLANG_GFX942_INDEXER_POS_GATHER", "0") == "1"
+_GFX942_INDEXER_POS_GATHER = envs.SGLANG_GFX942_INDEXER_POS_GATHER.get()
 
 
 def _fp8_mqa_pool(device, name, rows, tail, dtype, quantum):
@@ -785,7 +785,7 @@ def low_ratio_index_topk_hip_extend(
     # Resolved before tri_query because the fused-Q path needs a different one.
     use_fp8_mqa = (
         use_triton_native
-        and os.environ.get("SGLANG_DSV41_FP8_MQA_INDEXER", "0") == "1"
+        and envs.SGLANG_DSV41_FP8_MQA_INDEXER.get()
     )
     fused_fp8_q = use_triton_native and use_fp8_mqa and _FP8_MQA_FUSED_Q
     # bf16 operands, not the packed fp4 pair _indexer_inputs returns

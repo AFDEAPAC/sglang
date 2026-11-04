@@ -43,8 +43,7 @@ _HC_BOUNDARY_WIDE = dict(
 _HC_SINKHORN_NUM_WARPS = 4
 
 
-def _hc_boundary_env_cfg(name: str) -> Optional[Tuple[int, int, int]]:
-    raw = os.environ.get(name, "")
+def _hc_boundary_env_cfg(raw: str) -> Optional[Tuple[int, int, int]]:
     if raw in ("", "0") or is_gfx95_supported():
         return None
     block_m, block_k, num_warps = (int(v) for v in raw.split(","))
@@ -53,8 +52,8 @@ def _hc_boundary_env_cfg(name: str) -> Optional[Tuple[int, int, int]]:
 
 # gfx942 tile overrides of the Triton partial kernel as "BLOCK_M,BLOCK_K,NUM_WARPS": DECODE for M <= 16 rows,
 # PREFILL from SGLANG_GFX942_HC_BOUNDARY_PREFILL_MIN_M rows; BLOCK_K also sets the slice count the reduce sums
-_HC_BOUNDARY_GFX942_DECODE = _hc_boundary_env_cfg("SGLANG_GFX942_HC_BOUNDARY_DECODE")
-_HC_BOUNDARY_GFX942_PREFILL = _hc_boundary_env_cfg("SGLANG_GFX942_HC_BOUNDARY_PREFILL")
+_HC_BOUNDARY_GFX942_DECODE = _hc_boundary_env_cfg(envs.SGLANG_GFX942_HC_BOUNDARY_DECODE.get())
+_HC_BOUNDARY_GFX942_PREFILL = _hc_boundary_env_cfg(os.environ.get("SGLANG_GFX942_HC_BOUNDARY_PREFILL", ""))
 _HC_BOUNDARY_GFX942_PREFILL_MIN_M = int(
     os.environ.get("SGLANG_GFX942_HC_BOUNDARY_PREFILL_MIN_M", "256")
 )

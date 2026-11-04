@@ -23,6 +23,7 @@ from sglang.kernels.ops.quantization.fp4_fake_quant import (
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.utils import add_prefix, is_gfx95_supported
+from sglang.srt.environ import envs
 
 
 def _fused_dsv41_kernels(x: torch.Tensor) -> bool:
@@ -37,15 +38,15 @@ _GFX942_FUSED_INDEX_K_STORE = (
 # gfx942 opt-in to the fused RoPE launches of the CUDA / gfx950 path; their in-kernel complex multiply may round a
 # rotated element one bf16 ulp away from torch's
 _GFX942_FUSED_DSV41_ROPE = (
-    os.environ.get("SGLANG_GFX942_FUSED_DSV41_ROPE", "0") == "1" and torch.version.hip is not None
+    envs.SGLANG_GFX942_FUSED_DSV41_ROPE.get() and torch.version.hip is not None
 )
 # gfx942 opt-ins: the split-K head-weight GEMV of the gfx950 decode indexer, and the fused c1 / c2 / index-K
 # low-ratio compress kernels (software e2m1 packing), which also fix the ratio-2 weight layout
 _GFX942_INDEXER_WEIGHTS_SPLITK = (
-    os.environ.get("SGLANG_GFX942_INDEXER_WEIGHTS_SPLITK", "0") == "1" and torch.version.hip is not None
+    envs.SGLANG_GFX942_INDEXER_WEIGHTS_SPLITK.get() and torch.version.hip is not None
 )
 _GFX942_FUSED_LOW_RATIO_COMPRESS = (
-    os.environ.get("SGLANG_GFX942_FUSED_LOW_RATIO_COMPRESS", "0") == "1" and torch.version.hip is not None
+    envs.SGLANG_GFX942_FUSED_LOW_RATIO_COMPRESS.get() and torch.version.hip is not None
 )
 
 
@@ -104,7 +105,7 @@ class RMSNorm(nn.Module):
                 or (
                     x.is_cuda
                     and _gfx942_fused_dsv41_opt_in()
-                    and os.environ.get("SGLANG_GFX942_FUSED_DSV41_RMS", "0") == "1"
+                    and envs.SGLANG_GFX942_FUSED_DSV41_RMS.get()
                 )
             )
             and x.dtype in (torch.bfloat16, torch.float32)

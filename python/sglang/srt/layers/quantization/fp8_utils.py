@@ -2481,7 +2481,7 @@ _GFX942_BPRESHUFFLE_EXTRA_K = frozenset(
 
 
 # gfx942 opt-in: rowwise fp8 linears of at most this many rows run gfx942_gemv.fp8_gemv_rowwise
-_GFX942_FP8_GEMV = _is_hip and int(os.environ.get("SGLANG_GFX942_FP8_GEMV_MAX_M", "0") or 0) > 0
+_GFX942_FP8_GEMV = _is_hip and envs.SGLANG_GFX942_FP8_GEMV_MAX_M.get() > 0
 
 
 def use_aiter_bpreshuffle_gemm(
