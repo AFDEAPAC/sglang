@@ -947,5 +947,7 @@ def rmsnorm_ptq_with_sinkhorn(
             EPS=coefficients.hc_eps,
             num_warps=_HC_SINKHORN_NUM_WARPS,
         )
-    out._gfx942_ptq = (q, s, out._version)
+    from sglang.kernels.ops.quantization.gfx942_decode_fuse import _ptq_version
+
+    out._gfx942_ptq = (q, s, _ptq_version(out))
     return out
