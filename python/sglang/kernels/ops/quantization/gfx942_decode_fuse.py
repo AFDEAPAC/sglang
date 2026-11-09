@@ -24,6 +24,21 @@ from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype, fp8_max
 from sglang.srt.environ import envs
 
 
+def _ptq_version(t: torch.Tensor):
+    """``t._version``, or None when the tensor does not track one.
+
+    Tensors created under ``torch.inference_mode`` have no version counter and
+    raise on access. The PTQ cache is validated by comparing versions, so None
+    has to mean "cannot validate", never "matches" -- see
+    attached_per_token_quant, which requires a real version before it hits.
+    """
+    try:
+        return t._version
+    except Exception:
+        return None
+
+
+
 def _env_on(name: str) -> bool:
     return torch.version.hip is not None and os.environ.get(name, "0") == "1"
 
@@ -190,7 +205,7 @@ def rmsnorm_with_per_token_quant(x: torch.Tensor, weight: torch.Tensor, eps: flo
     q = torch.empty(x.shape, device=x.device, dtype=fp8_dtype)
     s = torch.empty((x.shape[0], 1), device=x.device, dtype=torch.float32)
     rmsnorm_dual_ptq(out, q, s, x, weight, eps)
-    out._gfx942_ptq = (q, s, out._version)
+    out._gfx942_ptq = (q, s, _ptq_version(out))
     return out
 
 
@@ -212,9 +227,11 @@ def attached_per_token_quant(
 ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
     """The (fp8, scale) that rmsnorm_with_per_token_quant attached to input, while it still describes input_2d."""
     ptq = getattr(input, "_gfx942_ptq", None)
+    _v = _ptq_version(input)
     hit = (
         ptq is not None
-        and ptq[2] == input._version
+        and _v is not None
+        and ptq[2] == _v
         and ptq[0].shape == input_2d.shape
         and input_2d.data_ptr() == input.data_ptr()
     )
