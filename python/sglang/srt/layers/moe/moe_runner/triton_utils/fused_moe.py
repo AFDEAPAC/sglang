@@ -763,15 +763,18 @@ def _fused_moe_kernel_sequence(
             swiglu_limit_for_triton: Optional[float] = None
             swiglu_limit_for_silu_and_mul_clamp: Optional[float] = None
 
-            if filter_expert:
+            # act_and_mul_triton applies the clamp itself and runs wherever
+            # Triton does; silu_and_mul_clamp is the fused CUDA/XPU kernel.
+            # filter_expert answers "is any expert remote", which does not say
+            # which of the two this platform can run -- at EP1 it is False, and
+            # HIP then had no path at all.
+            _clamp_via_triton = filter_expert or not (_is_cuda or _is_xpu)
+            if _clamp_via_triton:
                 swiglu_limit_for_triton = swiglu_limit
             else:
-                assert _is_cuda or _is_xpu, (
-                    "fused silu_and_mul_clamp kernel is CUDA/XPU only; HIP must disable SWIGLU_CLAMP_FUSION"
-                )
                 swiglu_limit_for_silu_and_mul_clamp = swiglu_limit
 
-            if not filter_expert:
+            if not _clamp_via_triton:
                 if swiglu_limit_for_silu_and_mul_clamp is not None:
                     from sglang.kernels.ops.activation.silu_and_mul_clamp import (
                         silu_and_mul_clamp,
