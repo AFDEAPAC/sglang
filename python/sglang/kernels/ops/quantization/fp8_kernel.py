@@ -183,6 +183,8 @@ def _per_token_group_quant_8bit_colmajor(
     y_num_columns,
     # Stride from one column to the next of y_s
     y_s_col_stride,
+    # Stride from one row to the next of y_s (1 when y_s is column-major)
+    y_s_row_stride,
     # Avoid to divide zero
     eps,
     # Information for float8
@@ -206,7 +208,7 @@ def _per_token_group_quant_8bit_colmajor(
     blocks_per_row = y_num_columns // group_size
     scale_col = g_id % blocks_per_row
     scale_row = g_id // blocks_per_row
-    y_s_ptr += scale_col * y_s_col_stride + scale_row
+    y_s_ptr += scale_col * y_s_col_stride + scale_row * y_s_row_stride
 
     cols = tl.arange(0, BLOCK)  # group_size <= BLOCK
     mask = cols < group_size
@@ -304,6 +306,7 @@ def _per_token_group_quant_8bit_raw(
             group_size,
             x.shape[1],
             x_s.stride(1),
+            x_s.stride(0),
             eps,
             bit8_min=bit8_min,
             bit8_max=bit8_max,
@@ -454,6 +457,7 @@ def _run_per_token_group_quant_8bit_kernel(
             group_size,
             x.shape[1],
             x_s.stride(1),
+            x_s.stride(0),
             eps,
             bit8_min=fp8_min,
             bit8_max=fp8_max,
