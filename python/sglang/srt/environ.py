@@ -25,16 +25,44 @@ def _default_hip() -> bool:
         return False
 
 
-
 @functools.lru_cache(maxsize=1)
 def _default_gfx942() -> bool:
-    """Lazy gfx942 (CDNA3 / MI300X / MI325X) detection for env defaults.
+    """Lazy gfx942 (CDNA3 / MI300X / MI308X / MI325X) detection for env defaults.
 
-    Same contract as _default_hip: this module is stdlib-only and loaded very
-    early, so torch is imported inside and any failure resolves to False. Used
-    for DeepSeek-V4.1 fused paths that are validated on gfx942 and left off
-    elsewhere.
+    Unlike _default_hip, which only reads ``torch.version.hip`` and so needs no
+    device, this question is about the chip -- and it must still be answerable
+    in a process that has no HIP context. sglang imports the kernel modules in
+    the launcher process before any device setup, and these switches are read at
+    module scope, so a device-dependent answer freezes as False there and the
+    forked workers inherit it: the switches go off with nothing reporting it.
+
+    Decided in the same order aiter's ``get_gfx()`` uses, so the sglang and
+    aiter halves of this configuration cannot disagree:
+
+    1. ``GPU_ARCHS`` -- what the launcher exports and aiter consults first.
+    2. the KFD topology in sysfs -- no torch, no context, no device order.
+    3. torch's device query -- last, and only if the first two said nothing.
     """
+    archs = os.environ.get("GPU_ARCHS", "").strip()
+    if archs and archs != "native":
+        # a multi-arch list builds for several chips; gfx942 being in it is the
+        # question here, not which entry a build-time caller would pick.
+        return any(a.strip() == "gfx942" for a in archs.split(";"))
+
+    try:
+        import glob
+
+        # gfx_target_version packs major/minor/step: gfx942 -> 9*10000+4*100+2.
+        for prop in glob.glob("/sys/class/kfd/kfd/topology/nodes/*/properties"):
+            with open(prop) as fh:
+                for line in fh:
+                    if line.startswith("gfx_target_version"):
+                        if line.split()[1].strip() == "90402":
+                            return True
+                        break
+    except Exception:
+        pass
+
     try:
         import torch
 
