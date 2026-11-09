@@ -103,6 +103,7 @@ from sglang.srt.utils import (
     is_npu,
 )
 from sglang.srt.utils.common import async_h2d
+from contextlib import contextmanager as _contextmanager
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -539,8 +540,29 @@ class DSparkWorkerV2(BaseSpecWorker):
             raise AttributeError(name)
         return getattr(self.target_worker, name)
 
+    @_contextmanager
     def _draft_context(self):
-        return draft_tp_context(self.draft_parallel_layout)
+        """Draft-model construction/execution scope.
+
+        Beyond the TP context, DSPARK's draft is a differently-quantized MoE
+        from the target, and the weight loader needs to know which of the two
+        it is looking at. speculative_moe_backend_context sets that flag; see
+        the int4 a16wi4 arm in quantization/fp8.py.
+        """
+        import os as _os
+        from contextlib import ExitStack as _ExitStack
+
+        from sglang.srt.layers.moe.utils import (
+            speculative_moe_a2a_backend_context,
+            speculative_moe_backend_context,
+        )
+
+        with _ExitStack() as stack:
+            stack.enter_context(draft_tp_context(self.draft_parallel_layout))
+            if _os.environ.get("SGLANG_DSV41_DSPARK_SPEC_MOE_CONTEXT", "0") == "1":
+                stack.enter_context(speculative_moe_backend_context())
+                stack.enter_context(speculative_moe_a2a_backend_context())
+            yield
 
     def alloc_memory_pool(
         self,
