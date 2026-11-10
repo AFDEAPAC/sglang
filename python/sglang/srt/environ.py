@@ -618,7 +618,7 @@ class Envs:
     SGLANG_DSPARK_FUSED_ACCEPT_TAIL = EnvBool(False)
     SGLANG_DSPARK_ACCEPT_TAIL_MIN_BS = EnvInt(1)
     SGLANG_DSPARK_ACCEPT_TAIL_MAX_BS = EnvInt(0)
-    # Static verify graphs stage the draft context-KV commit; the next draft graph
+    # Static verify graphs stage the draft KV store; the next draft graph
     # writes it on a side stream forked at its head, joined at its first KV store.
     SGLANG_DSPARK_DEFER_CONTEXT_KV = EnvBool(False)
     # DSpark draft graph: its in-graph attention-metadata prep runs on a side stream
@@ -636,8 +636,8 @@ class Envs:
     # Sampled DSpark verify accepts draw with block-wise rejection (blockwise_rejection.py:
     # exact in law, counter-based draws agree across TP ranks) instead of the classic kernel.
     SGLANG_OPT_DSV41_BLOCKWISE_REJECTION = EnvBool(False)
-    # The deferred commit's staging (hidden, write locations, positions, commit lengths)
-    # in one Triton launch instead of four copies and a fill.
+    # The deferred draft KV store's staging (write locations, positions, state slots,
+    # commit lengths) in one Triton launch instead of four copies and a fill.
     SGLANG_OPT_DSV41_DSPARK_ONE_LAUNCH_COMMIT_STAGE = EnvBool(False)
 
     # ===================================================================
