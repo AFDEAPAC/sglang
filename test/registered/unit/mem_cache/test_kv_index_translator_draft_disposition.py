@@ -321,8 +321,10 @@ class TestKVIndexTranslatorDraftDisposition(unittest.TestCase):
         draft_translator = _Shift()
         # The iteration's plan: physical ids for the fused draft's translator.
         plan = SimpleNamespace(
-            write_ids=lambda reader, cols=None: (
-                physical.clone() if reader is draft_translator else virtual.clone()
+            write_ids=lambda reader, *, kind=IdSpaceKind.FULL, cols=None: (
+                (physical.clone() if reader is draft_translator else virtual.clone())
+                if kind == IdSpaceKind.FULL
+                else None
             )
         )
         hidden = torch.randn(4, 8)
@@ -365,6 +367,10 @@ class TestKVIndexTranslatorDraftDisposition(unittest.TestCase):
         )
         worker._append_target_hidden_sequential = lambda **kw: (
             DFlashWorkerV2._append_target_hidden_sequential(worker, **kw)
+        )
+
+        self.assertIsNone(
+            DFlashWorkerV2._draft_write_ids(worker, plan, IdSpaceKind.SLIDING_WINDOW)
         )
 
         # Per-token writes (prefill).

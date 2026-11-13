@@ -30,7 +30,7 @@ from sglang.srt.lora.layers import unwrap_lora_layer
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
-from sglang.srt.mem_cache.kv_loc_plan import KVLocPlan
+from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind, KVLocPlan
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.forward_batch_info import (
@@ -1813,10 +1813,12 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         return out_tokens
 
-    def _draft_write_ids(self, plan: KVLocPlan) -> torch.Tensor:
+    def _draft_write_ids(
+        self, plan: KVLocPlan, kind: IdSpaceKind = IdSpaceKind.FULL
+    ) -> Optional[torch.Tensor]:
         """The plan's write ids as the draft pool indexes them: the target's
         physical ids for a fused draft, the virtual ids for a private one."""
-        return plan.write_ids(self.draft_model_runner.kv_index_translator)
+        return plan.write_ids(self.draft_model_runner.kv_index_translator, kind=kind)
 
     def _append_target_hidden_to_draft_kv_by_loc(
         self,
@@ -1827,6 +1829,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         cache_loc_2d: Optional[torch.Tensor] = None,
         commit_lens: Optional[torch.Tensor] = None,
         extend_lens: Optional[torch.Tensor] = None,
+        swa_cache_loc: Optional[torch.Tensor] = None,
     ) -> None:
         """Materialize target context features into the draft KV cache at explicit slots.
 
@@ -1896,9 +1899,18 @@ class DFlashWorkerV2(BaseSpecWorker):
                     "DFLASH cache_loc_2d requires commit_lens for prefix-valid writes."
                 )
 
+        if swa_cache_loc is not None and swa_cache_loc.shape != cache_loc.shape:
+            raise ValueError(
+                "DFLASH full and window cache locations must have matching shapes."
+            )
+
         device = self.model_runner.device
         if cache_loc.device != device:
             cache_loc = cache_loc.to(device, non_blocking=True)
+        if swa_cache_loc is not None:
+            swa_cache_loc = swa_cache_loc.to(
+                device=device, dtype=torch.int64, non_blocking=True
+            )
         if positions.device != device:
             positions = positions.to(device, non_blocking=True)
         if target_hidden.device != device:
@@ -1950,6 +1962,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                             ctx_hidden=ctx_hidden,
                             ctx_positions=positions,
                             ctx_cache_loc=cache_loc,
+                            ctx_swa_cache_loc=swa_cache_loc,
                             ctx_cache_loc_2d=cache_loc_2d,
                             commit_lens=commit_lens,
                         )
@@ -1975,7 +1988,15 @@ class DFlashWorkerV2(BaseSpecWorker):
 
                     self.draft_model_runner.token_to_kv_pool.set_kv_buffer_prefix_valid(
                         attn.attn,
-                        cache_loc_2d,
+                        (
+                            cache_loc_2d
+                            if swa_cache_loc is None
+                            else KVWriteLoc(
+                                cache_loc_2d,
+                                swa_loc=swa_cache_loc.view_as(cache_loc_2d),
+                                physical=True,
+                            )
+                        ),
                         commit_lens,
                         k,
                         v,
@@ -1990,6 +2011,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                         ctx_hidden=ctx_hidden,
                         ctx_positions=positions,
                         ctx_cache_loc=cache_loc,
+                        ctx_swa_cache_loc=swa_cache_loc,
                     )
                     return
                 except Exception as e:
@@ -2004,6 +2026,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 ctx_hidden=ctx_hidden,
                 ctx_positions=positions,
                 ctx_cache_loc=cache_loc,
+                ctx_swa_cache_loc=swa_cache_loc,
             )
 
     def _append_target_hidden_sequential(
@@ -2011,6 +2034,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         ctx_hidden: torch.Tensor,
         ctx_positions: torch.Tensor,
         ctx_cache_loc: torch.Tensor,
+        ctx_swa_cache_loc: Optional[torch.Tensor] = None,
     ) -> None:
         for layer in self.draft_model.layers:
             attn = layer.self_attn
@@ -2030,7 +2054,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             v = v.view(-1, attn.num_kv_heads, attn.head_dim)
             self.draft_model_runner.token_to_kv_pool.set_kv_buffer(
                 attn.attn,
-                KVWriteLoc(ctx_cache_loc, physical=True),
+                KVWriteLoc(ctx_cache_loc, swa_loc=ctx_swa_cache_loc, physical=True),
                 k,
                 v,
                 attn.attn.k_scale,
@@ -2044,6 +2068,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         ctx_cache_loc: torch.Tensor,
         ctx_cache_loc_2d: Optional[torch.Tensor] = None,
         commit_lens: Optional[torch.Tensor] = None,
+        ctx_swa_cache_loc: Optional[torch.Tensor] = None,
     ) -> None:
         """Fused KV materialization using batched projection + Triton kernel."""
         token_to_kv_pool = self.draft_model_runner.token_to_kv_pool
@@ -2059,7 +2084,15 @@ class DFlashWorkerV2(BaseSpecWorker):
             if ctx_cache_loc_2d is not None and commit_lens is not None:
                 token_to_kv_pool.set_kv_buffer_prefix_valid(
                     attn,
-                    ctx_cache_loc_2d,
+                    (
+                        ctx_cache_loc_2d
+                        if ctx_swa_cache_loc is None
+                        else KVWriteLoc(
+                            ctx_cache_loc_2d,
+                            swa_loc=ctx_swa_cache_loc.view_as(ctx_cache_loc_2d),
+                            physical=True,
+                        )
+                    ),
                     commit_lens,
                     cache_k,
                     cache_v,
@@ -2069,7 +2102,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             else:
                 token_to_kv_pool.set_kv_buffer(
                     attn,
-                    KVWriteLoc(ctx_cache_loc, physical=True),
+                    KVWriteLoc(ctx_cache_loc, swa_loc=ctx_swa_cache_loc, physical=True),
                     cache_k,
                     cache_v,
                     attn.k_scale,
@@ -2408,6 +2441,9 @@ class DFlashWorkerV2(BaseSpecWorker):
             self._append_target_hidden_to_draft_kv_by_loc(
                 target_hidden=logits_output.hidden_states,
                 cache_loc=self._draft_write_ids(kv_loc_plan),
+                swa_cache_loc=self._draft_write_ids(
+                    kv_loc_plan, IdSpaceKind.SLIDING_WINDOW
+                ),
                 positions=positions,
                 extend_lens=ctx_lens,
             )
@@ -2987,6 +3023,9 @@ class DFlashWorkerV2(BaseSpecWorker):
             target_hidden=hidden.reshape(-1, hidden.shape[-1]),
             cache_loc=cache_loc,
             cache_loc_2d=cache_loc.view(verify_out_cache_loc_2d.shape),
+            swa_cache_loc=self._draft_write_ids(
+                kv_loc_plan, IdSpaceKind.SLIDING_WINDOW
+            ),
             positions=positions,
             commit_lens=commit_lens,
         )

@@ -8,7 +8,7 @@ from sglang.kernels.ops.speculative.dspark.dspark_verify_window import (
     build_ring_commit_inject_layout,
 )
 from sglang.srt.managers.schedule_batch import ScheduleBatch
-from sglang.srt.mem_cache.kv_loc_plan import Cols, KVLocPlan
+from sglang.srt.mem_cache.kv_loc_plan import Cols, IdSpaceKind, KVLocPlan
 from sglang.srt.model_executor.forward_batch_info import compute_position
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 from sglang.srt.utils import is_pin_memory_available
@@ -101,7 +101,8 @@ class TargetHiddenKvInjector:
                 output_size=num_tokens,
             )
         # The draft KV goes to the slots the target prefill writes.
-        cache_loc = self.ids_for(self.model_runner.kv_index_translator.own_plan(batch))
+        plan = self.model_runner.kv_index_translator.own_plan(batch)
+        cache_loc = self.ids_for(plan)
         pool = self.draft_model_runner.token_to_kv_pool
         swa_loc = None
         if hasattr(pool, "set_swa_key_buffer_radix_fused_norm_rope"):
@@ -113,6 +114,11 @@ class TargetHiddenKvInjector:
                 commit_lens=None,
                 state_slot=state_slot,
                 final_pos=final_pos,
+            )
+        else:
+            swa_loc = plan.write_ids(
+                self.draft_model_runner.kv_index_translator,
+                kind=IdSpaceKind.SLIDING_WINDOW,
             )
         return PrefillPlacement(cache_loc, positions, state_slot, final_pos, swa_loc)
 
@@ -147,6 +153,7 @@ class TargetHiddenKvInjector:
         state_slot: Optional[torch.Tensor] = None,
         final_pos: Optional[torch.Tensor] = None,
         target_hidden_is_projected: bool = False,
+        kv_loc_plan: Optional[KVLocPlan] = None,
     ) -> None:
         self._inject(
             target_hidden=target_hidden,
@@ -157,6 +164,7 @@ class TargetHiddenKvInjector:
             state_slot=state_slot,
             final_pos=final_pos,
             target_hidden_is_projected=target_hidden_is_projected,
+            kv_loc_plan=kv_loc_plan,
         )
 
     def _inject(
@@ -170,6 +178,7 @@ class TargetHiddenKvInjector:
         state_slot: Optional[torch.Tensor] = None,
         final_pos: Optional[torch.Tensor] = None,
         target_hidden_is_projected: bool = False,
+        kv_loc_plan: Optional[KVLocPlan] = None,
         swa_loc: Optional[torch.Tensor] = None,
     ) -> None:
         if target_hidden is None or target_hidden.numel() == 0:
@@ -219,6 +228,13 @@ class TargetHiddenKvInjector:
             )
             return
 
+        if kv_loc_plan is not None:
+            swa_loc = kv_loc_plan.write_ids(
+                self.draft_model_runner.kv_index_translator,
+                kind=IdSpaceKind.SLIDING_WINDOW,
+            )
+        if swa_loc is not None:
+            swa_loc = swa_loc.to(device=device, dtype=torch.int64, non_blocking=True)
         with torch.inference_mode():
             self.draft_model.write_target_hidden_kv(
                 target_hidden=target_hidden,
@@ -228,6 +244,7 @@ class TargetHiddenKvInjector:
                 cache_loc_2d=cache_loc_2d,
                 commit_lens=commit_lens,
                 target_hidden_is_projected=target_hidden_is_projected,
+                swa_loc=swa_loc,
             )
 
     def _inject_mla(
@@ -406,4 +423,5 @@ class TargetHiddenKvInjector:
             cache_loc_2d=verify_cache_loc_2d,
             positions=positions_2d.reshape(-1),
             commit_lens=commit_lens,
+            kv_loc_plan=kv_loc_plan,
         )

@@ -302,6 +302,40 @@ class UnifiedDraftSWAKVPool(SWAKVPool):
             layer_id_override=pool_layer_id,
         )
 
+    def set_kv_buffer_prefix_valid(
+        self,
+        layer,
+        loc_info,
+        commit_lens: torch.Tensor,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+        k_scale: Optional[float] = None,
+        v_scale: Optional[float] = None,
+    ):
+        """Commit each request's live prefix on the layer's side, routed like
+        `set_kv_buffer`: a window layer writes through the 2-D `swa_loc`."""
+        loc, swa_loc, _ = unwrap_write_loc(loc_info)
+        physical = write_loc_is_physical(loc_info)
+        pool, pool_layer_id = self._side(layer.layer_id)
+        if pool is self.swa_kv_pool:
+            assert swa_loc is not None, (
+                "UnifiedDraftSWAKVPool.set_kv_buffer_prefix_valid: window layer "
+                "received no swa_loc."
+            )
+            side_loc = swa_loc
+        else:
+            side_loc = loc
+        pool.set_kv_buffer_prefix_valid(
+            layer,
+            KVWriteLoc(side_loc, physical=physical),
+            commit_lens,
+            cache_k,
+            cache_v,
+            k_scale,
+            v_scale,
+            layer_id_override=pool_layer_id,
+        )
+
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
         raise NotImplementedError(
             "fused draft KV relocates with the HOST pool's whole-page move; a "

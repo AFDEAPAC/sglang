@@ -3305,6 +3305,9 @@ class MHATokenToKVPool(KVCache):
         else:
             layer_id = layer.layer_id
 
+        # A routed draft pool hands its side a physical-marked write loc.
+        physical = write_loc_is_physical(loc_2d)
+        loc_2d, _, _ = unwrap_write_loc(loc_2d)
         if loc_2d.ndim != 2:
             raise ValueError(f"loc_2d must be rank-2, got shape={tuple(loc_2d.shape)}.")
         if commit_lens.ndim != 1 or commit_lens.shape[0] != loc_2d.shape[0]:
@@ -3337,9 +3340,10 @@ class MHATokenToKVPool(KVCache):
             valid_idx = torch.nonzero(valid_mask.reshape(-1), as_tuple=False).flatten()
             if valid_idx.numel() == 0:
                 return
+            valid_loc = loc_2d.reshape(-1).index_select(0, valid_idx)
             self.set_kv_buffer(
                 layer,
-                loc_2d.reshape(-1).index_select(0, valid_idx),
+                KVWriteLoc(valid_loc, physical=True) if physical else valid_loc,
                 cache_k.index_select(0, valid_idx),
                 cache_v.index_select(0, valid_idx),
                 k_scale,
