@@ -802,6 +802,20 @@ class SchedulerPPMixin:
             "next_token_ids": result.next_token_ids,
         }
 
+        if getattr(self.model_worker, "_pp_decode", False) and result.accept_lens is not None:
+            # SGLANG_K3_DSPARK_PP verify step: the accept outcome and the last
+            # stage's tail draft, for every stage.
+            draft = result.next_draft_input
+            tensor_dict["k3_spec_accept_lens"] = result.accept_lens.to(torch.int64)
+            tensor_dict["k3_spec_new_seq_lens"] = result.new_seq_lens.to(torch.int64)
+            tensor_dict["k3_spec_bonus"] = draft.bonus_tokens.to(torch.int64)
+            if draft.draft_tokens is not None:
+                tensor_dict["k3_spec_draft"] = draft.draft_tokens.to(torch.int64).contiguous()
+            if result.block_accept_lens is not None:
+                tensor_dict["k3_spec_block_accept_lens"] = result.block_accept_lens.to(
+                    torch.int64
+                )
+
         if self._pp_spec_relay and result.accept_lens is not None:
             # PP+spec verify round: earlier stages need the accept results to
             # mirror seq_lens/KV bookkeeping and the bonus token to root the
@@ -1005,6 +1019,16 @@ class SchedulerPPMixin:
                     logits_output = LogitsProcessorOutput(next_token_logits=None)
                 logits_output.auxiliary_device_output = auxiliary_output
 
+        if "k3_spec_accept_lens" in pp_outputs.tensors:
+            return self._pp_k3_dspark_verify_result(
+                batch,
+                mb_metadata,
+                pp_outputs,
+                logits_output,
+                extend_input_len_per_req,
+                extend_logprob_start_len_per_req,
+            )
+
         if self._pp_spec_relay and "spec_accept_lens" in pp_outputs.tensors:
             # PP+spec verify round. Relayed tensors align with the composition
             # that ran the forward (mb_metadata.fwd_batch snapshot); the live
@@ -1079,6 +1103,16 @@ class SchedulerPPMixin:
                 num_tokens_for_logprob_per_req=1,
                 dsa_topk_indices=pp_outputs.tensors.get("draft_dsa_topk_indices"),
             )
+            batch.spec_info = next_draft_input
+        elif batch.spec_algorithm.is_dspark() and getattr(
+            self.model_worker, "_pp_decode", False
+        ):
+            from sglang.srt.speculative.dspark_components.dspark_worker_v2 import (
+                make_pp_relay_input,
+            )
+
+            # Every stage starts the request with the sampled token and no draft.
+            next_draft_input = make_pp_relay_input(next_token_ids, batch.seq_lens, None)
             batch.spec_info = next_draft_input
         elif batch.spec_algorithm.is_dspark():
             from sglang.srt.speculative.dspark_components.dspark_draft import (
@@ -1155,6 +1189,86 @@ class SchedulerPPMixin:
         self: Scheduler, batch: ScheduleBatch, output_result: GenerationBatchResult
     ):
         self.process_batch_result(batch, output_result)
+
+    def _pp_k3_dspark_verify_result(
+        self: Scheduler,
+        batch: ScheduleBatch,
+        mb_metadata: PPBatchMetadata,
+        pp_outputs: PPProxyTensors,
+        logits_output,
+        extend_input_len_per_req,
+        extend_logprob_start_len_per_req,
+    ) -> GenerationBatchResult:
+        """SGLANG_K3_DSPARK_PP verify step, on every stage: a non-last stage commits
+        its recurrent state for the verify it ran, then every stage advances
+        seq_lens and carries the last stage's next draft. The relayed rows follow
+        the composition that ran the forward; the live batch takes them by rid."""
+        from sglang.srt.speculative.dspark_components.dspark_worker_v2 import (
+            make_pp_relay_input,
+        )
+
+        device = batch.seq_lens.device
+        fwd_batch = mb_metadata.fwd_batch if mb_metadata.fwd_batch is not None else batch
+        accept_lens = pp_outputs["k3_spec_accept_lens"].to(device)
+        new_seq_lens = pp_outputs["k3_spec_new_seq_lens"].to(device)
+        bonus = pp_outputs["k3_spec_bonus"].to(device)
+        draft = pp_outputs.tensors.get("k3_spec_draft")
+        if draft is not None:
+            draft = draft.to(device)
+        if not self.pp_group.is_last_rank and not fwd_batch.forward_mode.is_idle():
+            if fwd_batch is not batch:
+                # copy() drops tree_cache, which the tracking-grid commit needs.
+                fwd_batch.tree_cache = batch.tree_cache
+                if fwd_batch.seq_lens_cpu is not None:
+                    fwd_batch.seq_lens = fwd_batch.seq_lens_cpu.to(
+                        device=device, dtype=torch.int64
+                    )
+            self.model_worker.pp_commit_after_relay(fwd_batch, new_seq_lens, accept_lens)
+
+        fwd_rids = [req.rid for req in fwd_batch.reqs]
+        live_rids = [req.rid for req in batch.reqs]
+        if live_rids == fwd_rids:
+            batch.seq_lens = new_seq_lens
+            batch.spec_info = make_pp_relay_input(bonus, new_seq_lens, draft)
+        else:
+            row_by_rid = {rid: i for i, rid in enumerate(fwd_rids)}
+            rows = [row_by_rid.get(rid, -1) for rid in live_rids]
+            take = torch.tensor([max(r, 0) for r in rows], dtype=torch.long, device=device)
+            keep = torch.tensor([r < 0 for r in rows], dtype=torch.bool, device=device)
+            cur = batch.spec_info
+            batch.seq_lens = torch.where(keep, batch.seq_lens, new_seq_lens[take].to(batch.seq_lens.dtype))
+            live_bonus = torch.where(
+                keep, cur.bonus_tokens.to(device).view(-1).to(torch.int64), bonus[take]
+            )
+            live_draft = None
+            cur_draft = getattr(cur, "draft_tokens", None)
+            if draft is not None or cur_draft is not None:
+                width = (draft if draft is not None else cur_draft).shape[1]
+                zeros = torch.zeros((len(live_rids), width), dtype=torch.int64, device=device)
+                relayed = draft[take] if draft is not None else zeros
+                kept = cur_draft.to(device) if cur_draft is not None else zeros
+                live_draft = torch.where(keep.unsqueeze(1), kept, relayed)
+            batch.spec_info = make_pp_relay_input(live_bonus, batch.seq_lens, live_draft)
+        if batch.seq_lens_cpu is not None:
+            batch.seq_lens_cpu = batch.seq_lens.to("cpu")
+            batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
+        batch.input_ids = None
+        block_accept_lens = pp_outputs.tensors.get("k3_spec_block_accept_lens")
+        return GenerationBatchResult(
+            logits_output=logits_output,
+            pp_hidden_states_proxy_tensors=None,
+            next_token_ids=pp_outputs["next_token_ids"].to(torch.int64).cpu(),
+            accept_lens=accept_lens.cpu(),
+            block_accept_lens=(
+                block_accept_lens.cpu() if block_accept_lens is not None else None
+            ),
+            new_seq_lens=new_seq_lens,
+            speculative_num_draft_tokens=get_spec().speculative_num_draft_tokens,
+            extend_input_len_per_req=extend_input_len_per_req,
+            extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
+            can_run_cuda_graph=mb_metadata.can_run_cuda_graph,
+            fpm_timing=mb_metadata.fpm_timing,
+        )
 
     def _pp_spec_commit_relayed_accept(
         self: Scheduler,

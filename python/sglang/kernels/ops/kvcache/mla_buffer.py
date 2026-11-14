@@ -9,6 +9,12 @@ import triton.language as tl
 from sglang.kernels.jit.utils import is_arch_support_pdl
 from sglang.srt.runtime_context import get_parallel
 
+# Smallest magnitude that torch's bf16/fp32 -> fp8 .to() turns into NaN: values that
+# round past the fp8 max. Triton's cast saturates instead, so a kernel that must match
+# torch byte for byte maps |x| >= this to NaN before casting (checked over all bf16
+# patterns on gfx942 for e4m3fnuz).
+TORCH_FP8_OVERFLOW_AT = {torch.float8_e4m3fnuz: 248.0}
+
 
 @triton.jit
 def set_mla_kv_buffer_kernel(
@@ -268,7 +274,10 @@ def _set_mla_kv_buffer_impl(
     total_dim = nope_dim + rope_dim
     BLOCK = triton.next_power_of_2(total_dim)
     grid = (n_loc, 1)
-    pdl_kwargs = {"USE_GDC": True, "launch_pdl": True} if is_arch_support_pdl() else {}
+    use_pdl = is_arch_support_pdl()
+    pdl_kwargs = {"USE_GDC": use_pdl}
+    if use_pdl:
+        pdl_kwargs["launch_pdl"] = True
     set_mla_kv_buffer_kernel[grid](
         kv_buffer,
         cache_k_nope,
@@ -345,6 +354,7 @@ def set_mla_kv_buffer_fp8_quant_kernel(
     DCP_RANK: tl.constexpr = 0,
     DCP_WORLD_SIZE: tl.constexpr = 1,
     USE_GDC: tl.constexpr = False,
+    OVERFLOW_NAN_AT: tl.constexpr = 0.0,
 ):
     """Fuse BF16/FP16->FP8 cast with paged KV write."""
     pid_loc = tl.program_id(0)
@@ -391,6 +401,8 @@ def set_mla_kv_buffer_fp8_quant_kernel(
         )
         src = tl.where(is_nope, src_nope, src_rope)
 
+    if OVERFLOW_NAN_AT > 0:
+        src = tl.where(tl.abs(src) >= OVERFLOW_NAN_AT, float("nan"), src)
     # Destination pointer is FP8-typed view; tl.store performs downcast.
     tl.store(dst_ptr, src, mask=mask & is_valid)
 
@@ -408,12 +420,15 @@ def set_mla_kv_buffer_triton_fp8_quant(
     reserved_skip_index: int = 0,
     dcp_world_size: int = 1,
     dcp_rank: int = 0,
+    match_torch_overflow: bool = False,
 ):
     """Fuse BF16/FP16 MLA K quantization with paged KV write.
 
     Writes targeting ``reserved_skip_index`` are skipped. Pass -1 to disable.
     With ``dcp_world_size > 1`` the locs are DCP-widened: only this rank's slots
-    are written, at row ``loc // dcp_world_size``.
+    are written, at row ``loc // dcp_world_size``. With ``match_torch_overflow``
+    the bytes equal ``.to(fp8_dtype)`` (out-of-range values become NaN rather than
+    saturating); ``fp8_dtype`` must be in ``TORCH_FP8_OVERFLOW_AT``.
     """
     kv_buffer_fp8 = kv_buffer.view(fp8_dtype)
 
@@ -424,7 +439,10 @@ def set_mla_kv_buffer_triton_fp8_quant(
     n_loc = loc.numel()
     grid = (n_loc, triton.cdiv(total_dim, BLOCK))
 
-    pdl_kwargs = {"USE_GDC": True, "launch_pdl": True} if is_arch_support_pdl() else {}
+    use_pdl = is_arch_support_pdl()
+    pdl_kwargs = {"USE_GDC": use_pdl}
+    if use_pdl:
+        pdl_kwargs["launch_pdl"] = True
 
     set_mla_kv_buffer_fp8_quant_kernel[grid](
         kv_buffer_fp8,
@@ -440,6 +458,7 @@ def set_mla_kv_buffer_triton_fp8_quant(
         BLOCK=BLOCK,
         DCP_RANK=dcp_rank,
         DCP_WORLD_SIZE=dcp_world_size,
+        OVERFLOW_NAN_AT=TORCH_FP8_OVERFLOW_AT[fp8_dtype] if match_torch_overflow else 0.0,
         **pdl_kwargs,
     )
 

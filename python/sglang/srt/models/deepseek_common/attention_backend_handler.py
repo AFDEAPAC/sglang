@@ -181,6 +181,18 @@ def handle_attention_trtllm_mla(attn, forward_batch):
         return _dispatch_mla_subtype(attn, forward_batch)
 
 
+def _k3_prefix_lse_takes(forward_batch) -> bool:
+    """Kimi-K3 D1 (SGLANG_K3_PREFIX_LSE with the fused fp8 prefill) attends a cached
+    prefix in the aiter backend itself, chunked and on each DCP rank's shard, so an
+    extend with a prefix takes plain MHA: the model computes K/V of the new tokens
+    only, with no one-shot gather or chunked-KV loop."""
+    if not _is_hip or is_gfx95_supported() or _get_sum_extend_prefix_lens(forward_batch) == 0:
+        return False
+    from sglang.srt.layers.attention import k3_mla_prefill_fp8, k3_prefix_lse
+
+    return k3_prefix_lse.LSE_ON and k3_mla_prefill_fp8.FUSED_ON
+
+
 def handle_attention_aiter(attn, forward_batch):
     # During PCG/BCG capture on ROCm, aiter fp8 MLA prefill has no capture
     # kernels; route through the MHA path (radix_attention swaps attn_mqa for
@@ -188,6 +200,8 @@ def handle_attention_aiter(attn, forward_batch):
     if is_in_tc_piecewise_cuda_graph() or is_in_breakable_cuda_graph():
         return AttnForwardMethod.MHA
     if forward_batch.forward_mode.is_extend_without_speculative():
+        if _k3_prefix_lse_takes(forward_batch):
+            return AttnForwardMethod.MHA
         if not _support_mha_one_shot(attn, forward_batch, "aiter"):
             return AttnForwardMethod.MHA_CHUNKED_KV
         if get_parallel().dcp_enabled:

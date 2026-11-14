@@ -184,7 +184,7 @@ SGL_DEVICE void stage_wave_sum(float v, int lane, int wid, float* out) {
 
 }  // namespace radix4
 
-template <typename T, int EXPERTS, int TOPK, int BLOCK>
+template <typename T, typename TB, int EXPERTS, int TOPK, int BLOCK>
 __global__ __launch_bounds__(BLOCK) void route_radix4_kernel(__grid_constant__ const RouteRadix4Params params) {
   constexpr int WAVE = static_cast<int>(kRadix4Wave);
   constexpr int NWAVE = BLOCK / WAVE;
@@ -204,7 +204,7 @@ __global__ __launch_bounds__(BLOCK) void route_radix4_kernel(__grid_constant__ c
   const int lane = tid % WAVE;
   const int wid = tid / WAVE;
   const auto* srow = static_cast<const T*>(params.scores) + static_cast<size_t>(token) * params.stride_scores;
-  const auto* sbias = static_cast<const T*>(params.bias);
+  const auto* sbias = static_cast<const TB*>(params.bias);
 
   float sig[VPT];
   uint32_t key[VPT];
@@ -484,13 +484,18 @@ struct RouteRadix4Kernel {
     device_.set_options<kDLGPU>();
 
     auto score_dtype = SymbolicDType{};
+    auto bias_dtype = SymbolicDType{};
     TensorMatcher({M_, N_})
         .with_dtype<bf16_t, fp32_t>(score_dtype)
         .with_device(device_)
         .with_strides({-1, 1})
         .verify(scores);
-    // Rebinding the same symbolic dtype makes the bias track the scores.
-    TensorMatcher({N_}).with_dtype<bf16_t, fp32_t>(score_dtype).with_device(device_).verify(bias);
+    TensorMatcher({N_}).with_dtype<bf16_t, fp32_t>(bias_dtype).with_device(device_).verify(bias);
+    // Scores and bias share a dtype, except bf16 scores may come with an fp32 bias: the kernel widens
+    // each bf16 score exactly, so that equals feeding the scores cast to fp32.
+    RuntimeCheck(
+        score_dtype.is_type<bf16_t>() || bias_dtype.is_type<fp32_t>(),
+        "route_radix4 takes an fp32 bias with fp32 scores");
     TensorMatcher({M_, K_}).with_dtype<fp32_t>().with_device(device_).verify(out_w);
     TensorMatcher({M_, K_}).with_dtype<int32_t>().with_device(device_).verify(out_i);
 
@@ -516,10 +521,12 @@ struct RouteRadix4Kernel {
     constexpr auto kTopK = static_cast<int>(kRadix4TopK);
     constexpr auto kBlock = static_cast<int>(kRadix4Block);
     const auto device = device_.unwrap();
-    if (score_dtype.is_type<bf16_t>()) {
-      LaunchKernel(M, kBlock, device)(route_radix4_kernel<bf16_t, kExperts, kTopK, kBlock>, params);
+    if (score_dtype.is_type<bf16_t>() && bias_dtype.is_type<bf16_t>()) {
+      LaunchKernel(M, kBlock, device)(route_radix4_kernel<bf16_t, bf16_t, kExperts, kTopK, kBlock>, params);
+    } else if (score_dtype.is_type<bf16_t>()) {
+      LaunchKernel(M, kBlock, device)(route_radix4_kernel<bf16_t, fp32_t, kExperts, kTopK, kBlock>, params);
     } else {
-      LaunchKernel(M, kBlock, device)(route_radix4_kernel<fp32_t, kExperts, kTopK, kBlock>, params);
+      LaunchKernel(M, kBlock, device)(route_radix4_kernel<fp32_t, fp32_t, kExperts, kTopK, kBlock>, params);
     }
   }
 };

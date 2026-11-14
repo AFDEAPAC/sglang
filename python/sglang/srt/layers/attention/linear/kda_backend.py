@@ -4,6 +4,7 @@ from typing import Optional, Tuple, Union
 import torch
 
 from sglang.kernels.ops.attention import kda_fused_decode
+from sglang.kernels.ops.attention import kda_fused_decode_aiter_triton
 from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     causal_conv1d_fn,
     causal_conv1d_update,
@@ -893,6 +894,54 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 and onorm_gate is not None
                 and mixed_qkv.shape[0] == cache_indices.shape[0]
                 and b.ndim == 3
+                and kda_fused_decode_aiter_triton.enabled()
+                and kda_fused_decode_aiter_triton.covered(
+                    mixed_qkv,
+                    a,
+                    b[0],
+                    conv_states,
+                    ssm_states,
+                    cache_indices,
+                    onorm_gate,
+                )
+            ):
+                if self._fused_override_notice is not None:
+                    rank0_log(self._fused_override_notice)
+                    self._fused_override_notice = None
+                w_q_t, w_k_t, w_v_t, conv_bias, a_log, onorm_w, onorm_eps = fused_static
+                core_attn_out = kda_fused_decode_aiter_triton.run(
+                    mixed_qkv=mixed_qkv,
+                    a=a,
+                    b=b,
+                    conv_states=conv_states,
+                    conv_weight=layer.conv_weights,
+                    A_log=a_log,
+                    dt_bias=layer.dt_bias,
+                    lower_bound=layer.lower_bound,
+                    ssm_states=ssm_states,
+                    cache_indices=cache_indices,
+                    query_start_loc=query_start_loc,
+                    onorm_g=onorm_gate,
+                    norm_weight=onorm_w,
+                    norm_eps=onorm_eps,
+                    num_v_heads=layer.num_v_heads,
+                    head_v_dim=layer.head_v_dim,
+                )
+                layer._k3_onorm_consumed = True
+                self._track_mamba_state_decode(
+                    forward_batch,
+                    conv_states,
+                    ssm_states,
+                    cache_indices,
+                    layer.layer_id,
+                )
+                return core_attn_out
+            elif (
+                not is_hip()
+                and fused_static is not None
+                and onorm_gate is not None
+                and mixed_qkv.shape[0] == cache_indices.shape[0]
+                and b.ndim == 3
                 and kda_fused_decode.covered(
                     mixed_qkv,
                     a,
@@ -1316,12 +1365,19 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 if ring_indices is not None:
                     ring_kwargs["ring_indices"] = ring_indices
         intermediate_conv_window_cache = mamba_cache_params.intermediate_conv_window[0]
-        intermediate_state_indices = select_verify_intermediate_state_indices(
-            self.verify_intermediate_state_indices,
-            forward_batch.req_pool_indices,
-            cache_indices[: query_start_loc.shape[0] - 1] >= 0,
-            self.req_to_token_pool.size,
-        )
+        capturing = torch.cuda.is_current_stream_capturing()
+        hit = fm.verify_state_indices
+        if hit is None or hit[0] != capturing:
+            hit = fm.verify_state_indices = (
+                capturing,
+                select_verify_intermediate_state_indices(
+                    self.verify_intermediate_state_indices,
+                    forward_batch.req_pool_indices,
+                    cache_indices[: query_start_loc.shape[0] - 1] >= 0,
+                    self.req_to_token_pool.size,
+                ),
+            )
+        intermediate_state_indices = hit[1]
 
         draft_token_num = forward_batch.spec_info.draft_token_num
         ragged_layout = forward_batch.ragged_verify_layout

@@ -47,6 +47,7 @@ from sglang.kernels.ops.kvcache.cache_move import (
 from sglang.kernels.ops.kvcache.cache_ops import launch_reshape_and_cache_flash
 from sglang.kernels.ops.kvcache.kvcache import can_use_store_cache, store_cache
 from sglang.kernels.ops.kvcache.mla_buffer import (
+    TORCH_FP8_OVERFLOW_AT,
     get_mla_kv_buffer_triton,
     set_mla_kv_buffer_dcp_sharded_triton,
     set_mla_kv_buffer_triton,
@@ -4861,6 +4862,23 @@ class MLATokenToKVPool(KVCache, MLAKVView):
             "door means an attention backend took a write path that never "
             "declared which loc space it emits."
         )
+        # SGLANG_DECODE_GLUE_TAIL: fuse bf16->fp8 quant with paged MLA KV write (same as DSA path).
+        if (
+            _is_hip
+            and self.dtype == fp8_dtype
+            and self.store_dtype != self.dtype
+        ):
+            cache_k_nope = cache_k[..., : self.kv_lora_rank]
+            cache_k_rope = cache_k[..., self.kv_lora_rank :]
+            set_mla_kv_buffer_triton_fp8_quant(
+                self.kv_buffer[layer_id - self.start_layer],
+                loc,
+                cache_k_nope,
+                cache_k_rope,
+                fp8_dtype,
+            )
+            return
+
         if cache_k.dtype != self.dtype:
             cache_k = cache_k.to(self.dtype)
 
@@ -4907,6 +4925,28 @@ class MLATokenToKVPool(KVCache, MLAKVView):
             # NoPE bytes are [FP8 values | one FP32 scale per 128 values].
             # RoPE bytes contain the raw BF16 tail and may have zero width.
             self._scatter_mla_rows(dst_buffer, loc, cache_k_nope_fp8, cache_k_rope_fp8)
+        elif (
+            _is_hip
+            and envs.SGLANG_K3_MLA_KV_FUSED_CAST.get()
+            and cache_k_nope.shape[0] <= envs.SGLANG_K3_MLA_KV_FUSED_CAST_MAX_TOKENS.get()
+            and self.dtype == fp8_dtype
+            and fp8_dtype in TORCH_FP8_OVERFLOW_AT
+            and cache_k_nope.dtype != self.dtype
+            and cache_k_rope is not None
+            and cache_k_rope.numel() > 0
+        ):
+            span = self._write_loc_dcp_span
+            set_mla_kv_buffer_triton_fp8_quant(
+                dst_buffer,
+                loc,
+                cache_k_nope,
+                cache_k_rope,
+                fp8_dtype,
+                dcp_world_size=span,
+                # Resolved locs already address this rank's rows: select nothing.
+                dcp_rank=get_parallel().attn_dcp_rank if span > 1 else 0,
+                match_torch_overflow=True,
+            )
         else:
             if cache_k_nope.dtype != self.dtype:
                 cache_k_nope = cache_k_nope.to(self.dtype)

@@ -47,6 +47,7 @@ from sglang.srt.mem_cache.pool_host.page_unified import resolve_kv_host_geometry
 from sglang.srt.mem_cache.pool_host.qsa import QSAIndexerPoolHost
 from sglang.srt.mem_cache.pool_host.unified import UnifiedPageEnvelopeHostPool
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_memory, get_parallel, get_serving
 
 if TYPE_CHECKING:
@@ -1639,6 +1640,12 @@ def build_full_draft_pools(
         # Hybrid draft runners keep their sole attention layer in this sub-pool.
         pool = inner
     if pool.layer_num == 0:
+        return [], []
+    if get_parallel().attn_dcp_size > 1 and not envs.SGLANG_HICACHE_DCP_DRAFT_HOST.get():
+        logger.warning(
+            "HiCache + DCP: draft KV has no host mirror; prefixes loaded back from "
+            "host keep stale draft KV (lower acceptance, target verify unchanged)."
+        )
         return [], []
 
     controller = tree_cache.cache_controller

@@ -363,10 +363,41 @@ def rocm_absorb_v_bmm(
                     out=_bmm_buf.transpose(0, 1),
                 )
         else:
-            attn_bmm_output = torch.bmm(
-                attn_output.to(torch.bfloat16).transpose(0, 1),
-                _absorb_weight_bf16(attn.w_vc, attn.w_scale),
-            )
+            if (
+                envs.SGLANG_DECODE_MLA_ABSORB_V_BUF.get()
+                and attn.w_vc.dtype == torch.bfloat16
+                and isinstance(attn.w_scale, (int, float))
+                and attn.w_scale == 1.0
+            ):
+                batch, heads, _ = attn_output.shape
+                n_vdim = attn.w_vc.shape[2]
+                buf = getattr(attn, "_decode_absorb_v_buf", None)
+                if (
+                    buf is None
+                    or buf.shape[0] < batch
+                    or buf.shape[1] != heads
+                    or buf.shape[2] != n_vdim
+                    or buf.dtype != torch.bfloat16
+                    or buf.device != attn_output.device
+                ):
+                    attn._decode_absorb_v_buf = torch.empty(
+                        (batch, heads, n_vdim),
+                        device=attn_output.device,
+                        dtype=torch.bfloat16,
+                    )
+                    buf = attn._decode_absorb_v_buf
+                _bmm_buf = buf[:batch]
+                attn_bmm_output = _bmm_buf.transpose(0, 1)
+                torch.bmm(
+                    attn_output.transpose(0, 1),
+                    attn.w_vc,
+                    out=attn_bmm_output,
+                )
+            else:
+                attn_bmm_output = torch.bmm(
+                    attn_output.to(torch.bfloat16).transpose(0, 1),
+                    _absorb_weight_bf16(attn.w_vc, attn.w_scale),
+                )
 
     if _bmm_buf is not None:
         # _bmm_buf is already (batch, heads, dim) contiguous
@@ -1044,8 +1075,33 @@ class DeepseekMLARocmForwardMixin:
                 )
                 save_kv_cache = False
             else:
-                q = torch.cat([q_nope_out, q_pe], dim=-1)
-                k = torch.cat([k_nope, k_pe], dim=-1)
+                # K3_MLA_FUSED_PREP: both concats, the Q head pad and the fp8 KV write in
+                # one launch (skip-rope MLA, decode only).
+                from sglang.srt.layers.attention import k3_mla_fused_prep as _k3_mla_fp
+
+                q = None
+                if (
+                    _k3_mla_fp.ENABLED
+                    and self.rotary_emb is None
+                    and llama_4_scaling is None
+                    and forward_batch.forward_mode.is_decode()
+                    and not get_parallel().dcp_enabled
+                ):
+                    q = _k3_mla_fp.fused_prep(
+                        q_nope_out,
+                        q_pe,
+                        k_nope,
+                        k_pe,
+                        positions,
+                        forward_batch.out_cache_loc,
+                        get_token_to_kv_pool().get_key_buffer(self.attn_mqa.layer_id),
+                    )
+                if q is not None:
+                    k = None
+                    save_kv_cache = False
+                else:
+                    q = torch.cat([q_nope_out, q_pe], dim=-1)
+                    k = torch.cat([k_nope, k_pe], dim=-1)
 
             # Apply llama 4 scaling if provided
             if llama_4_scaling is not None:

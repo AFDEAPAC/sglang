@@ -78,7 +78,9 @@ def covered(
     topk_group: Optional[int],
 ) -> bool:
     """Specialized for K3 routing: [M, 896] row-contiguous scores, top-16,
-    ungrouped, with the bias in the score dtype (what the aiter path feeds it).
+    ungrouped, with the bias in the score dtype, or bf16 scores with an fp32
+    bias (the kernel widens each bf16 score exactly, so this equals passing the
+    scores cast to fp32).
 
     Grouped routing is excluded rather than emulated: the kernel ranks all 896
     experts at once and has no notion of masking whole groups out first.
@@ -89,7 +91,7 @@ def covered(
         and scores.size(1) == _NUM_EXPERTS
         and int(topk) == _TOPK
         and scores.dtype in (torch.bfloat16, torch.float32)
-        and bias.dtype == scores.dtype
+        and (bias.dtype == scores.dtype or (scores.dtype == torch.bfloat16 and bias.dtype == torch.float32))
         and scores.stride(1) == 1
         and bias.is_contiguous()
         and (num_expert_group or 1) == 1

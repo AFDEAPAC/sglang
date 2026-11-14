@@ -1,4 +1,7 @@
+import copy
 import logging
+import os
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, Optional, Protocol, runtime_checkable
 
 import torch
@@ -54,7 +57,9 @@ from sglang.srt.speculative.dspark_components.dspark_deferred_commit import (
 )
 from sglang.srt.speculative.dspark_components.dspark_draft import (
     DraftBlockProposer,
+    DraftBlockResult,
     make_next_draft_input,
+    resolve_draft_params,
 )
 from sglang.srt.speculative.dspark_components.dspark_draft_sampler import (
     maybe_build_draft_sampler,
@@ -152,6 +157,55 @@ def sim_draw_ahead_enabled(simulated_correct_len: Optional[torch.Tensor]) -> boo
     )
 
 
+# Kimi-K3 DSpark decode under PP: the draft lives on the last stage, which drafts
+# the next block at the tail of a step; every stage verifies the relayed block.
+_K3_DSPARK_PP = os.environ.get("SGLANG_K3_DSPARK_PP") == "1"
+
+
+@dataclass
+class DSparkPPRelayInput(DFlashDraftInputV2):
+    """SGLANG_K3_DSPARK_PP: what the last stage relays to every stage after a step,
+    per request: the bonus token, the committed length, and the gamma tokens it
+    drafted for the next verify (None until a request has been drafted for; the
+    target rejects the zero placeholders). Rows follow batch.reqs through filter /
+    merge, and prepare_for_decode reserves the two verify blocks as for any
+    DFlashDraftInputV2."""
+
+    draft_tokens: Optional[torch.Tensor] = None
+
+    def filter_batch(self, new_indices, new_indices_cpu=None):
+        super().filter_batch(new_indices, new_indices_cpu)
+        if self.draft_tokens is not None:
+            self.draft_tokens = self.draft_tokens[new_indices]
+
+    def merge_batch(self, spec_info):
+        mine, theirs = self.draft_tokens, getattr(spec_info, "draft_tokens", None)
+        n_mine = int(self.bonus_tokens.numel())
+        n_theirs = int(spec_info.bonus_tokens.numel())
+        super().merge_batch(spec_info)
+        if mine is None and theirs is None:
+            return
+        width = (mine if mine is not None else theirs).shape[1]
+        device = self.bonus_tokens.device
+        if mine is None:
+            mine = torch.zeros((n_mine, width), dtype=torch.int64, device=device)
+        if theirs is None:
+            theirs = torch.zeros((n_theirs, width), dtype=torch.int64, device=device)
+        self.draft_tokens = torch.cat([mine, theirs.to(device)], dim=0)
+
+
+def make_pp_relay_input(bonus_tokens, new_seq_lens, draft_tokens) -> DSparkPPRelayInput:
+    base = make_next_draft_input(bonus_tokens=bonus_tokens, new_seq_lens=new_seq_lens)
+    return DSparkPPRelayInput(
+        topk_p=base.topk_p,
+        topk_index=base.topk_index,
+        bonus_tokens=base.bonus_tokens,
+        new_seq_lens=base.new_seq_lens,
+        hidden_states=base.hidden_states,
+        draft_tokens=draft_tokens,
+    )
+
+
 class DSparkWorkerV2(BaseSpecWorker):
     """Non-last PP stages run only the target; draft state belongs to the last stage."""
 
@@ -189,7 +243,11 @@ class DSparkWorkerV2(BaseSpecWorker):
             envs.SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION.get()
         )
         self._hosts_draft = get_parallel().pp_group.is_last_rank
+        self._pp_decode = _K3_DSPARK_PP and get_parallel().pp_size > 1
+        self._pp_q_cache: Optional[torch.Tensor] = None
         if not self._hosts_draft:
+            if self._pp_decode:
+                self._init_pp_target_only()
             return
 
         self._draft_is_moe = draft_is_deepseek_v4()
@@ -519,6 +577,28 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         if self._is_pd_prefill and not self._draft_is_moe:
             self.draft_model.prune_to_ctx_kv_injection()
+        if self._pp_decode:
+            # Every stage builds the same verify width without the draft config.
+            assert self.verify_num_draft_tokens == get_spec().speculative_num_draft_tokens
+
+    def _init_pp_target_only(self) -> None:
+        """SGLANG_K3_DSPARK_PP non-last stage: target verify forwards on the relayed
+        block; draft, accept and sampling live on the last stage."""
+        self.verify_num_draft_tokens = int(get_spec().speculative_num_draft_tokens)
+        self.speculative_num_draft_tokens = self.verify_num_draft_tokens
+        self.gamma = self.verify_num_draft_tokens - 1
+        self._block_pos_offsets = build_block_pos_offsets(
+            length=self.verify_num_draft_tokens, device=self.device
+        )
+        self._verify_executor = TargetVerifyExecutor(
+            target_worker=self.target_worker,
+            gamma=self.gamma,
+            verify_num_draft_tokens=self.verify_num_draft_tokens,
+            model_runner=self.model_runner,
+            kv_injector=None,
+            tp_sync=SpecTpSync(get_dp_tp_group()),
+        )
+        self._need_mamba_verify_commit = False
 
     def _resolve_target_embed_tokens(self, target_model):
         if hasattr(target_model, "get_input_embeddings"):
@@ -562,6 +642,13 @@ class DSparkWorkerV2(BaseSpecWorker):
 
     def init_attention_backends(self):
         if not self._hosts_draft:
+            if self._pp_decode:
+                self._need_mamba_verify_commit = mambaish_config(
+                    self.model_runner.model_config
+                ) is not None and hasattr(
+                    self.model_runner.attn_backend,
+                    "update_mamba_state_after_mtp_verify",
+                )
             return
         with draft_pp_context(), self._draft_context():
             self._draft_worker.init_attention_backends()
@@ -757,6 +844,8 @@ class DSparkWorkerV2(BaseSpecWorker):
         *,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> GenerationBatchResult:
+        if self._pp_decode:
+            return self._pp_forward(batch, pp_proxy_tensors)
         if not self._hosts_draft:
             batch_output = self.target_worker.forward_batch_generation(
                 batch,
@@ -783,6 +872,227 @@ class DSparkWorkerV2(BaseSpecWorker):
             return self._forward_prefill(batch, on_publish, pp_proxy_tensors)
 
         return self._forward_decode(batch, on_publish, grammar_barrier)
+
+    # SGLANG_K3_DSPARK_PP: every stage verifies the block the last stage relayed;
+    # the last stage accepts, commits, and drafts the next block at the tail.
+    def _pp_forward(self, batch: ScheduleBatch, pp_proxy_tensors) -> GenerationBatchResult:
+        if batch.forward_mode.is_idle():
+            return self._decode_idle_result(on_publish=None)
+        if not (batch.forward_mode.is_extend() or batch.is_extend_in_batch):
+            return self._pp_forward_decode(batch, pp_proxy_tensors)
+        if not self._hosts_draft:
+            out = self.target_worker.forward_batch_generation(
+                batch,
+                pp_proxy_tensors=pp_proxy_tensors,
+                capture_hidden_mode=CaptureHiddenMode.FULL,
+            )
+            out.new_seq_lens = batch.seq_lens
+            return out
+        self._verify_planner.note_non_decode_step()
+        self._observers.note_prefill_step()
+        out = self._forward_prefill(batch, None, pp_proxy_tensors)
+        # A request starts with no draft: its first verify carries zero
+        # placeholders, which the one-hot q row accepts only as an exact sample.
+        self._pp_reset_q_rows(batch.req_pool_indices)
+        out.next_draft_input = make_pp_relay_input(out.next_token_ids, batch.seq_lens, None)
+        return out
+
+    def _pp_forward_decode(self, batch: ScheduleBatch, pp_proxy_tensors) -> GenerationBatchResult:
+        relay = batch.spec_info
+        if not isinstance(relay, DFlashDraftInputV2):
+            raise RuntimeError(
+                "DSpark PP decode expected the relayed DFlashDraftInputV2 state on the running batch."
+            )
+        if batch.has_grammar:
+            raise NotImplementedError("DSpark PP decode does not support grammar-constrained requests.")
+        bs = len(batch.seq_lens)
+        device = self.device
+        G = self.verify_num_draft_tokens
+        draft_tokens = getattr(relay, "draft_tokens", None)
+        if draft_tokens is None or draft_tokens.shape[0] != bs:
+            draft_tokens = torch.zeros((bs, self.gamma), dtype=torch.int64, device=device)
+        draft_tokens = draft_tokens.to(device=device, dtype=torch.int64)
+        verify_window = alloc_verify_window(
+            batch=batch,
+            bs=bs,
+            device=device,
+            verify_num_draft_tokens=G,
+            block_pos_offsets=self._block_pos_offsets,
+            model_runner=self.model_runner,
+            seq_lens_cpu=(
+                batch.seq_lens_cpu if batch.seq_lens_cpu is not None else relay.nxt_kv_lens_cpu
+            ),
+        )
+        verify_ids_2d = torch.cat(
+            [relay.bonus_tokens.view(-1, 1).to(device=device, dtype=torch.int64), draft_tokens],
+            dim=1,
+        ).contiguous()
+        prefix_lens = batch.seq_lens
+        sampling_info = batch.sampling_info
+        prepare_mamba_track_for_verify(batch)
+        target_verify = self._verify_executor.run_non_compact(
+            batch=batch,
+            draft_input=relay,
+            verify_ids_2d=verify_ids_2d,
+            verify_window=verify_window,
+            sampling_info=sampling_info if self._hosts_draft else None,
+            pp_proxy_tensors=pp_proxy_tensors,
+        )
+        if not self._hosts_draft:
+            return GenerationBatchResult(
+                pp_hidden_states_proxy_tensors=target_verify.pp_proxy,
+                can_run_cuda_graph=target_verify.can_run_cuda_graph,
+                speculative_num_draft_tokens=G,
+            )
+
+        logits_output = target_verify.logits_output
+        params = resolve_draft_params(sampling_info=sampling_info, bs=bs, device=device)
+        q_rows = (
+            None if self._greedy_draft else self._pp_q_rows(batch.req_pool_indices, sampling_info)
+        )
+        draft_block = DraftBlockResult(
+            draft_tokens=draft_tokens,
+            corrected_logits=q_rows,
+            greedy_mask=params.greedy_mask,
+            temperatures=params.temperatures,
+            # Nothing stored yet: every relayed draft is the zero placeholder, whose
+            # q row is one-hot at it, the same distribution a one-hot draft gives.
+            greedy_draft=self._greedy_draft or q_rows is None,
+        )
+        accept = self._verify_executor.accept_and_finalize(
+            folded_accept=False,
+            bs=bs,
+            verify_ids_2d=verify_ids_2d,
+            target_logits=logits_output.next_token_logits,
+            draft_block=draft_block,
+            sampling_info=sampling_info,
+            draft_input=relay,
+            layout=None,
+            prefix_lens=prefix_lens,
+            draft_tokens=draft_tokens,
+        )
+        self.model_runner.ngram_embedding_manager.update_after_verify(
+            verify_ids_2d=verify_ids_2d,
+            req_pool_indices=batch.req_pool_indices,
+            commit_lens=accept.commit_lens,
+        )
+        if batch.return_logprob:
+            compute_spec_logprobs(
+                batch, logits_output, accept.out_tokens.reshape(-1), chain_stride=G
+            )
+        self._commit_target_mamba_states_after_verify(
+            batch=batch,
+            seq_lens_pre_verify=prefix_lens,
+            seq_lens_post_verify=accept.new_seq_lens,
+            commit_lens=accept.commit_lens,
+        )
+        with self._draft_context():
+            self._verify_executor.commit_hidden(
+                batch=batch,
+                layout=None,
+                hidden_strided=None,
+                verify_window=verify_window,
+                logits_output=logits_output,
+                commit_lens=accept.commit_lens,
+                bs=bs,
+                run_compact=False,
+            )
+        logits_output.hidden_states = None
+        next_draft = self._pp_tail_draft(batch, accept, sampling_info)
+        return GenerationBatchResult(
+            logits_output=logits_output,
+            next_token_ids=accept.out_tokens.reshape(-1),
+            accept_lens=accept.commit_lens,
+            block_accept_lens=self._block_accept_lens(accept=accept, folded_accept=False, bs=bs),
+            can_run_cuda_graph=target_verify.can_run_cuda_graph,
+            next_draft_input=make_pp_relay_input(accept.bonus, accept.new_seq_lens, next_draft),
+            speculative_num_draft_tokens=G,
+            new_seq_lens=accept.new_seq_lens,
+        )
+
+    def _pp_tail_draft(self, batch: ScheduleBatch, accept, sampling_info) -> torch.Tensor:
+        """Draft the next verify block now, so every stage can verify it next step.
+        Its slots [new_seq_len, new_seq_len + G) lie inside the two verify blocks
+        DFlashDraftInputV2.prepare_for_decode reserved for this step."""
+        new_seq_lens = accept.new_seq_lens
+        bs = int(new_seq_lens.shape[0])
+        # The proposer reads many batch fields; only the lengths move.
+        view = copy.copy(batch)
+        view.seq_lens = new_seq_lens
+        view.seq_lens_cpu = new_seq_lens.cpu()
+        window = alloc_verify_window(
+            batch=view,
+            bs=bs,
+            device=self.device,
+            verify_num_draft_tokens=self.verify_num_draft_tokens,
+            block_pos_offsets=self._block_pos_offsets,
+            model_runner=self.model_runner,
+            seq_lens_cpu=view.seq_lens_cpu,
+        )
+        draft_input = make_next_draft_input(bonus_tokens=accept.bonus, new_seq_lens=new_seq_lens)
+        with self._draft_context():
+            proposal = self._proposer.propose(
+                batch=view,
+                draft_input=draft_input,
+                verify_window=window,
+                bs=bs,
+                device=self.device,
+                target_model=self.target_worker.model_runner.model,
+                sampling_info=sampling_info,
+            )
+        step_logits = proposal.draft_block.corrected_logits
+        if step_logits is not None:
+            self._pp_store_q(batch.req_pool_indices, step_logits)
+        return proposal.draft_block.draft_tokens.to(torch.int64)
+
+    def _pp_q(self, like: torch.Tensor) -> torch.Tensor:
+        """Per request slot: the step logits the relayed draft tokens were drawn from,
+        for the sampling accept. Rows start one-hot at token 0, the placeholder draft."""
+        if self._pp_q_cache is None:
+            rows = self.model_runner.req_to_token_pool.req_to_token.shape[0]
+            self._pp_q_cache = torch.full(
+                (rows, self.gamma, like.shape[-1]),
+                float("-inf"),
+                dtype=like.dtype,
+                device=self.device,
+            )
+            self._pp_q_cache[..., 0] = 0.0
+        return self._pp_q_cache
+
+    def _pp_q_rows(self, req_pool_indices, sampling_info) -> Optional[torch.Tensor]:
+        if sampling_info is None or sampling_info.is_all_greedy or self._pp_q_cache is None:
+            return None
+        return self._pp_q_cache[req_pool_indices]
+
+    def _pp_reset_q_rows(self, req_pool_indices) -> None:
+        if self._pp_q_cache is None or req_pool_indices.numel() == 0:
+            return
+        rows = self._pp_q_cache[req_pool_indices]
+        rows.fill_(float("-inf"))
+        rows[..., 0] = 0.0
+        self._pp_q_cache[req_pool_indices] = rows
+
+    def _pp_store_q(self, req_pool_indices, step_logits) -> None:
+        cache = self._pp_q(step_logits)
+        cache[req_pool_indices] = step_logits.reshape(-1, self.gamma, cache.shape[-1]).to(cache.dtype)
+
+    def pp_commit_after_relay(
+        self, fwd_batch: ScheduleBatch, seq_lens_post: torch.Tensor, commit_lens: torch.Tensor
+    ) -> None:
+        """Non-last stage: commit this stage's KDA state for the verify the last
+        stage accepted, on the forward-time batch. Linear attention addresses the
+        state by request (pp_stable_rows_enabled): the backend's forward metadata
+        now belongs to the other microbatch."""
+        if self._hosts_draft or not self._need_mamba_verify_commit:
+            return
+        commit_lens = commit_lens.to(device=fwd_batch.seq_lens.device)
+        prepare_mamba_track_for_verify(fwd_batch)
+        self._commit_target_mamba_states_after_verify(
+            batch=fwd_batch,
+            seq_lens_pre_verify=fwd_batch.seq_lens,
+            seq_lens_post_verify=seq_lens_post.to(device=fwd_batch.seq_lens.device),
+            commit_lens=commit_lens,
+        )
 
     def _forward_dp_spec_prefill_coordination(
         self, batch, plan, on_publish, grammar_barrier, pp_proxy_tensors

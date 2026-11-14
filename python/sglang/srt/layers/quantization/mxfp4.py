@@ -1039,6 +1039,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             # fused_moe selects the preshuffle_on kernel family.
             layer.w13_weight.is_shuffled = True
             layer.w2_weight.is_shuffled = True
+            if k3_situ:
+                # aiter's gfx942 a16w4 SiTU kernel cannot infer the W1 layout.
+                layer.w13_weight.gate_up_interleave = use_aiter_gu_interleave
 
             layer.w13_weight_scale = torch.nn.Parameter(
                 shuffled_w13_scale, requires_grad=False
@@ -1772,6 +1775,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         if getattr(layer.w13_weight, "is_shuffled", False):
             w13_weight.is_shuffled = True
             w2_weight.is_shuffled = True
+        if hasattr(layer.w13_weight, "gate_up_interleave"):
+            w13_weight.gate_up_interleave = layer.w13_weight.gate_up_interleave
 
         # Skip the explicit pad if x already arrives at the padded
         # hidden_size (the upstream RMSNorm fused the pad into its
@@ -1808,9 +1813,21 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 )
             ),
         )
-        return self.runner.run(
+        combine_out = self.runner.run(
             dispatch_output._replace(hidden_states=x_padded), quant_info
         )
+        # SGLANG_DECODE_GLUE_TAIL: unpad inside quant apply so layer.forward does not copy.
+        hs = combine_out.hidden_states
+        if hs.shape[-1] != x.shape[-1]:
+            hs = hs[..., : x.shape[-1]]
+            if not hs.is_contiguous():
+                hs = hs.contiguous()
+            from sglang.srt.layers.moe.token_dispatcher.standard import (
+                StandardCombineInput,
+            )
+
+            return StandardCombineInput(hidden_states=hs)
+        return combine_out
 
 
 class Mxfp4DynamicQuantMoEMethod(FusedMoEMethodBase):

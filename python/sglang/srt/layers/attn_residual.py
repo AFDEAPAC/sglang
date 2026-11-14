@@ -22,6 +22,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.utils import is_cuda, is_hip, is_npu
@@ -280,6 +281,16 @@ def _aggregate_fused(
     return out_norm(_mix_fused(prefix_sum, bank, nvb, score_proj, score_norm))
 
 
+def fp8_quant_of(x: torch.Tensor) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+    """The (fp8, per-token scale) pair an aggregation with fp8_out attached to
+    its output x, equal to aiter.per_token_quant_hip(x); None if there is none
+    or x was modified in place since."""
+    attached = getattr(x, "_k3_fp8_quant", None)
+    if attached is None or attached[2] != x._version:
+        return None
+    return attached[0], attached[1]
+
+
 def _aggregate_hip(
     prefix_sum: torch.Tensor,
     addend: Optional[torch.Tensor],
@@ -289,16 +300,50 @@ def _aggregate_hip(
     score_norm: RMSNorm,
     out_norm: Optional[RMSNorm],
     write_bank_row: bool = False,
+    fp8_out: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Single ROCm Triton kernel: the bank stays in registers so scoring and
     mixing share one read, and the pending residual add, the bank snapshot and
     the output RMSNorm all fold into the same launch. out_norm None returns the
-    pre-norm mixture instead. Returns (result, prefix)."""
+    pre-norm mixture instead. Returns (result, prefix). fp8_out also writes
+    the result's per-token fp8 quant, attached for fp8_quant_of."""
+    # K3_AITER_ATTN_RES: prefill-only dispatch to aiter's attn_res_gate, which does not
+    # fall off the register-tile cliff this kernel hits at nvb >= 5.
+    if out_norm is not None and not write_bank_row:
+        from sglang.kernels.ops.attention import attn_res_aiter as _k3_ara
+
+        if _k3_ara.wants(prefix_sum.shape[0], nvb):
+            return _k3_ara.gate(
+                prefix_sum,
+                addend,
+                bank,
+                nvb,
+                get_cw(score_proj, score_norm),
+                score_norm.variance_epsilon,
+                out_norm.weight,
+                out_norm.variance_epsilon,
+            )
     from sglang.kernels.ops.attention.attn_res_hip import attn_res_hip
 
     cw = get_cw(score_proj, score_norm)
     prefix = prefix_sum if addend is None else torch.empty_like(prefix_sum)
     out = torch.empty_like(prefix_sum)
+    num_tokens = prefix_sum.shape[0]
+    quant = (
+        fp8_out
+        and out_norm is not None
+        and num_tokens <= envs.SGLANG_ROCM_K3_FUSE_KDA_INPROJ_MAX_TOKENS.get()
+    )
+    out_q = (
+        torch.empty(out.shape, dtype=torch.float8_e4m3fnuz, device=out.device)
+        if quant
+        else None
+    )
+    out_s = (
+        torch.empty((num_tokens, 1), dtype=torch.float32, device=out.device)
+        if quant
+        else None
+    )
     attn_res_hip(
         prefix_sum,
         bank,
@@ -311,7 +356,11 @@ def _aggregate_hip(
         addend=addend,
         prefix_out=prefix,
         write_prefix=write_bank_row,
+        out_q=out_q,
+        out_s=out_s,
     )
+    if quant:
+        out._k3_fp8_quant = (out_q, out_s, out._version)
     return out, prefix
 
 
@@ -366,10 +415,11 @@ def _aggregate_fused_add(
     score_norm: RMSNorm,
     out_norm: RMSNorm,
     write_bank_row: bool = False,
+    fp8_out: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Aggregation point with a pending upstream residual add: materialize
     prefix = prefix_a + prefix_b, then aggregate. Returns (normed, prefix).
-    write_bank_row rides _aggregate (fast path only)."""
+    write_bank_row rides _aggregate (fast path only); fp8_out is hip only."""
     if _use_hip_fused(prefix_a.shape[1], nvb):
         # The hip kernel reads the prefix row anyway, so the add folds into it.
         return _aggregate_hip(
@@ -381,6 +431,7 @@ def _aggregate_fused_add(
             score_norm,
             out_norm,
             write_bank_row=write_bank_row,
+            fp8_out=fp8_out,
         )
     prefix = prefix_a + prefix_b
     return (
@@ -405,6 +456,7 @@ def _aggregate(
     score_norm: RMSNorm,
     out_norm: RMSNorm,
     write_bank_row: bool = False,
+    fp8_out: bool = False,
 ) -> torch.Tensor:
     """Single aggregation point: score → softmax → mix → norm.
 
@@ -435,6 +487,7 @@ def _aggregate(
             score_norm,
             out_norm,
             write_bank_row=write_bank_row,
+            fp8_out=fp8_out,
         )[0]
     assert not write_bank_row, "fused bank write is fast-path only"
     return _aggregate_fused(prefix_sum, bank, nvb, score_proj, score_norm, out_norm)
@@ -490,11 +543,13 @@ class AttnResidual:
         out_norm: RMSNorm,
         rows: Optional[slice] = None,
         write: bool = False,
+        fp8_out: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Aggregate; with write=True also snapshot the aggregated prefix
         (the second return value) into the next bank row — fused into the
         fast kernel (the row streams through its score pass anyway), a
-        standalone .write() copy on every other path."""
+        standalone .write() copy on every other path. fp8_out: see
+        _aggregate_hip."""
         if rows is None and self.written_on_slice:
             raise RuntimeError(
                 "a read of every row after a write of this rank's slice of "
@@ -530,6 +585,7 @@ class AttnResidual:
                 score_norm,
                 out_norm,
                 write_bank_row=fused_write,
+                fp8_out=fp8_out,
             )
             prefix = hidden_states
         else:
@@ -543,6 +599,7 @@ class AttnResidual:
                 score_norm,
                 out_norm,
                 write_bank_row=fused_write,
+                fp8_out=fp8_out,
             )
         if fused_write:
             self._count_write(rows)  # row nvb written in-kernel

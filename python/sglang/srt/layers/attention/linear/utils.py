@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import functools
+import os
 from enum import Enum
 from typing import TYPE_CHECKING, Optional
 
@@ -15,6 +17,21 @@ if TYPE_CHECKING:
 
 def pp_spec_stable_rows_enabled() -> bool:
     return envs.SGLANG_ENABLE_PP_SPEC.get()
+
+
+def pp_stable_rows_enabled() -> bool:
+    """Verify scratch and the post-verify state commit address rows by request:
+    under PP+spec a non-last stage commits a verify after the other microbatch's
+    forward, whose batch positions and forward metadata are not that verify's.
+    Kimi-K3 DSpark-PP (SGLANG_K3_DSPARK_PP) needs this without upstream's relay."""
+    return pp_spec_stable_rows_enabled() or _k3_dspark_pp()
+
+
+@functools.lru_cache(maxsize=1)
+def _k3_dspark_pp() -> bool:
+    from sglang.srt.runtime_context import get_parallel
+
+    return os.environ.get("SGLANG_K3_DSPARK_PP") == "1" and get_parallel().pp_size > 1
 
 
 class LinearAttnKernelBackend(Enum):
@@ -111,7 +128,7 @@ def resolve_linear_attn_backends(
 def select_verify_intermediate_state_indices(
     default_indices, req_pool_indices, valid, pool_size: int
 ):
-    if not pp_spec_stable_rows_enabled():
+    if not pp_stable_rows_enabled():
         return default_indices
 
     import torch

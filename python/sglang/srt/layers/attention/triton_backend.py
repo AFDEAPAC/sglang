@@ -115,6 +115,97 @@ def logit_capping_mod(logit_capping_method, logit_cap):
         raise ValueError()
 
 
+# gfx942, folded draft heads over few kv heads (fp8 pool): the stock grouped launch (BLOCK_N 32,
+# 4 warps, 1 stage, waves_per_eu 1) stays latency-bound at about 110 GB/s; this one reaches 730-850 GB/s.
+_FOLD_BLOCK_N, _FOLD_NUM_WARPS, _FOLD_NUM_STAGES, _FOLD_WAVES_PER_EU = 32, 2, 3, 2
+
+
+def _draft_fold_decode(
+    q,
+    k_buffer,
+    v_buffer,
+    o,
+    kv_indptr,
+    kv_indices,
+    attn_logits,
+    attn_lse,
+    num_kv_splits,
+    max_kv_splits,
+    sm_scale_withk,
+    v_scale,
+    logit_cap,
+    xai_temperature_len,
+    use_pdl,
+    page_size,
+):
+    """decode_attention_fwd_grouped for a non-MLA layer, with the launch above."""
+    from sglang.kernels.ops.attention import decode_attention as da
+
+    assert max_kv_splits == attn_logits.shape[2]
+    batch, head_num = q.shape[0], q.shape[1]
+    Lk, Lv = k_buffer.shape[-1], v_buffer.shape[-1]
+    kv_group_num = head_num // k_buffer.shape[-2]
+    k_slot, k_head, k_page, k_tok = da._extract_kv_strides(k_buffer, page_size)
+    v_slot, v_head, v_page, v_tok = da._extract_kv_strides(v_buffer, page_size)
+    grid = (batch, da._grouped_head_tiles(head_num, kv_group_num), max_kv_splits)
+    da._fwd_grouped_kernel_stage1[grid](
+        q,
+        k_buffer,
+        v_buffer,
+        sm_scale_withk,
+        kv_indptr,
+        kv_indices,
+        attn_logits,
+        attn_lse,
+        num_kv_splits,
+        q.stride(0),
+        q.stride(1),
+        k_slot,
+        k_head,
+        v_slot,
+        v_head,
+        k_page,
+        k_tok,
+        v_page,
+        v_tok,
+        attn_logits.stride(0),
+        attn_logits.stride(1),
+        attn_logits.stride(2),
+        kv_group_num=kv_group_num,
+        q_head_num=head_num,
+        BLOCK_DMODEL=triton.next_power_of_2(Lk),
+        BLOCK_DPE=0,
+        BLOCK_DV=triton.next_power_of_2(Lv),
+        BLOCK_N=_FOLD_BLOCK_N,
+        BLOCK_H=da._GROUPED_BLOCK_H,
+        MIN_BLOCK_KV=da._MIN_BLOCK_KV,
+        logit_cap=logit_cap,
+        xai_temperature_len=xai_temperature_len,
+        num_warps=_FOLD_NUM_WARPS,
+        num_stages=_FOLD_NUM_STAGES,
+        Lk=Lk,
+        Lv=Lv,
+        HAS_MLA=False,
+        USE_PDL=use_pdl,
+        PAGE_SIZE=page_size,
+        waves_per_eu=_FOLD_WAVES_PER_EU,
+        matrix_instr_nonkdim=16,
+        kpack=2,
+    )
+    da._decode_softmax_reducev_fwd(
+        attn_logits,
+        attn_lse,
+        q,
+        o,
+        v_scale,
+        v_buffer,
+        kv_indptr,
+        num_kv_splits,
+        max_kv_splits,
+        use_pdl=use_pdl,
+    )
+
+
 @dataclass
 class ForwardMetadata:
     attn_logits: torch.Tensor
@@ -145,6 +236,13 @@ class ForwardMetadata:
     lean_locks: Optional[torch.Tensor] = None
     # One int32, set by get_num_kv_splits when the decode seq lens are uneven
     uneven_batch: Optional[torch.Tensor] = None
+    # SGLANG_K3_DRAFT_FOLD target verify (_forward_draft_fold): KV over prefix + block,
+    # the block's queries folded into heads
+    fold_kv_indptr: Optional[torch.Tensor] = None
+    fold_kv_indices: Optional[torch.Tensor] = None
+    fold_num_kv_splits: Optional[torch.Tensor] = None
+    fold_attn_logits: Optional[torch.Tensor] = None
+    fold_attn_lse: Optional[torch.Tensor] = None
 
 
 class TritonAttnBackend(AttentionBackend):
@@ -412,6 +510,17 @@ class TritonAttnBackend(AttentionBackend):
         self._verify_mask = None
         # Tree-mask scratch is fetched from the target backend only.
         self.is_draft_runner = model_runner.is_draft_worker
+        # A non-causal draft block attends to the same keys from every query, so its
+        # TARGET_VERIFY is a split-KV decode over prefix + block with the block's queries
+        # as extra heads; extend_attention_fwd walks the whole prefix serially per
+        # (request, head), the gfx942 fallback (split-KV verify is gfx95-only).
+        self.draft_fold = self.is_draft_runner and get_bool_env_var(
+            "SGLANG_K3_DRAFT_FOLD", "false"
+        )
+        if self.draft_fold:
+            self.fold_kv_indptr = torch.zeros(
+                (max_bs + 1,), dtype=torch.int32, device=model_runner.device
+            )
 
         # Auto-detect BLOCK_M that extend_attention kernel will use for this model.
         # This is used by the scheduler's tile-budget admission logic to match
@@ -536,6 +645,30 @@ class TritonAttnBackend(AttentionBackend):
         )
         return kv_indptr
 
+    def _fill_fold(
+        self,
+        plan: IterationIds,
+        bs: int,
+        seq_lens: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        num_tokens: int,
+        kv_indices: torch.Tensor,
+        num_kv_splits: torch.Tensor,
+    ) -> torch.Tensor:
+        """KV over prefix + block for _forward_draft_fold. The block's slots are
+        req_to_token[:, seq_len : seq_len + num_tokens] (alloc_verify_window)."""
+        lens = seq_lens[:bs] + num_tokens
+        kv_indptr = self._fill_kv_indptr_and_indices(
+            plan,
+            bs,
+            lens,
+            req_pool_indices,
+            kv_indices,
+            kv_indptr=self.fold_kv_indptr[: bs + 1],
+        )
+        self.get_num_kv_splits(num_kv_splits, lens)
+        return kv_indptr
+
     def _update_decode_kv_buffers(
         self,
         plan: IterationIds,
@@ -641,6 +774,16 @@ class TritonAttnBackend(AttentionBackend):
             custom_mask[: spec_info.custom_mask.shape[0]] = spec_info.custom_mask
         else:
             custom_mask = None
+        if self.draft_fold and custom_mask is None:
+            self._fill_fold(
+                plan,
+                bs,
+                seq_lens,
+                req_pool_indices,
+                num_tokens_per_req,
+                self.cuda_graph_fold_kv_indices,
+                self.cuda_graph_num_kv_splits[:bs],
+            )
         seq_mask_len = num_tokens_per_req * (seq_lens + num_tokens_per_req)
         mask_indptr = self.mask_indptr[: bs + 1]
         mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len, dim=0)
@@ -883,6 +1026,7 @@ class TritonAttnBackend(AttentionBackend):
         aligned_window_kv_indices = None
         swa_attn_logits = None
         spec_info = forward_batch.spec_info
+        fold = {}
         # Lean decode buffers are only allocated on the decode path below; default
         # to None so the shared ForwardMetadata constructor works for extend/verify.
         lean_Mp = lean_Lp = lean_Op = lean_locks = None
@@ -1060,6 +1204,40 @@ class TritonAttnBackend(AttentionBackend):
             num_kv_splits = None
             attn_logits = None
             attn_lse = None
+            if self.draft_fold and custom_mask is None:
+                n_fold = int(forward_batch.seq_lens[:bs].sum().item()) + bs * (
+                    num_tokens_per_req
+                )
+                fold_kv_indices = torch.empty(
+                    n_fold, dtype=torch.int64, device=self.device
+                )
+                fold_num_kv_splits = torch.empty(
+                    (bs,), dtype=torch.int32, device=self.device
+                )
+                h = self.num_head * num_tokens_per_req
+                fold = dict(
+                    fold_kv_indptr=self._fill_fold(
+                        forward_batch.iteration_ids,
+                        bs,
+                        forward_batch.seq_lens,
+                        forward_batch.req_pool_indices,
+                        num_tokens_per_req,
+                        fold_kv_indices,
+                        fold_num_kv_splits,
+                    ),
+                    fold_kv_indices=fold_kv_indices,
+                    fold_num_kv_splits=fold_num_kv_splits,
+                    fold_attn_logits=torch.empty(
+                        (bs, h, self.max_kv_splits, self.v_head_dim),
+                        dtype=torch.float32,
+                        device=self.device,
+                    ),
+                    fold_attn_lse=torch.empty(
+                        (bs, h, self.max_kv_splits),
+                        dtype=torch.float32,
+                        device=self.device,
+                    ),
+                )
 
         else:
             if self.dcp_size > 1:
@@ -1156,6 +1334,7 @@ class TritonAttnBackend(AttentionBackend):
             lean_Op=lean_Op,
             lean_locks=lean_locks,
             uneven_batch=uneven_batch,
+            **fold,
         )
 
     def init_cuda_graph_state(
@@ -1232,6 +1411,12 @@ class TritonAttnBackend(AttentionBackend):
             )
         else:
             self.cuda_graph_kv_indices = kv_indices_buf
+        if self.draft_fold:
+            self.cuda_graph_fold_kv_indices = torch.zeros(
+                (max_bs * (self.max_context_len + self.num_draft_tokens)),
+                dtype=torch.int64,
+                device=self.device,
+            )
 
         # Layout is draft * (seq_len + draft) per request (seq_mask_len cumsum
         # below) -- the same bound the shared sizing covers. Read as uint8.
@@ -1328,6 +1513,23 @@ class TritonAttnBackend(AttentionBackend):
                 else None
             )
             max_extend_len = self._target_verify_num_tokens_per_req(spec_info)
+            fold = {}
+            if self.draft_fold and custom_mask is None:
+                # Target verify leaves the decode scratch unused; its first
+                # bs * max_extend_len rows hold the folded heads.
+                h = self.num_head * max_extend_len
+                n = bs * max_extend_len
+                fold = dict(
+                    fold_kv_indptr=self.fold_kv_indptr[: bs + 1],
+                    fold_kv_indices=self.cuda_graph_fold_kv_indices,
+                    fold_num_kv_splits=self.cuda_graph_num_kv_splits[:bs],
+                    fold_attn_logits=self.cuda_graph_attn_logits[:n].view(
+                        bs, h, self.max_kv_splits, self.v_head_dim
+                    ),
+                    fold_attn_lse=self.cuda_graph_attn_lse[:n].view(
+                        bs, h, self.max_kv_splits
+                    ),
+                )
             return ForwardMetadata(
                 attn_logits=None,
                 attn_lse=None,
@@ -1345,6 +1547,7 @@ class TritonAttnBackend(AttentionBackend):
                 ),
                 window_kv_offsets=self.cuda_graph_window_kv_offsets if swa else None,
                 swa_out_cache_loc=swa_out_cache_loc,
+                **fold,
             )
         elif forward_mode.is_dllm_extend():
             return ForwardMetadata(
@@ -1847,6 +2050,19 @@ class TritonAttnBackend(AttentionBackend):
             k_descale = 1.0
             v_descale = 1.0
 
+        if (
+            self.forward_metadata.fold_kv_indices is not None
+            and save_kv_cache
+            and not causal
+            and score_mod is None
+            and sinks is None
+            and sliding_window_size == -1
+            and layer.qk_head_dim == layer.v_head_dim
+        ):
+            return self._forward_draft_fold(
+                q, o, layer, k_descale, v_descale, logits_soft_cap
+            )
+
         # Split-KV EAGLE-verify fast path (ROCm/Triton). On target-verify
         # (topk=1 causal chain), run the bandwidth-efficient split-KV kernel
         # instead of the serial-prefix extend kernel. verify_splitkv_fwd()
@@ -1927,6 +2143,52 @@ class TritonAttnBackend(AttentionBackend):
         if self.dllm_attention is not None:
             return self.dllm_attention.forward_extend(layer, *args, **kwargs)
         return self.extend_attention_fwd(*args, **kwargs)
+
+    def _forward_draft_fold(self, q, o, layer, k_descale, v_descale, logit_cap):
+        # The block's K/V was saved above, so it is read back quantized like the prefix.
+        md = self.forward_metadata
+        n, h, d = md.max_extend_len, layer.tp_q_head_num, layer.qk_head_dim
+        bs = md.fold_kv_indptr.shape[0] - 1
+        qf = q.reshape(bs, n, h, d).transpose(1, 2).reshape(bs, h * n, d)
+        of = q.new_empty((bs, h * n, d))
+        k_buffer = self.kv_layers.read(layer.layer_id).key()
+        v_buffer = self.kv_layers.read(layer.layer_id).value()
+        args = (
+            qf,
+            k_buffer,
+            v_buffer,
+            of,
+            md.fold_kv_indptr,
+            md.fold_kv_indices,
+            md.fold_attn_logits,
+            md.fold_attn_lse,
+            md.fold_num_kv_splits,
+            self.max_kv_splits,
+        )
+        if self.use_mla or qf.shape[1] == v_buffer.shape[-2] or not _is_gfx942:
+            self.decode_attention_fwd(
+                *args,
+                layer.scaling,
+                k_descale,
+                v_descale,
+                logit_cap=logit_cap,
+                xai_temperature_len=layer.xai_temperature_len,
+                has_mla=self.use_mla,
+                use_pdl=self.use_pdl,
+                page_size=self.page_size,
+            )
+        else:
+            _draft_fold_decode(
+                *args,
+                layer.scaling * k_descale,
+                v_descale,
+                logit_cap,
+                layer.xai_temperature_len,
+                self.use_pdl,
+                self.page_size,
+            )
+        o.view(bs, n, h, d).copy_(of.view(bs, h, n, d).transpose(1, 2))
+        return o
 
     def _dense_one_shot_kv_indptr_for(self, forward_batch: ForwardBatch):
         """Cumulative full sequence lengths addressing the one-shot K/V rows.

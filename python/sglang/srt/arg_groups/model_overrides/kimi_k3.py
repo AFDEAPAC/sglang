@@ -13,6 +13,7 @@ from sglang.srt.arg_groups.model_override_base import (
     resolving_view,
 )
 from sglang.srt.runtime_context import get_platform
+from sglang.srt.utils import is_gfx95_supported
 
 logger = logging.getLogger(__name__)
 
@@ -100,7 +101,10 @@ def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
                 decode_attention_backend="cutedsl_mla",
             )
         elif decode_backend == "aiter":
-            _require_kimi_k3_aiter_gluon_dcp_support()
+            # gfx942 runs DCP decode on the qh64 LSE asm kernel
+            # (AiterAttnBackend.dcp_decode_head_group); Gluon MLA is gfx950-only.
+            if not (get_platform().is_hip and not is_gfx95_supported()):
+                _require_kimi_k3_aiter_gluon_dcp_support()
             # Override prefill backend to aiter by default
             # if users don't explicitly specify triton
             prefill_ab = "triton" if prefill_backend == "triton" else "aiter"
@@ -113,12 +117,22 @@ def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
                 prefill_attention_backend=prefill_ab,
                 decode_attention_backend="aiter",
             )
+            if (
+                get_platform().is_hip
+                and not is_gfx95_supported()
+                and server_args.dcp_comm_backend is None
+            ):
+                # gfx942: AllGather + ReduceScatter beats a2a with the replicated
+                # Q projection on decode (inter-token latency at concurrency 16).
+                logger.info("Kimi-K3 DCP on gfx942 uses dcp_comm_backend 'ag_rs'.")
+                overrides["dcp_comm_backend"] = "ag_rs"
         else:
             raise AssertionError(
                 f"Decode attention backend for Kimi-K3 DCP must be 'cutedsl_mla' or 'aiter', got {decode_backend!r}."
             )
 
-        if cfg.dcp_replicate_q_proj is None and cfg.dcp_comm_backend in (
+        dcp_comm_backend = overrides.get("dcp_comm_backend", cfg.dcp_comm_backend)
+        if cfg.dcp_replicate_q_proj is None and dcp_comm_backend in (
             "a2a",
             "fi_a2a",
         ):

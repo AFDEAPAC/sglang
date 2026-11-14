@@ -759,6 +759,12 @@ class Envs:
     SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH = EnvBool(False)
     # Opt-in: keep receiving prefill requests while forward results are pending.
     SGLANG_ENABLE_DISAGG_PREFILL_CONTINUOUS_INPUT_POLLING = EnvBool(False)
+    # OpenAI requests are converted (chat template + tokenization) on the default
+    # executor; 0 converts them on the event loop.
+    SGLANG_OPENAI_CONVERT_IN_EXECUTOR = EnvBool(True)
+    # Under DCP the speculative draft KV is replicated over the logical slot space;
+    # 0 skips its HiCache host mirror (no write-through of draft KV).
+    SGLANG_HICACHE_DCP_DRAFT_HOST = EnvBool(True)
     # Opt-in: retire finished prefill KV transfers while a forward result is pending.
     SGLANG_DISAGG_PREFILL_POLL_TRANSFERS_WHILE_WAITING = EnvBool(False)
     # Override NVML Confidential Computing autodetection. None = autodetect.
@@ -768,6 +774,10 @@ class Envs:
     # Radix and sparse KV caches
     # ===================================================================
     SGLANG_RADIX_FORCE_MISS = EnvBool(False)
+    # Hybrid mamba radix cache: a prefill that reaches a checkpoint-grid position past
+    # its match's branching point tracks that deeper (prompt-end) state instead of the
+    # branching point. Multi-turn requests resume from the previous turn's prompt end.
+    SGLANG_MAMBA_PREFER_PROMPT_END_CHECKPOINT = EnvBool(False)
     SGLANG_CHUNKED_PREFIX_CACHE_THRESHOLD = EnvInt(8192)
     SGLANG_MAX_KV_CHUNK_CAPACITY = EnvInt(128 * 1024)
     # Kill-switch for the shared-index (IndexShare) swap-in prefetch
@@ -1116,6 +1126,18 @@ class Envs:
     # output columns ride along nearly free.
     SGLANG_ROCM_K3_FUSE_KDA_INPROJ = EnvBool(True)
     SGLANG_ROCM_K3_FUSE_KDA_INPROJ_MAX_TOKENS = EnvInt(256)
+    # Decode copy elimination: dense 2D gate before o_norm fallback.
+    SGLANG_DECODE_KDA_GATE_COPY = EnvBool(False)
+    # Decode copy elimination: persistent routed_input scratch buffer.
+    SGLANG_DECODE_MOE_ROUTED_COPY = EnvBool(False)
+    # Decode copy elimination: persistent absorb v-BMM buffer.
+    SGLANG_DECODE_MLA_ABSORB_V_BUF = EnvBool(False)
+    # Decode copy elimination: persistent MLA Q head-pad buffer.
+    SGLANG_DECODE_MLA_HEAD_PAD_BUF = EnvBool(False)
+    # Cache MoE correction_bias dtype conversion (sglang #33838 topk hunk).
+    SGLANG_TOPK_BIAS_CACHE = EnvBool(True)
+    # K3_AITER_FUSED_KDA_PORT: aiter Triton fused KDA decode on gfx942.
+    SGLANG_AITER_FUSED_KDA_DECODE = EnvBool(False)
     # On gfx95x with SGLANG_USE_AITER=1, quantize the BF16 Qwen3.5/3.8 GDN
     # in_proj_qkvz and out_proj to MXFP4 after loading. 0 keeps them BF16.
     SGLANG_ROCM_GDN_ONLINE_MXFP4 = EnvBool(True)
@@ -2316,6 +2338,21 @@ class Envs:
     SGLANG_K3_FUSED_FRONT = EnvBool(True)
     # Use the ROCm radix-4 router for covered K3 top-k workloads.
     SGLANG_K3_RADIX4_TOPK = EnvBool(False)
+    # gfx942 DCP MLA decode on 64-head groups: build the grouped fp8 q and merge the
+    # group outputs and LSEs with one Triton kernel each (kernels/ops/attention/
+    # dcp_head_groups.py) instead of the torch pad, transpose, cat and masked_fill ops.
+    SGLANG_K3_DCP_HG_TRITON = EnvBool(False)
+    # Write bf16 MLA K rows into an fp8 KV cache with the cast inside the scatter
+    # kernel (set_mla_kv_buffer_triton_fp8_quant) instead of casting first.
+    SGLANG_K3_MLA_KV_FUSED_CAST = EnvBool(False)
+    # Rows per write up to which the fused cast is used: past ~4-6k rows (prefill
+    # chunks) the cast kernels plus the plain scatter are faster on gfx942.
+    SGLANG_K3_MLA_KV_FUSED_CAST_MAX_TOKENS = EnvInt(4096)
+    # gfx942: the attention-residual aggregate kernel also writes the per-token fp8
+    # quant of its output for the SGLANG_K3_DECODE_FP8 kda / front GEMMs, which then
+    # skip their own per_token_quant_hip (batches up to
+    # SGLANG_ROCM_K3_FUSE_KDA_INPROJ_MAX_TOKENS tokens).
+    SGLANG_K3_AGG_FP8_OUT = EnvBool(False)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_CACHE_CAPACITY = EnvInt(2)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MIN_HITS = EnvInt(2)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MAX_SEQLEN = EnvInt(6144)

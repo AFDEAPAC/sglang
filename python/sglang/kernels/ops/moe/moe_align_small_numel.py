@@ -145,7 +145,10 @@ def moe_align_small_numel(
         assert num_tokens_post_pad.is_contiguous()
         assert num_tokens_post_pad.data_ptr() % 8 == 0
     numel = topk_ids.numel()
-    pdl_kwargs = {"USE_GDC": True, "launch_pdl": True} if is_arch_support_pdl() else {}
+    use_pdl = is_arch_support_pdl()
+    pdl_kwargs = {"USE_GDC": use_pdl}
+    if use_pdl:
+        pdl_kwargs["launch_pdl"] = True
     _moe_align_small_numel_kernel[(1,)](
         topk_ids,
         sorted_token_ids,

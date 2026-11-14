@@ -22,6 +22,11 @@ import triton.language as tl
 # limit with H=7168 (one masked tile of 8192) and nvb <= 8.
 MAX_REGISTER_TILE: int = 8 * 8192
 
+# The fp8 output reproduces aiter.per_token_quant_hip on gfx942 (e4m3fnuz) bit
+# for bit: scale = amax * (1/240), inverse by v_rcp_f32, clamp by v_med3_f32,
+# convert by v_cvt_pk_fp8_f32 (aiter's fp32_to_fp8_scaled_x2).
+_FP8_FNUZ_MAX = 240.0
+
 
 @cache
 def supports_attn_res_hip(hidden_size: int, nvb: int) -> bool:
@@ -43,6 +48,8 @@ def _agg_kernel(
     cw_ptr,  # [H] fp32; score_norm weight * score_proj weight
     ow_ptr,  # [H]; out RMSNorm weight, unread when not APPLY_OUT_NORM
     out_ptr,  # [T, H]
+    out_q_ptr,  # [T, H] fp8, written when QUANT_OUT
+    out_s_ptr,  # [T] fp32 per-token scale, written when QUANT_OUT
     score_eps,
     out_eps,
     stride_pm,
@@ -51,6 +58,7 @@ def _agg_kernel(
     stride_bm,
     stride_bb,
     stride_o,
+    stride_q,
     H: tl.constexpr,
     BLOCK_H: tl.constexpr,
     NVB: tl.constexpr,
@@ -58,6 +66,9 @@ def _agg_kernel(
     HAS_ADD: tl.constexpr,
     WRITE_BANK: tl.constexpr,
     APPLY_OUT_NORM: tl.constexpr,
+    QUANT_OUT: tl.constexpr = False,
+    FP8_MAX: tl.constexpr = 240.0,
+    INV_FP8_MAX: tl.constexpr = 1.0,
 ):
     """One CTA per token: score the NVB+1 rows, softmax, mix, apply the output
     RMSNorm, all in one launch.
@@ -124,13 +135,43 @@ def _agg_kernel(
     p_w = tl.exp(p_score - m)
     inv = 1.0 / (tl.sum(b_w) + p_w)
 
-    acc = pv * (p_w * inv) + tl.sum(b_w[:, None] * inv * tile, axis=0)
+    # Explicit fma: the compiler contracts this mul+add in some variants of
+    # the kernel and not in others, which would change the output bits.
+    acc = tl.fma(pv, p_w * inv, tl.sum(b_w[:, None] * inv * tile, axis=0))
 
     if APPLY_OUT_NORM:
         scale = 1.0 / tl.sqrt(tl.sum(acc * acc) / H + out_eps)
         ow = tl.load(ow_ptr + offs, mask=mask, other=0.0).to(tl.float32)
         acc = acc * scale * ow
-    tl.store(out_ptr + t * stride_o + offs, acc.to(out_ptr.dtype.element_ty), mask=mask)
+    y = acc.to(out_ptr.dtype.element_ty)
+    tl.store(out_ptr + t * stride_o + offs, y, mask=mask)
+    if QUANT_OUT:
+        # Quantize the stored bf16 values, as a separate quant kernel would.
+        yf = y.to(tl.float32)
+        q_scale = tl.max(tl.where(mask, tl.abs(yf), 0.0)) * INV_FP8_MAX
+        inv = tl.inline_asm_elementwise(
+            "v_rcp_f32 $0, $1", "=v,v", [q_scale], dtype=tl.float32, is_pure=True, pack=1
+        )
+        lo = tl.full([BLOCK_H], -FP8_MAX, tl.float32)
+        hi = tl.full([BLOCK_H], FP8_MAX, tl.float32)
+        qf = tl.inline_asm_elementwise(
+            "v_med3_f32 $0, $1, $2, $3",
+            "=v,v,v,v",
+            [yf * inv, lo, hi],
+            dtype=tl.float32,
+            is_pure=True,
+            pack=1,
+        )
+        packed = tl.inline_asm_elementwise(
+            "v_cvt_pk_fp8_f32 $0, $1, $1", "=v,v", [qf], dtype=tl.int32, is_pure=True, pack=1
+        )
+        q = packed.to(tl.uint8).to(out_q_ptr.dtype.element_ty, bitcast=True)
+        # Cap the store at 8 contiguous bytes: a 16-byte fp8 store makes the
+        # compiler give every thread 16 elements instead of 8, which reorders
+        # the reductions above and changes the bf16 output.
+        offs_q = tl.max_contiguous(tl.multiple_of(offs, 8), 8)
+        tl.store(out_q_ptr + t * stride_q + offs_q, q, mask=mask)
+        tl.store(out_s_ptr + t, q_scale)
 
 
 def attn_res_hip(
@@ -146,6 +187,8 @@ def attn_res_hip(
     addend: Optional[torch.Tensor] = None,
     prefix_out: Optional[torch.Tensor] = None,
     write_prefix: bool = False,
+    out_q: Optional[torch.Tensor] = None,
+    out_s: Optional[torch.Tensor] = None,
 ) -> None:
     """Single-kernel attention-residual aggregation for ROCm.
 
@@ -169,6 +212,8 @@ def attn_res_hip(
     write_prefix : also snapshot the prefix row into bank[:, nvb, :] (bit-exact
                  copy, fused into the score pass which already has the row in
                  registers); requires NB > nvb
+    out_q, out_s : [T, H] float8_e4m3fnuz and [T, 1] fp32 buffers receiving
+                 aiter.per_token_quant_hip(out) bit for bit (gfx942 only)
     """
     T, H = prefix_sum.shape
     assert nvb >= 1, "nvb == 0 has nothing to aggregate; the caller must handle it"
@@ -178,6 +223,10 @@ def attn_res_hip(
     )
     has_add = addend is not None
     assert not has_add or prefix_out is not None, "addend requires prefix_out"
+    quant_out = out_q is not None
+    if quant_out:
+        assert out_s is not None and out_q.dtype == torch.float8_e4m3fnuz
+        assert out_q.shape == out.shape and out_q.stride(1) == 1 and out_s.is_contiguous()
 
     # Triton needs a real pointer for every argument; the flags decide whether
     # these are ever dereferenced.
@@ -185,6 +234,11 @@ def attn_res_hip(
     prefix_out_arg = prefix_out if has_add else prefix_sum
     ow_arg = ow if ow is not None else cw
 
+    import os as _os_agg
+    _nw = int(_os_agg.environ.get("SGLANG_K3_AGG_NUM_WARPS", "4"))
+    if not getattr(_os_agg, "_k3_agg_nw_announced", False):
+        print(f"[k3-agg-warps] n={_nw}", flush=True)
+        _os_agg._k3_agg_nw_announced = True
     _agg_kernel[(T,)](
         prefix_sum,
         addend_arg,
@@ -193,6 +247,8 @@ def attn_res_hip(
         cw,
         ow_arg,
         out,
+        out_q if quant_out else out,
+        out_s if quant_out else cw,
         score_eps,
         out_eps,
         prefix_sum.stride(0),
@@ -201,6 +257,7 @@ def attn_res_hip(
         bank.stride(0),
         bank.stride(1),
         out.stride(0),
+        out_q.stride(0) if quant_out else 0,
         H=H,
         BLOCK_H=triton.next_power_of_2(H),
         NVB=nvb,
@@ -208,5 +265,8 @@ def attn_res_hip(
         HAS_ADD=has_add,
         WRITE_BANK=write_prefix,
         APPLY_OUT_NORM=ow is not None,
-        num_warps=4,
+        QUANT_OUT=quant_out,
+        FP8_MAX=_FP8_FNUZ_MAX,
+        INV_FP8_MAX=1.0 / _FP8_FNUZ_MAX,
+        num_warps=_nw,
     )

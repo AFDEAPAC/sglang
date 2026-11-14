@@ -2651,7 +2651,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                         req.kv.mamba_next_track_idx
                     )
                 )
-            if req.mamba_branching_seqlen is not None:
+            if req.mamba_branching_seqlen is not None and not (
+                envs.SGLANG_MAMBA_PREFER_PROMPT_END_CHECKPOINT.get()
+                and mamba_track_seqlen_aligned > req.mamba_branching_seqlen
+            ):
                 # track branching point in this forward if the branching point
                 # is within the current extend batch.
                 branching_seqlen_aligned_mask = (

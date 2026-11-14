@@ -13,6 +13,7 @@ from fastapi.responses import ORJSONResponse, StreamingResponse
 
 from sglang.srt.entrypoints.openai.encoding_dsv32 import DS32EncodingError
 from sglang.srt.entrypoints.openai.protocol import ErrorResponse, OpenAIServingRequest
+from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
 from sglang.srt.observability.req_time_stats import monotonic_time
 from sglang.srt.runtime_context import get_observability
@@ -98,10 +99,15 @@ class OpenAIServingBase(ABC):
 
             # Convert off-loop: jinja render + full-prompt tokenization blocks
             # the loop on long prompts, and the rust tokenizer releases the GIL.
-            loop = asyncio.get_running_loop()
-            adapted_request, processed_request = await loop.run_in_executor(
-                None, self._convert_to_internal_request, request, raw_request
-            )
+            if envs.SGLANG_OPENAI_CONVERT_IN_EXECUTOR.get():
+                loop = asyncio.get_running_loop()
+                adapted_request, processed_request = await loop.run_in_executor(
+                    None, self._convert_to_internal_request, request, raw_request
+                )
+            else:
+                adapted_request, processed_request = self._convert_to_internal_request(
+                    request, raw_request
+                )
 
             if isinstance(adapted_request, (GenerateReqInput, EmbeddingReqInput)):
                 # Only set timing fields if adapted_request supports them

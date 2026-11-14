@@ -713,7 +713,7 @@ def _handle_dspark(server_args: ServerArgs) -> None:
                 f"(got {cfg.speculative_moe_a2a_backend!r})."
             )
 
-    if cfg.pp_size != 1:
+    if cfg.pp_size != 1 and os.environ.get("SGLANG_K3_DSPARK_PP") != "1":
         if cfg.disaggregation_mode != "prefill":
             raise ValueError(
                 "DSpark pipeline parallelism requires PD prefill; "

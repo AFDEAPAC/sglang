@@ -21,7 +21,7 @@ from sglang.srt.layers.attention.base_attn_backend import (
     AttentionBackend,
     SharedReadEnds,
 )
-from sglang.srt.layers.attention.linear.utils import pp_spec_stable_rows_enabled
+from sglang.srt.layers.attention.linear.utils import pp_stable_rows_enabled
 from sglang.srt.layers.attention.mamba.mamba import MambaMixer2
 from sglang.srt.layers.attention.mamba.mamba2_metadata import (
     ForwardMetadata,
@@ -1589,7 +1589,7 @@ class HybridLinearAttnBackend(AttentionBackend):
         """Commit accepted Mamba states; PP rows identify the delayed batch."""
         request_number = last_correct_step_indices.shape[0]
         src_indices_raw = None
-        if pp_spec_stable_rows_enabled() and req_pool_indices is not None:
+        if pp_stable_rows_enabled() and req_pool_indices is not None:
             src_indices_raw = req_pool_indices[:request_number]
 
         # `mamba_track_indices` is VIRTUAL; the scatter writes physical views.

@@ -82,6 +82,9 @@ class ForwardMetadata:
     # a cuda-graph capture then holds one build instead of one per layer.
     fused_accept_state_indices: Optional[torch.Tensor] = None
     fused_accept_num_accepted: Optional[torch.Tensor] = None
+    # (built under capture, verify intermediate-state rows): one build per
+    # forward like the above; a capture does not reuse its eager warmup's.
+    verify_state_indices: Optional[tuple] = None
 
     has_mamba_track_mask: bool = False
     mamba_track_mask_indices: Optional[torch.Tensor] = None

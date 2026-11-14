@@ -124,7 +124,21 @@ def check_pipeline_parallel_compat(cfg: Any) -> None:
     assert cfg.disable_overlap_schedule, (
         "Pipeline parallelism is not compatible with overlap schedule"
     )
-    if cfg.speculative_algorithm == "DSPARK":
+    if cfg.speculative_algorithm == "DSPARK" and os.environ.get("SGLANG_K3_DSPARK_PP") == "1":
+        # Kimi-K3 DSpark-PP relays its own per-request state (DSparkPPRelayInput).
+        assert cfg.disaggregation_mode == "null", (
+            "SGLANG_K3_DSPARK_PP is not compatible with --disaggregation-mode"
+        )
+        assert not envs.SGLANG_ENABLE_PP_SPEC.get(), (
+            "SGLANG_K3_DSPARK_PP and SGLANG_ENABLE_PP_SPEC are exclusive"
+        )
+        assert not cfg.speculative_adaptive, (
+            "SGLANG_K3_DSPARK_PP is not compatible with --speculative-adaptive"
+        )
+        assert not attn_dp_enabled_of(cfg), (
+            "SGLANG_K3_DSPARK_PP is not compatible with attention DP"
+        )
+    elif cfg.speculative_algorithm == "DSPARK":
         assert cfg.disaggregation_mode == "prefill", (
             "Pipeline parallel DSPARK requires disaggregation-mode=prefill"
         )

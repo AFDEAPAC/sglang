@@ -1474,8 +1474,19 @@ class OpenAIServingChat(OpenAIServingBase):
         """Give response-template parsers the rendered assistant prefill.
 
         `tools` are the tools whose calls the tool-call parser reads."""
+        sampling_params = adapted_request.sampling_params or {}
         prefix = adapted_request.text
-        if not isinstance(prefix, str) and adapted_request.input_ids:
+        # Only response-template parsers and template grammars read the prefix;
+        # decoding a 200k-token prompt costs ~80 ms on the event loop.
+        if (
+            not isinstance(prefix, str)
+            and adapted_request.input_ids
+            and (
+                self._parsers_read_prompt_prefix()
+                or template_tool_call_grammar
+                or sampling_params.get("json_schema")
+            )
+        ):
             prefix = self.tokenizer_manager.tokenizer.decode(
                 adapted_request.input_ids,
                 skip_special_tokens=False,
@@ -1484,7 +1495,6 @@ class OpenAIServingChat(OpenAIServingBase):
         prefix = prefix or ""
         request._response_parser_prefix = prefix
         request._response_parser_tool_grammar = template_tool_call_grammar
-        sampling_params = adapted_request.sampling_params or {}
         if template_tool_call_grammar:
             self._fit_tool_call_grammar_to_prefix(
                 request,
@@ -1796,6 +1806,14 @@ class OpenAIServingChat(OpenAIServingBase):
             and tool_detector.constrains_every_turn
             # Other backends cannot compile its structural tag.
             and self.tokenizer_manager.config_value("grammar_backend") == "xgrammar"
+        )
+
+    def _parsers_read_prompt_prefix(self) -> bool:
+        if isinstance(self._reasoning_detector, ResponseTemplateReasoningDetector):
+            return True
+        tool_detector = FunctionCallParser.ToolCallParserEnum.get(self.tool_call_parser)
+        return tool_detector is not None and issubclass(
+            tool_detector, ResponseTemplateToolDetector
         )
 
     def _requires_response_template_detokenization(

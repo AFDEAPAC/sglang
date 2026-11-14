@@ -100,9 +100,13 @@ class AttnBankState:
     # The bank stays on each rank's attention-TP slice across layers;
     # otherwise every rank writes every row and the attention reads them all.
     reads_slices: bool = False
+    # The read's consumer quantizes it per token to fp8: have the aggregation
+    # write that quant too (AttnResidual.forward fp8_out).
+    attn_fp8_out: bool = False
+    ffn_fp8_out: bool = False
 
     def _aggregate(
-        self, contribution, residual, norm, *, score_proj, score_norm, write
+        self, contribution, residual, norm, *, score_proj, score_norm, write, fp8_out
     ):
         bank = self.bank.require()
         return bank.forward(
@@ -113,6 +117,7 @@ class AttnBankState:
             norm,
             rows=_bank_rows(bank, contribution),
             write=write,
+            fp8_out=fp8_out,
         )
 
     def read_attn_input(self, residual, norm):
@@ -131,6 +136,7 @@ class AttnBankState:
             score_proj=self.attn_score_proj,
             score_norm=self.attn_score_norm,
             write=self.writes_block,
+            fp8_out=self.attn_fp8_out,
         )
         return normed, None if self.writes_block else residual
 
@@ -142,6 +148,7 @@ class AttnBankState:
             score_proj=self.ffn_score_proj,
             score_norm=self.ffn_score_norm,
             write=False,
+            fp8_out=self.ffn_fp8_out,
         )
 
     def reduce_scatter_and_read_ffn_input(
