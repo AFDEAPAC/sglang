@@ -1926,6 +1926,10 @@ class Envs:
     SGLANG_DSV41_TRITON_ATTN_PREFILL_LEAN = EnvBool(_default_gfx942)
     SGLANG_DSV41_TRITON_ATTN_EXTRA_CFGS = EnvBool(_default_gfx942)
     SGLANG_GFX942_TRITON_ATTN_INV_ROPE = EnvBool(_default_gfx942)
+    # gfx942 dual-scope sparse decode on triton_sparse_decode/sparse_mla_decode_gfx942.hip (h_q <= 16): QK^T on the
+    # fp8 MFMA from the cached e4m3fnuz keys and a hi + lo fp8 split of q, PV on the bf16 MFMA with bf16 p, partials
+    # merged by the par combine. MI308X, 32 requests x 6 verify rows, 8 heads: 125 us vs 256 us for the Triton path.
+    SGLANG_GFX942_HIP_SPARSE_DECODE = EnvBool(_default_gfx942)
 
     # Fused kernels: fewer launches and fewer round trips through memory.
     SGLANG_GFX942_FUSED_DSV41_RMS = EnvBool(_default_gfx942)

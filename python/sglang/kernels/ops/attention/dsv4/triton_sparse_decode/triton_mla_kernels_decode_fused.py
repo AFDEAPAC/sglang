@@ -12,6 +12,10 @@ Supports:
 - All configs: with/without topk_length, with/without attn_sink
 """
 
+import ctypes
+import logging
+import subprocess
+import tempfile
 from typing import Optional, Tuple
 
 import torch
@@ -20,6 +24,8 @@ import triton.language as tl
 
 from sglang.srt.utils.common import is_gfx942_supported
 from sglang.srt.environ import envs
+
+logger = logging.getLogger(__name__)
 
 # gfx942/MI300/MI325 stores e4m3fnuz (bias 8);
 # gfx950/MI350 and CUDA store OCP e4m3fn (bias 7).
@@ -3095,7 +3101,216 @@ class SplitKBufferPool:
         cls._device = None
 
 
+# gfx942: sparse_mla_decode_gfx942.hip writes the split-K partials (fp8 MFMA scores, bf16 PV) that the par combine
+# merges. Waves per SIMD of the kernel and the extra cost of a split, relative to one split's work, for _hip_splits.
+_HIP_SRC = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "sparse_mla_decode_gfx942.hip"
+)
+_HIP_WAVES_PER_SIMD = 2
+_HIP_SPLIT_COST = 0.2
+# Eager calls also run the Triton split-K path and log how the outputs compare.
+_HIP_CHECK = int(os.environ.get("SGLANG_GFX942_HIP_SPARSE_DECODE_CHECK", "0"))
+_hip_kernel = None
+_hip_zero: dict = {}
+_hip_checked = 0
+
+
+class _HipArgs(ctypes.Structure):
+    _pack_ = 1
+    _fields_ = (
+        [
+            (n, ctypes.c_void_p)
+            for n in (
+                "q",
+                "kv_main",
+                "idx_main",
+                "len_main",
+                "kv_extra",
+                "idx_extra",
+                "len_extra",
+                "po",
+                "plse",
+                "zero",
+            )
+        ]
+        + [("sm_scale", ctypes.c_float)]
+        + [
+            (n, ctypes.c_int32)
+            for n in (
+                "q_t",
+                "q_h",
+                "kv_main_block",
+                "main_shift",
+                "idx_main_t",
+                "kv_extra_block",
+                "extra_shift",
+                "idx_extra_t",
+                "po_s",
+                "po_t",
+                "po_h",
+                "plse_s",
+                "plse_t",
+                "plse_h",
+                "T",
+                "h_q",
+                "s_q",
+                "topk_main",
+                "topk_extra",
+                "per_split",
+                "cta_splits",
+            )
+        ]
+    )
+
+
+def _hip_sparse_decode_kernel():
+    """The HIP sparse decode kernel, built with hipcc at first use; None when off or unavailable."""
+    global _hip_kernel
+    if _hip_kernel is None:
+        _hip_kernel = False
+        if envs.SGLANG_GFX942_HIP_SPARSE_DECODE.get() and is_gfx942_supported():
+            from sglang.kernels.jit.utils.hipcc import (
+                HipKernel,
+                check_hip,
+                hip_lib,
+                hipcc_path,
+            )
+
+            co = os.path.join(tempfile.mkdtemp(prefix="sglang_sparse_mla_decode_"), "k.co")
+            cmd = [hipcc_path(), "--genco", "--offload-arch=gfx942", "-O3", "-o", co, _HIP_SRC]
+            try:
+                subprocess.run(cmd, check=True, capture_output=True)
+                mod = ctypes.c_void_p()
+                check_hip(hip_lib().hipModuleLoad(ctypes.byref(mod), co.encode()), "load")
+                _hip_kernel = HipKernel(mod, "sparse_mla_decode_gfx942")
+            except (OSError, subprocess.CalledProcessError, RuntimeError) as e:
+                logger.warning(
+                    "gfx942 HIP sparse decode unavailable, keeping the Triton kernel: %s", e
+                )
+    return _hip_kernel or None
+
+
+def _hip_splits(total_tokens: int, total_topk: int, device: torch.device) -> int:
+    """CTA splits (2 token ranges each) minimizing resident-wave rounds x per-wave work plus a per-split cost."""
+    slots = torch.cuda.get_device_properties(device).multi_processor_count * 4 * _HIP_WAVES_PER_SIMD
+    best, best_cost = 1, float("inf")
+    for cs in range(1, 11):
+        if triton.cdiv(total_topk, 2 * cs) < 16:
+            break
+        cost = triton.cdiv(4 * total_tokens * cs, slots) * (1.0 / cs + _HIP_SPLIT_COST)
+        if cost < best_cost:
+            best, best_cost = cs, cost
+    return best
+
+
+def _hip_dual_scope(
+    q, kv_main, idx_main, block_main, kv_extra, idx_extra, block_extra, sm_scale,
+    len_main, len_extra, attn_sink, s_q, inv_rope,
+):
+    """(output, lse) from the HIP kernel and the par combine, or None where it does not apply."""
+    total_tokens, h_q, d_qk = q.shape
+    topk_main, topk_extra = idx_main.shape[1], idx_extra.shape[1]
+    if (
+        h_q > 16
+        or d_qk != 512
+        or topk_main % 16
+        or topk_extra % 16
+        or len_main is None
+        or len_extra is None
+        or block_main & (block_main - 1)
+        or block_extra & (block_extra - 1)
+        or idx_main.stride(1) != 1
+        or idx_extra.stride(1) != 1
+        or idx_main.stride(0) % 4
+        or idx_extra.stride(0) % 4
+        or idx_main.data_ptr() % 16
+        or idx_extra.data_ptr() % 16
+    ):
+        return None
+    kernel = _hip_sparse_decode_kernel()
+    if kernel is None:
+        return None
+    device = q.device
+    zero = _hip_zero.get(device)
+    if zero is None:
+        zero = _hip_zero[device] = torch.zeros(640, dtype=torch.uint8, device=device)
+    if q.dtype != torch.bfloat16 or not q.is_contiguous():
+        q = q.to(torch.bfloat16).contiguous()
+    kv_m = kv_main.view(torch.uint8)
+    kv_e = kv_extra.view(torch.uint8)
+    len_main = len_main.to(torch.int32)
+    len_extra = len_extra.to(torch.int32)
+    cs = _hip_splits(total_tokens, topk_main + topk_extra, device)
+    splits = 2 * cs
+    per_split = triton.cdiv(triton.cdiv(topk_main + topk_extra, splits), 16) * 16
+    bufs = SplitKBufferPool.get_buffers(splits, total_tokens, h_q, DSV4_D_V, device)
+    po, plse = bufs["partial_output"], bufs["partial_lse"]
+    output = torch.empty(total_tokens, h_q, DSV4_D_V, dtype=torch.bfloat16, device=device)
+    lse = torch.empty(total_tokens, h_q, dtype=torch.float32, device=device)
+    args = _HipArgs(
+        q.data_ptr(), kv_m.data_ptr(), idx_main.data_ptr(), len_main.data_ptr(),
+        kv_e.data_ptr(), idx_extra.data_ptr(), len_extra.data_ptr(), po.data_ptr(),
+        plse.data_ptr(), zero.data_ptr(), sm_scale, q.stride(0), q.stride(1),
+        kv_m.stride(0), block_main.bit_length() - 1, idx_main.stride(0),
+        kv_e.stride(0), block_extra.bit_length() - 1, idx_extra.stride(0),
+        po.stride(0), po.stride(1), po.stride(2), plse.stride(0), plse.stride(1), plse.stride(2),
+        total_tokens, h_q, s_q, topk_main, topk_extra, per_split, cs,
+    )
+    kernel.launch(total_tokens * cs, args, torch.cuda.current_stream().cuda_stream, 256, 0)
+    _launch_par_combine(po, plse, attn_sink, output, lse, splits, h_q, inv_rope)
+    return output, lse
+
+
+def _check_hip_dual_scope(hip_out, hip_lse, triton_args):
+    """Log how the HIP output compares with the Triton split-K path on the same inputs (eager calls)."""
+    global _hip_checked
+    if _hip_checked >= _HIP_CHECK or torch.cuda.is_current_stream_capturing():
+        return
+    _hip_checked += 1
+    ref_out, ref_lse = _fused_gather_attn_decode_dsv4_dual_scope_low_overhead_triton(*triton_args)
+    d = (hip_out.float() - ref_out.float()).abs()
+    logger.info(
+        "gfx942 HIP sparse decode check %d: tokens=%d heads=%d max|dO|=%.3g (max|O| %.3g) max|dlse|=%.3g",
+        _hip_checked,
+        hip_out.shape[0],
+        hip_out.shape[1],
+        float(d.max()),
+        float(ref_out.float().abs().max()),
+        float((hip_lse - ref_lse).abs().max()),
+    )
+
+
 def fused_gather_attn_decode_dsv4_dual_scope_low_overhead(
+    q: torch.Tensor,
+    kv_cache_main: torch.Tensor,
+    indices_main: torch.Tensor,
+    block_size_main: int,
+    kv_cache_extra: torch.Tensor,
+    indices_extra: torch.Tensor,
+    block_size_extra: int,
+    sm_scale: float,
+    topk_length_main: Optional[torch.Tensor] = None,
+    topk_length_extra: Optional[torch.Tensor] = None,
+    attn_sink: Optional[torch.Tensor] = None,
+    s_q: int = 1,
+    inv_rope: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Dual-scope sparse decode with split-K: the gfx942 HIP kernel where it applies
+    (SGLANG_GFX942_HIP_SPARSE_DECODE), else the Triton split-K kernel."""
+    args = (
+        q, kv_cache_main, indices_main, block_size_main, kv_cache_extra, indices_extra,
+        block_size_extra, sm_scale, topk_length_main, topk_length_extra, attn_sink, s_q,
+        inv_rope,
+    )
+    hip = _hip_dual_scope(*args)
+    if hip is None:
+        return _fused_gather_attn_decode_dsv4_dual_scope_low_overhead_triton(*args)
+    if _HIP_CHECK:
+        _check_hip_dual_scope(hip[0], hip[1], args)
+    return hip
+
+
+def _fused_gather_attn_decode_dsv4_dual_scope_low_overhead_triton(
     q: torch.Tensor,
     kv_cache_main: torch.Tensor,
     indices_main: torch.Tensor,
