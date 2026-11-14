@@ -1991,6 +1991,10 @@ class Envs:
     # and 256/512 cost 3.4%/8.3% at 63488 batch 32, so this is the measured
     # optimum rather than an override.
     SGLANG_DSV41_DECODE_INDEXER_BLOCK_L = EnvInt(128)
+    # Persistent CTAs per CU of the Triton decode indexer launch (prefill keeps 4).
+    # Bit-exact across launches; on MI308X 8 was never slower over batch 1..32 x 4K..64K
+    # (8 x 64K 1.12x, 32 x 64K 1.03x), while 16 and 32 cost 10% at batch 32 x 4K.
+    SGLANG_DSV41_DECODE_INDEXER_CTAS_PER_CU = EnvInt(8)
     # DeepSeek-V4 C4 decode / target-verify indexer: the same row-group kernel (aiter >= #6145),
     # its workspace built in the graph without a schedule; a request's verify rows share each
     # key load.
