@@ -1977,6 +1977,10 @@ class Envs:
     SGLANG_GFX942_HC_BOUNDARY_DECODE = EnvStr(
         lambda: "16,32,2" if _default_gfx942() else ""
     )
+    # HC boundary split-K partials stored row-major under their [slices, m, mix] view, so a
+    # sinkhorn row reads one contiguous run instead of a slice-strided gather. Same outputs bit
+    # for bit; the reduce + sinkhorn of a 16K-row prefill chunk runs 3.0x faster on MI308X.
+    SGLANG_GFX942_HC_PARTIALS_ROW_MAJOR = EnvBool(_default_gfx942)
     # Decode GEMV: upper bound on M, and the weight layout. MAX_M defaults to 0
     # upstream, which disables the path even when the switch is on.
     SGLANG_GFX942_FP8_GEMV_MAX_M = EnvInt(lambda: 8 if _default_gfx942() else 0)

@@ -91,6 +91,7 @@ def _hc_mix_reduce_sinkhorn_row(
     SLICES_PAD: tl.constexpr,
     ITERS: tl.constexpr,
     EPS: tl.constexpr,
+    PARTIALS_ROW_MAJOR: tl.constexpr,
 ):
     """_hc_mix_reduce_sinkhorn_kernel for one row with a tree fixed by NUM_SLICES; scratch_ptr
     ([m, 32] fp32) round-trips the reduced mixes so the sinkhorn starts from a plain layout."""
@@ -100,7 +101,12 @@ def _hc_mix_reduce_sinkhorn_row(
 
     s_idx = tl.arange(0, SLICES_PAD)
     s_ok = s_idx < NUM_SLICES
-    off = (s_idx * m + row) * MIX
+    if PARTIALS_ROW_MAJOR:
+        off = (row * NUM_SLICES + s_idx) * MIX
+        sq_off = row * NUM_SLICES + s_idx
+    else:
+        off = (s_idx * m + row) * MIX
+        sq_off = s_idx * m + row
     a_pre = tl.sum(
         tl.load(
             part_mix_ptr + off[:, None] + j[None, :],
@@ -129,7 +135,7 @@ def _hc_mix_reduce_sinkhorn_row(
         ),
         axis=0,
     )
-    sq = tl.sum(tl.load(part_sq_ptr + s_idx * m + row, mask=s_ok, other=0.0), axis=0)
+    sq = tl.sum(tl.load(part_sq_ptr + sq_off, mask=s_ok, other=0.0), axis=0)
     sp = scratch_ptr + row * 32
     tl.store(sp + j, a_pre)
     tl.store(sp + HC + j, a_post)
@@ -178,6 +184,7 @@ def _hc_mix_reduce_sinkhorn_vec_kernel(
     SLICES_PAD: tl.constexpr,
     ITERS: tl.constexpr,
     EPS: tl.constexpr,
+    PARTIALS_ROW_MAJOR: tl.constexpr,
 ):
     """One program per row of _hc_mix_reduce_sinkhorn_row."""
     _hc_mix_reduce_sinkhorn_row(
@@ -199,6 +206,7 @@ def _hc_mix_reduce_sinkhorn_vec_kernel(
         SLICES_PAD=SLICES_PAD,
         ITERS=ITERS,
         EPS=EPS,
+        PARTIALS_ROW_MAJOR=PARTIALS_ROW_MAJOR,
     )
 
 
@@ -238,6 +246,7 @@ def _rmsnorm_sinkhorn_kernel(
     SLICES_PAD: tl.constexpr,
     ITERS: tl.constexpr,
     EPS: tl.constexpr,
+    PARTIALS_ROW_MAJOR: tl.constexpr,
 ):
     """Grid (M + m,): programs [0, M) run rmsnorm_fake_quant_row on the norm's rows, programs
     [M, M + m) _hc_mix_reduce_sinkhorn_row on the pending boundary's rows; each row keeps its
@@ -286,6 +295,7 @@ def _rmsnorm_sinkhorn_kernel(
             SLICES_PAD=SLICES_PAD,
             ITERS=ITERS,
             EPS=EPS,
+            PARTIALS_ROW_MAJOR=PARTIALS_ROW_MAJOR,
         )
 
 
@@ -328,6 +338,7 @@ def hc_mix_reduce_sinkhorn_vec(
         SLICES_PAD=triton.next_power_of_2(num_slices),
         ITERS=sinkhorn_iters,
         EPS=hc_eps,
+        PARTIALS_ROW_MAJOR=_partials_row_major(part_mix),
         num_warps=_HC_SINKHORN_NUM_WARPS,
     )
 
@@ -496,6 +507,7 @@ def rmsnorm_with_sinkhorn(
         SLICES_PAD=triton.next_power_of_2(coefficients.num_slices),
         ITERS=coefficients.sinkhorn_iters,
         EPS=coefficients.hc_eps,
+        PARTIALS_ROW_MAJOR=_partials_row_major(coefficients.part_mix),
         num_warps=_HC_SINKHORN_NUM_WARPS,
     )
     return quant, out_norm
@@ -526,6 +538,7 @@ def _hc_boundary_partial_kernel(
     DOT_PRECISION: tl.constexpr,
     HAS_POST: tl.constexpr,
     HAS_COMBINE: tl.constexpr,
+    PARTIALS_ROW_MAJOR: tl.constexpr,
 ):
     """Grid (cdiv(M, BLOCK_M), H // BLOCK_K), one hidden slice of every copy per program. HAS_POST:
     res_out[k] = post[k]*x + sum_j comb[j,k]*res[j] in aiter::mhc_post's order, read back as bf16
@@ -599,18 +612,33 @@ def _hc_boundary_partial_kernel(
         w_tile = tl.load(w_ptr + w_off + k * H, mask=mask_n[None, :], other=0.0)
         acc += tl.dot(xt, w_tile, input_precision=DOT_PRECISION)
         sq += tl.sum(xt * xt, axis=1)
+    if PARTIALS_ROW_MAJOR:
+        mix_off = (offs_m * tl.num_programs(1) + pid_t) * MIX
+        sq_off = offs_m * tl.num_programs(1) + pid_t
+    else:
+        mix_off = (pid_t * M + offs_m) * MIX
+        sq_off = pid_t * M + offs_m
     tl.store(
-        part_mix_ptr + (pid_t * M + offs_m[:, None]) * MIX + offs_n[None, :],
+        part_mix_ptr + mix_off[:, None] + offs_n[None, :],
         acc,
         mask=m2 & mask_n[None, :],
     )
-    tl.store(part_sq_ptr + pid_t * M + offs_m, sq, mask=mask_m)
+    tl.store(part_sq_ptr + sq_off, sq, mask=mask_m)
     if HAS_COMBINE:
         tl.store(
             y_ptr + offs_m[:, None] * H + offs_h[None, :],
             y.to(y_ptr.dtype.element_ty),
             mask=m2,
         )
+
+
+_HC_PARTIALS_ROW_MAJOR = envs.SGLANG_GFX942_HC_PARTIALS_ROW_MAJOR.get()
+
+
+def _partials_row_major(part_mix: torch.Tensor) -> bool:
+    """Whether [slices, m, mix] partials sit row-major in memory (see _hc_boundary_partials).
+    One slice or one row is the same memory either way."""
+    return part_mix.shape[0] > 1 and part_mix.shape[1] > 1 and part_mix.stride(0) == part_mix.shape[2]
 
 
 # the gfx950 prefill kernel is bitwise the Triton kernel per row: the switch below is a speed choice
@@ -670,12 +698,18 @@ def _hc_boundary_partials(
     has_combine = pre_prev is not None
     block_m, block_k, num_warps = _hc_boundary_cfg(m)
     num_slices = h // block_k
-    part_mix = torch.empty((num_slices, m, mix), dtype=torch.float32, device=dev)
-    part_sq = torch.empty((num_slices, m), dtype=torch.float32, device=dev)
-    if m == 0:
-        return part_mix, part_sq
     if prefill is None:
         prefill = _hc_boundary_use_prefill(m, has_post, has_combine, x)
+    # the gfx950 prefill kernel writes the contiguous layout
+    row_major = _HC_PARTIALS_ROW_MAJOR and not prefill
+    if row_major:
+        part_mix = torch.empty((m, num_slices, mix), dtype=torch.float32, device=dev).transpose(0, 1)
+        part_sq = torch.empty((m, num_slices), dtype=torch.float32, device=dev).transpose(0, 1)
+    else:
+        part_mix = torch.empty((num_slices, m, mix), dtype=torch.float32, device=dev)
+        part_sq = torch.empty((num_slices, m), dtype=torch.float32, device=dev)
+    if m == 0:
+        return part_mix, part_sq
     placeholder = part_sq
     if prefill:
         mod = _hc_boundary_prefill_module()
@@ -746,6 +780,7 @@ def _hc_boundary_partials(
         DOT_PRECISION=_HC_MIX_DOT_PRECISION,
         HAS_POST=has_post,
         HAS_COMBINE=has_combine,
+        PARTIALS_ROW_MAJOR=row_major,
         **launch,
     )
     return part_mix, part_sq
@@ -851,6 +886,7 @@ def _rmsnorm_ptq_sinkhorn_kernel(
     SLICES_PAD: tl.constexpr,
     ITERS: tl.constexpr,
     EPS: tl.constexpr,
+    PARTIALS_ROW_MAJOR: tl.constexpr,
 ):
     """Grid (M + m,): programs [0, M) run the residual-free bf16 RMSNorm of a row and the per-token fp8 quant
     of its bf16 output (gfx942_decode_fuse.rmsnorm_with_per_token_quant), programs [M, M + m)
@@ -891,6 +927,7 @@ def _rmsnorm_ptq_sinkhorn_kernel(
             SLICES_PAD=SLICES_PAD,
             ITERS=ITERS,
             EPS=EPS,
+            PARTIALS_ROW_MAJOR=PARTIALS_ROW_MAJOR,
         )
 
 
@@ -945,6 +982,7 @@ def rmsnorm_ptq_with_sinkhorn(
             SLICES_PAD=triton.next_power_of_2(coefficients.num_slices),
             ITERS=coefficients.sinkhorn_iters,
             EPS=coefficients.hc_eps,
+            PARTIALS_ROW_MAJOR=_partials_row_major(coefficients.part_mix),
             num_warps=_HC_SINKHORN_NUM_WARPS,
         )
     from sglang.kernels.ops.quantization.gfx942_decode_fuse import _ptq_version
