@@ -15,6 +15,7 @@ in this branch and in the branch of the same name of the AITER fork.
 | `stop_kimi_k3.sh` | Stops the SGLang processes on this node. |
 | `healthcheck.sh`, `run_bench_serving.sh`, `run_eval_gsm8k.sh` | Health check, a short serving benchmark, and GSM8K against the running server. |
 | `tune_a16wmix_moe.py`, `tune_kimik3_bf16_gemm.sh` | Tuning tools for the a16wmix MoE tiles and the dense bf16 GEMMs. |
+| `make_fp8_model_dir.sh <checkpoint dir> <new dir>` | Makes the model directory for online fp8 dense layers: symlinks to the checkpoint plus a `config.json` with a `linear_fp8_config` block. |
 
 ## Start
 
