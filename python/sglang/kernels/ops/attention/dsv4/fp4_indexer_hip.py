@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import ctypes
 import os
 import functools
 import itertools
+import logging
+import subprocess
+import tempfile
 from typing import TYPE_CHECKING, Dict, List, NamedTuple, Optional, Tuple, Union
 
 import torch
@@ -70,6 +74,87 @@ _LOGITS_BUDGET_ELEMS = envs.SGLANG_DSV4_FP4_LOGITS_BUDGET_MB.get() * 2**20 // 4
 _DECODE_BLOCK_L = envs.SGLANG_DSV41_DECODE_INDEXER_BLOCK_L.get()
 _DECODE_CTAS_PER_CU_TRITON = envs.SGLANG_DSV41_DECODE_INDEXER_CTAS_PER_CU.get()
 _LOGITS_POOL: dict = {}
+# fp4_decode_logits_gfx942.hip: 128 positions per CTA tile; CTAs per CU per index-head count
+# is that instance's occupancy (waves per SIMD).
+_HIP_DECODE_SRC = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "fp4_decode_logits_gfx942.hip"
+)
+_HIP_DECODE_TILE = 128
+_HIP_DECODE_CTAS_PER_CU = {32: 5, 64: 3}
+# Eager decode calls also run the Triton kernel and log how the logits and top-k compare.
+_HIP_DECODE_CHECK = int(os.environ.get("SGLANG_GFX942_HIP_DECODE_INDEXER_CHECK", "0"))
+_hip_decode_module = None
+_hip_decode_kernels: dict = {}
+_hip_decode_checked = 0
+
+logger = logging.getLogger(__name__)
+
+
+class _HipDecodeArgs(ctypes.Structure):
+    _pack_ = 1
+    _fields_ = [
+        (n, ctypes.c_void_p)
+        for n in ("q", "w", "payload", "scale", "page_table", "lengths", "out")
+    ] + [
+        (n, ctypes.c_int32)
+        for n in (
+            "max_seq_len",
+            "pt_stride",
+            "out_stride",
+            "q_row_stride",
+            "q_head_stride",
+            "w_row_stride",
+            "workers",
+        )
+    ]
+
+
+def _gfx942_hip_decode_kernel(heads: int):
+    """The HIP decode indexer instance for `heads` index heads, its module built with hipcc
+    at first use; None when off, unavailable, or for another head count."""
+    global _hip_decode_module
+    if heads not in _HIP_DECODE_CTAS_PER_CU:
+        return None
+    if _hip_decode_module is None:
+        _hip_decode_module = False
+        arch = torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
+        if envs.SGLANG_GFX942_HIP_DECODE_INDEXER.get() and arch == "gfx942":
+            from sglang.kernels.jit.utils.hipcc import check_hip, hip_lib, hipcc_path
+
+            co = os.path.join(
+                tempfile.mkdtemp(prefix="sglang_fp4_decode_logits_"), "k.co"
+            )
+            cmd = [
+                hipcc_path(),
+                "--genco",
+                "--offload-arch=gfx942",
+                "-O3",
+                "-o",
+                co,
+                _HIP_DECODE_SRC,
+            ]
+            try:
+                subprocess.run(cmd, check=True, capture_output=True)
+                mod = ctypes.c_void_p()
+                check_hip(
+                    hip_lib().hipModuleLoad(ctypes.byref(mod), co.encode()), "load"
+                )
+                _hip_decode_module = mod
+            except (OSError, subprocess.CalledProcessError, RuntimeError) as e:
+                logger.warning(
+                    "gfx942 HIP decode indexer unavailable, keeping the Triton kernel: %s",
+                    e,
+                )
+    if not _hip_decode_module:
+        return None
+    kernel = _hip_decode_kernels.get(heads)
+    if kernel is None:
+        from sglang.kernels.jit.utils.hipcc import HipKernel
+
+        kernel = _hip_decode_kernels[heads] = HipKernel(
+            _hip_decode_module, f"fp4_decode_logits_gfx942_h{heads}"
+        )
+    return kernel
 
 
 class FP4DecodeWorkspace(NamedTuple):
@@ -377,6 +462,9 @@ def triton_fp4_split_paged_mqa_logits(
     FP4 K values are dequantized to BF16 in the Triton kernel and use the
     standard gfx942 BF16 MFMA. Live lengths and page ids stay on device, so a
     captured grid can replay against shorter contexts without host reads.
+    Decode rows without a candidate mask score on fp4_decode_logits_gfx942.hip
+    instead (SGLANG_GFX942_HIP_DECODE_INDEXER): the same products on the fp8
+    MFMA and the same bf16 roundings, the head sum in another fp32 order.
     """
     assert q.dtype == torch.bfloat16 and q.ndim == 3 and q.shape[-1] == _HEAD_DIM
     assert k_payload.shape[1:] == (1, 4, _KV_BLOCK_SIZE, 16)
@@ -395,6 +483,66 @@ def triton_fp4_split_paged_mqa_logits(
     logits = _alloc_logits(q.shape[0], max_seq_len, q.device, is_decode)
     if q.shape[0] == 0 or max_seq_len == 0:
         return logits
+    kernel = (
+        _gfx942_hip_decode_kernel(q.shape[1])
+        if is_decode and candidate_mask is None
+        else None
+    )
+    if kernel is None:
+        _triton_split_logits(
+            q,
+            weights,
+            k_payload,
+            k_scale,
+            page_table,
+            lengths,
+            candidate_mask,
+            logits,
+            is_decode,
+        )
+        return logits
+    rows = q.shape[0]
+    workers = min(
+        triton.cdiv(max_seq_len, _HIP_DECODE_TILE),
+        max(
+            1,
+            triton.cdiv(
+                torch.cuda.get_device_properties(q.device).multi_processor_count
+                * _HIP_DECODE_CTAS_PER_CU[q.shape[1]],
+                rows,
+            ),
+        ),
+    )
+    args = _HipDecodeArgs(
+        q.data_ptr(),
+        weights.data_ptr(),
+        k_payload.data_ptr(),
+        k_scale.data_ptr(),
+        page_table.data_ptr(),
+        lengths.data_ptr(),
+        logits.data_ptr(),
+        max_seq_len,
+        page_table.stride(0),
+        logits.stride(0),
+        q.stride(0),
+        q.stride(1),
+        weights.stride(0),
+        workers,
+    )
+    kernel.launch(
+        rows * workers, args, torch.cuda.current_stream().cuda_stream, 256, 0
+    )
+    if _HIP_DECODE_CHECK:
+        _check_hip_decode_logits(
+            logits, q, weights, k_payload, k_scale, page_table, lengths
+        )
+    return logits
+
+
+def _triton_split_logits(
+    q, weights, k_payload, k_scale, page_table, lengths, candidate_mask, logits, is_decode
+):
+    max_seq_len = page_table.shape[1] * _KV_BLOCK_SIZE
     block_l = _DECODE_BLOCK_L if is_decode else 64
     workers = min(
         triton.cdiv(max_seq_len, block_l),
@@ -430,7 +578,51 @@ def triton_fp4_split_paged_mqa_logits(
         BLOCK_L=block_l,
         num_warps=4,
     )
-    return logits
+
+
+def _check_hip_decode_logits(
+    logits, q, weights, k_payload, k_scale, page_table, lengths, topks=(512, 2048)
+):
+    """Log how the HIP decode logits compare with the Triton kernel's on the same inputs."""
+    global _hip_decode_checked
+    if (
+        _hip_decode_checked >= _HIP_DECODE_CHECK
+        or torch.cuda.is_current_stream_capturing()
+    ):
+        return
+    _hip_decode_checked += 1
+    ref = torch.empty_like(logits)
+    _triton_split_logits(
+        q, weights, k_payload, k_scale, page_table, lengths, None, ref, True
+    )
+    width = logits.shape[1]
+    lens = lengths.clamp(max=width)
+    valid = torch.arange(width, device=logits.device)[None, :] < lens[:, None]
+    hip_v = torch.where(valid, logits, 0.0)
+    ref_v = torch.where(valid, ref, 0.0)
+    differ = int((hip_v != ref_v).sum())
+    max_abs = float((hip_v - ref_v).abs().max())
+    overlap = {}
+    for topk in topks:
+        per_row = []
+        for row, n in enumerate(lens.tolist()):
+            k = min(topk, n)
+            if k == 0:
+                continue
+            a = logits[row, :n].topk(k).indices
+            b = ref[row, :n].topk(k).indices
+            per_row.append(int(torch.isin(a, b).sum()) / k)
+        overlap[topk] = min(per_row, default=1.0)
+    logger.info(
+        "gfx942 HIP decode indexer check %d: rows=%d logits=%d differ=%d max|d|=%.3g "
+        "min top-k overlap %s",
+        _hip_decode_checked,
+        logits.shape[0],
+        int(valid.sum()),
+        differ,
+        max_abs,
+        " ".join(f"{k}:{v:.5f}" for k, v in overlap.items()),
+    )
 
 
 def _alloc_logits(

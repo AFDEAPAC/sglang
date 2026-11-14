@@ -1999,6 +1999,10 @@ class Envs:
     # Bit-exact across launches; on MI308X 8 was never slower over batch 1..32 x 4K..64K
     # (8 x 64K 1.12x, 32 x 64K 1.03x), while 16 and 32 cost 10% at batch 32 x 4K.
     SGLANG_DSV41_DECODE_INDEXER_CTAS_PER_CU = EnvInt(8)
+    # gfx942 decode indexer rows on fp4_decode_logits_gfx942.hip (32 or 64 index heads): the FP4 products on the
+    # fp8 MFMA with the Triton kernel's bf16 roundings, only the head sum in another fp32 order (top-512 identical
+    # on random FP4 inputs). MI308X, 32 heads, batch 32 x 5 verify rows x 15872 positions: 170 us vs 1668 us.
+    SGLANG_GFX942_HIP_DECODE_INDEXER = EnvBool(_default_gfx942)
     # DeepSeek-V4 C4 decode / target-verify indexer: the same row-group kernel (aiter >= #6145),
     # its workspace built in the graph without a schedule; a request's verify rows share each
     # key load.
