@@ -879,7 +879,7 @@ async def server_info():
 
     server_args = _global_state.tokenizer_manager.server_args
 
-    return msgspec_to_builtins(
+    content = msgspec_to_builtins(
         redact_watermark_secrets(
             {
                 **build_server_info(server_args, _global_state.scheduler_info),
@@ -890,6 +890,12 @@ async def server_info():
             }
         )
     )
+    # Clients poll this once per benchmark run; FastAPI's jsonable_encoder walk of the ~40 KB payload is most of
+    # its latency, and the payload is builtins already. Types orjson rejects keep the generic path.
+    try:
+        return orjson_response(content)
+    except TypeError:
+        return content
 
 
 # example usage:
