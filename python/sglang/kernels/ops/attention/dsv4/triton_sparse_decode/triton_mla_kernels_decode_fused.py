@@ -3283,6 +3283,45 @@ def hip_dual_scope_prefill(
     return hip
 
 
+def hip_single_scope_prefill(q, kv, idx, block, sm_scale, length, attn_sink, s_q, inv_rope):
+    """Single-scope (sliding-window layers) extend / prefill rows on the HIP kernel with an empty second scope, or
+    None where it does not apply. 6144 rows x 8 heads x 128 keys: the Triton kernel takes ~1.5 ms."""
+    if not envs.SGLANG_GFX942_HIP_SPARSE_PREFILL.get() or length is None:
+        return None
+    t = q.shape[0]
+    idx_e = torch.zeros(t, 16, dtype=idx.dtype, device=q.device)
+    len_e = torch.zeros(t, dtype=torch.int32, device=q.device)
+    hip = _hip_dual_scope(q, kv, idx, block, kv, idx_e, block, sm_scale, length, len_e, attn_sink, s_q, inv_rope,
+                          pooled=False)
+    if hip is not None and _HIP_CHECK:
+        _check_hip_single(hip[0], hip[1], (q, kv, idx, block, sm_scale, length, attn_sink, s_q, inv_rope))
+    return hip
+
+
+def _check_hip_single(hip_out, hip_lse, args):
+    """Log how the HIP single-scope prefill output compares with the Triton kernel on the same inputs."""
+    global _hip_checked
+    if _hip_checked >= _HIP_CHECK or torch.cuda.is_current_stream_capturing():
+        return
+    _hip_checked += 1
+    q, kv, idx, block, sm_scale, length, attn_sink, s_q, inv_rope = args
+    ref_out, ref_lse = fused_gather_attn_decode_dsv4(
+        q, kv, idx, block, sm_scale, topk_length=length, attn_sink=attn_sink, s_q=s_q
+    )
+    if inv_rope is not None:
+        _apply_inv_rope_standalone(ref_out, inv_rope)
+    d = (hip_out.float() - ref_out.float()).abs()
+    logger.info(
+        "gfx942 HIP sliding-window prefill check %d: tokens=%d heads=%d max|dO|=%.3g (max|O| %.3g) max|dlse|=%.3g",
+        _hip_checked,
+        hip_out.shape[0],
+        hip_out.shape[1],
+        float(d.max()),
+        float(ref_out.float().abs().max()),
+        float((hip_lse.float() - ref_lse.float().view_as(hip_lse)).abs().max()),
+    )
+
+
 def _check_hip_prefill(hip_out, hip_lse, args):
     """Log how the HIP prefill output compares with the Triton prefill path on the same inputs."""
     global _hip_checked
