@@ -1,7 +1,11 @@
 """HIP mHC sublayer boundary: hc_post + collapse + mixing statistics, with the
 reduce + sinkhorn launched alone or hosted by the layer's next RMSNorm (HcCoefficients)."""
 
+import ctypes
+import logging
 import os
+import subprocess
+import tempfile
 from typing import Optional, Tuple, Union
 
 import torch
@@ -17,8 +21,9 @@ from sglang.kernels.ops.layernorm.rmsnorm_fake_quant_amd_gfx95 import (
     row_major_2d,
 )
 from sglang.srt.environ import envs
-from sglang.srt.utils.common import is_gfx95_supported, is_hip
+from sglang.srt.utils.common import is_gfx942_supported, is_gfx95_supported, is_hip
 
+logger = logging.getLogger(__name__)
 _is_hip = is_hip()
 # CDNA has no tf32: the mixing dot runs in ieee fp32 (the CUDA kernel uses tf32x3)
 _HC_MIX_DOT_PRECISION = "ieee"
@@ -318,6 +323,11 @@ def hc_mix_reduce_sinkhorn_vec(
 ) -> None:
     """Reduce the [num_slices, m, mix] partials and run the sinkhorn into pre/post/comb."""
     m = part_sq.shape[1]
+    if num_slices == 1 and _hc_sinkhorn_rows_gfx942(
+        part_mix, part_sq, hc_scale, hc_base, pre, post, comb,
+        k=k, rms_eps=rms_eps, mix=mix, hc_mult=hc_mult, sinkhorn_iters=sinkhorn_iters, hc_eps=hc_eps,
+    ):
+        return
     # layout round trip for the reduce + sinkhorn row (see its docstring)
     scratch = torch.empty((m, 32), dtype=torch.float32, device=part_mix.device)
     _hc_mix_reduce_sinkhorn_vec_kernel[(m,)](
@@ -786,6 +796,206 @@ def _hc_boundary_partials(
     return part_mix, part_sq
 
 
+# gfx942 prefill boundaries: hc_post_rows_gfx942.hip writes residual_out, y and the row sums of squares with one
+# wave per row (whole-row reads; the 64-column slices of the partial kernel read 64 B per row per instruction), then
+# the mixing dots run as one GEMM against the weights split into bf16 hi + lo with fp32 output: one slice for the
+# reduce + sinkhorn.
+_HC_ROWS_SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hc_post_rows_gfx942.hip")
+_HC_ROWS_MIN_M = 1024
+# Also run the Triton partials for the first N boundaries and log how the outputs compare.
+_HC_ROWS_CHECK = int(os.environ.get("SGLANG_GFX942_HIP_HC_ROWS_CHECK", "0"))
+_hc_rows_kernels = None
+_hc_rows_checked = 0
+_hc_sinkhorn_checked = 0
+
+
+class _HcRowArgs(ctypes.Structure):
+    _fields_ = (
+        [(n, ctypes.c_void_p) for n in ("x", "res", "post_in", "comb_in", "pre_prev", "res_out", "y", "sq")]
+        + [(n, ctypes.c_int64) for n in ("x_stride", "res_stride")]
+        + [(n, ctypes.c_int32) for n in ("m", "h")]
+    )
+
+
+class _HcSinkArgs(ctypes.Structure):
+    _fields_ = (
+        [(n, ctypes.c_void_p) for n in ("mix", "sq", "scale", "base", "pre", "post", "comb")]
+        + [(n, ctypes.c_int32) for n in ("m", "iters")]
+        + [(n, ctypes.c_float) for n in ("inv_k", "rms_eps", "eps")]
+    )
+
+
+def _hc_rows_kernels_gfx942():
+    """The (has_post, has_combine) row kernels, built with hipcc at first use; None when off or unavailable."""
+    global _hc_rows_kernels
+    if _hc_rows_kernels is None:
+        _hc_rows_kernels = False
+        if envs.SGLANG_GFX942_HIP_HC_BOUNDARY_ROWS.get() and is_gfx942_supported():
+            from sglang.kernels.jit.utils.hipcc import (
+                HipKernel,
+                check_hip,
+                hip_lib,
+                hipcc_path,
+            )
+
+            co = os.path.join(tempfile.mkdtemp(prefix="sglang_hc_rows_"), "k.co")
+            cmd = [hipcc_path(), "--genco", "--offload-arch=gfx942", "-O3", "-ffp-contract=off", "-o", co,
+                   _HC_ROWS_SRC]
+            try:
+                subprocess.run(cmd, check=True, capture_output=True)
+                mod = ctypes.c_void_p()
+                check_hip(hip_lib().hipModuleLoad(ctypes.byref(mod), co.encode()), "load")
+                _hc_rows_kernels = {
+                    key: HipKernel(mod, f"hc_rows_gfx942_{name}")
+                    for key, name in (
+                        ((True, True), "post_comb"),
+                        ((True, False), "post"),
+                        ((False, True), "comb"),
+                        ((False, False), "stats"),
+                    )
+                }
+                _hc_rows_kernels["sinkhorn"] = HipKernel(mod, "hc_sinkhorn_rows_gfx942")
+            except (OSError, subprocess.CalledProcessError, RuntimeError) as e:
+                logger.warning("gfx942 HIP HC boundary rows unavailable, keeping the Triton partials: %s", e)
+    return _hc_rows_kernels or None
+
+
+def _hc_sinkhorn_rows_gfx942(
+    part_mix, part_sq, hc_scale, hc_base, pre, post, comb, *, k, rms_eps, mix, hc_mult, sinkhorn_iters, hc_eps
+) -> bool:
+    """The one-slice reduce + sinkhorn on hc_sinkhorn_rows_gfx942 (one thread per row; the Triton kernel runs a
+    4-wave program per row: 6144 rows 112 us); False when it does not apply."""
+    m = part_sq.shape[1]
+    outs = (pre, post, comb)
+    if (
+        m < _HC_ROWS_MIN_M
+        or part_mix.shape[0] != 1
+        or hc_mult != 4
+        or mix != 24
+        or not envs.SGLANG_GFX942_HIP_HC_SINKHORN_ROWS.get()
+        or part_mix.dtype != torch.float32
+        or not (part_mix.is_contiguous() and part_sq.is_contiguous())
+        or part_mix.data_ptr() % 16
+        or any(t.dtype != torch.float32 or not t.is_contiguous() or t.data_ptr() % 16 for t in outs)
+    ):
+        return False
+    kernels = _hc_rows_kernels_gfx942()
+    if kernels is None:
+        return False
+    scale = hc_scale.float().contiguous()
+    base = hc_base.float().contiguous()
+    args = _HcSinkArgs(
+        part_mix.data_ptr(), part_sq.data_ptr(), scale.data_ptr(), base.data_ptr(), pre.data_ptr(), post.data_ptr(),
+        comb.data_ptr(), m, sinkhorn_iters, 1.0 / k, rms_eps, hc_eps,
+    )
+    kernels["sinkhorn"].launch(triton.cdiv(m, 256), args, torch.cuda.current_stream().cuda_stream, 256, 0)
+    if _HC_ROWS_CHECK:
+        _check_hc_sinkhorn(part_mix, part_sq, scale, base, outs, k, rms_eps, mix, hc_mult, sinkhorn_iters, hc_eps)
+    return True
+
+
+def _check_hc_sinkhorn(part_mix, part_sq, scale, base, outs, k, rms_eps, mix, hc_mult, sinkhorn_iters, hc_eps):
+    global _hc_sinkhorn_checked
+    if _hc_sinkhorn_checked >= _HC_ROWS_CHECK:
+        return
+    _hc_sinkhorn_checked += 1
+    m = part_sq.shape[1]
+    ref = tuple(torch.empty_like(t) for t in outs)
+    _hc_mix_reduce_sinkhorn_vec_kernel[(m,)](
+        part_mix, part_sq, torch.empty((m, 32), dtype=torch.float32, device=part_mix.device), scale, base, *ref,
+        m, 1.0 / k, rms_eps, MIX=mix, HC=hc_mult, NUM_SLICES=1, SLICES_PAD=1, ITERS=sinkhorn_iters, EPS=hc_eps,
+        PARTIALS_ROW_MAJOR=_partials_row_major(part_mix), num_warps=_HC_SINKHORN_NUM_WARPS,
+    )
+    logger.info(
+        "gfx942 HIP HC sinkhorn check %d: rows=%d max|d pre| %.3g max|d post| %.3g max|d comb| %.3g",
+        _hc_sinkhorn_checked,
+        m,
+        *(float((a - b).abs().max()) for a, b in zip(outs, ref)),
+    )
+
+
+def _hc_weights_hilo(hc_fn: torch.Tensor) -> torch.Tensor:
+    """[64, k] bf16: hi rows, lo rows, zero rows of the fp32 mixing weights, cached on the weight tensor."""
+    cached = getattr(hc_fn, "_gfx942_hilo", None)
+    if cached is not None and cached[0] == hc_fn._version:
+        return cached[1]
+    hi = hc_fn.to(torch.bfloat16)
+    pad = hi.new_zeros(64 - 2 * hc_fn.shape[0], hc_fn.shape[1])
+    hilo = torch.cat([hi, (hc_fn - hi.float()).to(torch.bfloat16), pad], 0)
+    hc_fn._gfx942_hilo = (hc_fn._version, hilo)
+    return hilo
+
+
+def _hc_boundary_rows_gfx942(x, residual, post_in, comb_in, pre_prev, hc_fn, residual_out, y):
+    """([1, m, mix] partials, [1, m] sums of squares) from the row kernel + GEMM, or None where it does not apply."""
+    m, hc_mult, h = residual.shape
+    if (
+        m < _HC_ROWS_MIN_M
+        or hc_mult != 4
+        or h % 512
+        or residual.data_ptr() % 16
+        or (x is not None and (x.stride(0) % 8 or x.data_ptr() % 16))
+        # the hi + lo weight cache must not be created inside a graph capture
+        or (torch.cuda.is_current_stream_capturing() and getattr(hc_fn, "_gfx942_hilo", None) is None)
+    ):
+        return None
+    kernels = _hc_rows_kernels_gfx942()
+    if kernels is None:
+        return None
+    if pre_prev is not None:
+        pre_prev = pre_prev.float().contiguous()
+    sq = torch.empty(m, dtype=torch.float32, device=residual.device)
+    ptr = lambda t: 0 if t is None else t.data_ptr()  # noqa: E731
+    args = _HcRowArgs(
+        ptr(x), residual.data_ptr(), ptr(post_in), ptr(comb_in), ptr(pre_prev), ptr(residual_out), ptr(y),
+        sq.data_ptr(), 0 if x is None else x.stride(0), residual.stride(0), m, h,
+    )
+    kernel = kernels[(x is not None, pre_prev is not None)]
+    kernel.launch(triton.cdiv(m, 4), args, torch.cuda.current_stream().cuda_stream, 256, 0)
+    mix = hc_fn.shape[0]
+    copies = (residual if x is None else residual_out).view(m, hc_mult * h)
+    hilo = _hc_weights_hilo(hc_fn)
+    # hipBLASLt picks very different kernels across these shapes (k = 20480, MI308X): N padded to 64 is fastest below
+    # 12288 rows (6144: 109 vs 241 us at N = 48), the transposed product above (16384: 371 vs 551 us)
+    if m >= 12288:
+        dots = torch.mm(hilo[: 2 * mix], copies.t(), out_dtype=torch.float32)
+        mixes = (dots[:mix] + dots[mix : 2 * mix]).t().contiguous()
+    else:
+        dots = torch.mm(copies, hilo.t(), out_dtype=torch.float32)
+        mixes = dots[:, :mix] + dots[:, mix : 2 * mix]
+    part_mix, part_sq = mixes.unsqueeze(0), sq.unsqueeze(0)
+    if _HC_ROWS_CHECK:
+        _check_hc_rows(x, residual, post_in, comb_in, pre_prev, hc_fn, residual_out, y, part_mix, part_sq)
+    return part_mix, part_sq
+
+
+def _check_hc_rows(x, residual, post_in, comb_in, pre_prev, hc_fn, residual_out, y, part_mix, part_sq):
+    global _hc_rows_checked
+    if _hc_rows_checked >= _HC_ROWS_CHECK:
+        return
+    _hc_rows_checked += 1
+    ref_out = None if residual_out is None else torch.empty_like(residual_out)
+    ref_y = None if y is None else torch.empty_like(y)
+    pm, ps = _hc_boundary_partials(
+        x, residual, post_in, comb_in, pre_prev, hc_fn, ref_out, ref_y, hc_mult=residual.shape[1]
+    )
+    same = all(
+        (a is None and b is None) or torch.equal(a, b) for a, b in ((residual_out, ref_out), (y, ref_y))
+    )
+    ref_mix, ref_sq = pm.sum(0), ps.sum(0)
+    logger.info(
+        "gfx942 HIP HC rows check %d: rows=%d post=%d combine=%d residual_out/y identical %s "
+        "rel d(dots) %.3g rel d(sq) %.3g",
+        _hc_rows_checked,
+        residual.shape[0],
+        x is not None,
+        y is not None,
+        same,
+        float((part_mix[0] - ref_mix).abs().max() / ref_mix.abs().max()),
+        float((part_sq[0] - ref_sq).abs().max() / ref_sq.abs().max()),
+    )
+
+
 def hc_boundary_fused_deferred(
     x: Optional[torch.Tensor],
     residual: torch.Tensor,
@@ -829,17 +1039,23 @@ def hc_boundary_fused_deferred(
         y = torch.empty((m, h), dtype=residual.dtype, device=dev)
     else:
         y = None
-    part_mix, part_sq = _hc_boundary_partials(
-        x,
-        residual,
-        post_in,
-        comb_in,
-        pre_prev,
-        hc_fn,
-        residual_out,
-        y,
-        hc_mult=hc_mult,
+    rows = _hc_boundary_rows_gfx942(
+        x, residual, post_in, comb_in, pre_prev, hc_fn, residual_out, y
     )
+    if rows is not None:
+        part_mix, part_sq = rows
+    else:
+        part_mix, part_sq = _hc_boundary_partials(
+            x,
+            residual,
+            post_in,
+            comb_in,
+            pre_prev,
+            hc_fn,
+            residual_out,
+            y,
+            hc_mult=hc_mult,
+        )
     coefficients = HcCoefficients(
         part_mix,
         part_sq,

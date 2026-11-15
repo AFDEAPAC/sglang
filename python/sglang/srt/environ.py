@@ -1988,6 +1988,13 @@ class Envs:
     # sinkhorn row reads one contiguous run instead of a slice-strided gather. Same outputs bit
     # for bit; the reduce + sinkhorn of a 16K-row prefill chunk runs 3.0x faster on MI308X.
     SGLANG_GFX942_HC_PARTIALS_ROW_MAJOR = EnvBool(_default_gfx942)
+    # Prefill boundaries (>= 1024 rows) on hc_post_rows_gfx942.hip, one wave per row, with the mixing dots as one GEMM
+    # (bf16 hi + lo weights, fp32 out). MI308X, 4096 rows with post and combine: 351 us vs 656 us for the Triton
+    # partials and their reduce + sinkhorn; residual_out and y bit for bit, coefficients within 1e-5 relative.
+    SGLANG_GFX942_HIP_HC_BOUNDARY_ROWS = EnvBool(_default_gfx942)
+    # Their one-slice reduce + sinkhorn on hc_sinkhorn_rows_gfx942 (one thread per row) instead of a 4-wave Triton
+    # program per row. Coefficients agree to fp32 rounding (different exp / division instruction sequences).
+    SGLANG_GFX942_HIP_HC_SINKHORN_ROWS = EnvBool(_default_gfx942)
     # Decode GEMV: upper bound on M, and the weight layout. MAX_M defaults to 0
     # upstream, which disables the path even when the switch is on.
     SGLANG_GFX942_FP8_GEMV_MAX_M = EnvInt(lambda: 8 if _default_gfx942() else 0)
