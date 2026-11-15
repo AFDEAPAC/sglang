@@ -3111,6 +3111,7 @@ _HIP_SPLIT_COST = 0.2
 # Eager calls also run the Triton split-K path and log how the outputs compare.
 _HIP_CHECK = int(os.environ.get("SGLANG_GFX942_HIP_SPARSE_DECODE_CHECK", "0"))
 _hip_kernel = None
+_hip_kernel_prefill = None
 _hip_zero: dict = {}
 _hip_checked = 0
 
@@ -3165,7 +3166,7 @@ class _HipArgs(ctypes.Structure):
 
 def _hip_sparse_decode_kernel():
     """The HIP sparse decode kernel, built with hipcc at first use; None when off or unavailable."""
-    global _hip_kernel
+    global _hip_kernel, _hip_kernel_prefill
     if _hip_kernel is None:
         _hip_kernel = False
         if envs.SGLANG_GFX942_HIP_SPARSE_DECODE.get() and is_gfx942_supported():
@@ -3183,6 +3184,7 @@ def _hip_sparse_decode_kernel():
                 mod = ctypes.c_void_p()
                 check_hip(hip_lib().hipModuleLoad(ctypes.byref(mod), co.encode()), "load")
                 _hip_kernel = HipKernel(mod, "sparse_mla_decode_gfx942")
+                _hip_kernel_prefill = HipKernel(mod, "sparse_mla_prefill_gfx942")
             except (OSError, subprocess.CalledProcessError, RuntimeError) as e:
                 logger.warning(
                     "gfx942 HIP sparse decode unavailable, keeping the Triton kernel: %s", e
@@ -3231,6 +3233,8 @@ def _hip_dual_scope(
     kernel = _hip_sparse_decode_kernel()
     if kernel is None:
         return None
+    if not pooled and envs.SGLANG_GFX942_HIP_SPARSE_PREFILL_SPLIT_QK.get():
+        kernel = _hip_kernel_prefill
     device = q.device
     zero = _hip_zero.get(device)
     if zero is None:

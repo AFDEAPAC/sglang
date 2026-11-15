@@ -404,3 +404,271 @@ __device__ __forceinline__ void run(const Args& a, const QOps& s_q, int lane, in
         a.plse[(size_t)split * a.plse_s + (size_t)t * a.plse_t + (size_t)n * a.plse_h] = lse;
     }
 }
+
+// ---- prefill variant ---------------------------------------------------------------------------------------------
+// The two waves of a token range split the QK^T work instead of both computing all of it: half 0 takes the fp8 chunks
+// 0-3, half 1 chunks 4-6 and the rope dims (16 MFMAs each, and each wave loads only those key bytes for QK^T). The
+// pair exchanges its partial scores through LDS and both form s = partial0 + partial1 in that order, so the halves
+// keep identical softmax states. Both ranges of a CTA run the same number of tiles (a shorter range's extra tiles are
+// empty) because the exchange needs a CTA barrier per tile.
+
+template <int HALF>
+__device__ __forceinline__ void load_qk_half(const Keys& k, int g, u32x4 (&kr)[5], u32x2 (&sc)[4]) {
+    if constexpr (HALF == 0) {
+#pragma unroll
+        for (int c = 0; c < 4; ++c) kr[c] = *(const u32x4*)(k.adata + 64 * c + 16 * g);
+    } else {
+#pragma unroll
+        for (int c = 0; c < 3; ++c) kr[c] = *(const u32x4*)(k.adata + 64 * (c + 4) + 16 * g);
+        kr[3] = *(const u32x4*)(k.adata + 448 + 32 * g);
+        kr[4] = *(const u32x4*)(k.adata + 448 + 32 * g + 16);
+    }
+#pragma unroll
+    for (int i = 0; i < 4; ++i) sc[i] = *(const u32x2*)k.cscale[i];
+}
+
+// This half's share of the scaled score of keys 4g + i for head n.
+template <int HALF>
+__device__ __forceinline__ void qk_half(const QOps& s_q, int lane, const u32x4 (&kr)[5], const u32x2 (&sc)[4],
+                                        float c_nope, float c_rope, float (&part)[4]) {
+    constexpr int C0 = HALF == 0 ? 0 : 4, NC = HALF == 0 ? 4 : 3;
+    float nope[4] = {0.f, 0.f, 0.f, 0.f};
+    f32x4 acc[2];
+#pragma unroll
+    for (int cc = 0; cc < NC; ++cc) {
+        const int c = C0 + cc;
+        const u32x4 qh = s_q.v[2 * c][lane], ql = s_q.v[2 * c + 1][lane];
+        f32x4& ac = acc[cc & 1];
+        ac = f32x4{0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+        for (int j = 0; j < 2; ++j) {
+            const long ka8 = (long)u64(kr[cc][2 * j], kr[cc][2 * j + 1]);
+            ac = __builtin_amdgcn_mfma_f32_16x16x32_fp8_fp8(ka8, (long)u64(qh[2 * j], qh[2 * j + 1]), ac, 0, 0, 0);
+            ac = __builtin_amdgcn_mfma_f32_16x16x32_fp8_fp8(ka8, (long)u64(ql[2 * j], ql[2 * j + 1]), ac, 0, 0, 0);
+        }
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const uint32_t e = c < 4 ? (sc[i][0] >> (8 * c)) & 0xffu : (sc[i][1] >> (8 * (c - 4))) & 0xffu;
+            nope[i] += pow2_e8m0(e) * ac[i];
+        }
+    }
+    if constexpr (HALF == 0) {
+#pragma unroll
+        for (int i = 0; i < 4; ++i) part[i] = c_nope * nope[i];
+    } else {
+        f32x4 ar = {0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+        for (int p = 0; p < 2; ++p) {
+            const u32x4 qr = s_q.v[14 + p][lane];
+#pragma unroll
+            for (int h2 = 0; h2 < 2; ++h2)
+                ar = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(bf16x4(kr[3 + p][2 * h2], kr[3 + p][2 * h2 + 1]),
+                                                               bf16x4(qr[2 * h2], qr[2 * h2 + 1]), ar, 0, 0, 0);
+        }
+#pragma unroll
+        for (int i = 0; i < 4; ++i) part[i] = c_nope * nope[i] + c_rope * ar[i];
+    }
+}
+
+template <int HALF>
+__device__ __forceinline__ void run_split(const Args& a, const QOps& s_q, f32x4 (*s_x)[4][64], int lane, int wave,
+                                          int n, int g, int t, int split, int b, int k0, int k1, int n_iter,
+                                          float c_nope, float c_rope) {
+    const int32_t* idx_main_row = a.idx_main + (size_t)t * a.idx_main_t;
+    const int32_t* idx_extra_row = a.idx_extra + (size_t)t * a.idx_extra_t;
+    const int len_main = a.len_main[b], len_extra = a.len_extra[b];
+
+    f32x4 o[16];
+#pragma unroll
+    for (int i = 0; i < 16; ++i) o[i] = f32x4{0.f, 0.f, 0.f, 0.f};
+    float m_run = -INFINITY, l_run = 0.f;
+
+    Tile cur_t = tile_at(a, idx_main_row, idx_extra_row, len_main, len_extra, k0, k1);
+    Keys cur;
+    u32x4 kr[5];
+    u32x2 sc[4];
+    {
+        const bool live = k0 < k1 && cur_t.len > 0;
+        const int ia = live && n < cur_t.len ? cur_t.idx[n] : -1;
+        const u32x4 kci = live ? *(const u32x4*)(cur_t.idx + 4 * g) : u32x4{0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu};
+        cur = keys_of(cur_t, a.zero, ia, kci, n, g);
+        load_qk_half<HALF>(cur, g, kr, sc);
+    }
+
+    for (int it = 0; it < n_iter; ++it) {
+        const int tile = k0 + 16 * it;
+        const Tile nxt_t = tile_at(a, idx_main_row, idx_extra_row, len_main, len_extra, tile + 16, k1);
+        const bool next_live = tile + 16 < k1 && nxt_t.len > 0;
+        int ia_n = -1;
+        u32x4 kci_n = {0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu};
+        if (next_live) {
+            ia_n = n < nxt_t.len ? nxt_t.idx[n] : -1;
+            kci_n = *(const u32x4*)(nxt_t.idx + 4 * g);
+        }
+        uint32_t vx[4][4];
+        u32x2 r[4];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            if constexpr (HALF == 0) {
+#pragma unroll
+                for (int cc = 0; cc < 4; ++cc) vx[i][cc] = *(const uint32_t*)(cur.cdata[i] + 64 * cc + 4 * n);
+            } else {
+#pragma unroll
+                for (int cc = 0; cc < 3; ++cc) vx[i][cc] = *(const uint32_t*)(cur.cdata[i] + 256 + 64 * cc + 4 * n);
+                r[i] = *(const u32x2*)(cur.cdata[i] + 448 + 8 * n);
+            }
+        }
+
+        float part[4];
+        qk_half<HALF>(s_q, lane, kr, sc, c_nope, c_rope, part);
+        u32x2 sc_cur[4];
+        bool cv[4];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            sc_cur[i] = sc[i];
+            cv[i] = cur.cvalid[i];
+        }
+        s_x[it & 1][wave][lane] = f32x4{part[0], part[1], part[2], part[3]};
+        __builtin_amdgcn_sched_barrier(0);
+
+        if (next_live) {
+            cur = keys_of(nxt_t, a.zero, ia_n, kci_n, n, g);
+            load_qk_half<HALF>(cur, g, kr, sc);
+        } else {
+            cur = keys_of(nxt_t, a.zero, -1, kci_n, n, g);
+#pragma unroll
+            for (int i = 0; i < 4; ++i) sc[i] = u32x2{0u, 0u};
+        }
+        cur_t = nxt_t;
+
+        __syncthreads();
+        const f32x4 other = s_x[it & 1][wave ^ 1][lane];
+        float s[4];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) s[i] = cv[i] ? (HALF == 0 ? part[i] + other[i] : other[i] + part[i]) : -INFINITY;
+
+        float tmax = fmaxf(fmaxf(s[0], s[1]), fmaxf(s[2], s[3]));
+        tmax = fmaxf(tmax, __shfl_xor(tmax, 16));
+        tmax = fmaxf(tmax, __shfl_xor(tmax, 32));
+        const float m_new = fmaxf(m_run, tmax);
+        const bool none = m_new == -INFINITY;
+        const float alpha = none ? 1.f : exp2f(m_run - m_new);
+        float p[4];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) p[i] = none ? 0.f : exp2f(s[i] - m_new);
+        l_run = l_run * alpha + ((p[0] + p[1]) + (p[2] + p[3]));
+        m_run = m_new;
+        const i16x4 pa4 = bf16x4(rne_bf16_bits(p[0]) | (rne_bf16_bits(p[1]) << 16),
+                                 rne_bf16_bits(p[2]) | (rne_bf16_bits(p[3]) << 16));
+        if (__any(alpha != 1.f)) {
+            float al[4];
+#pragma unroll
+            for (int i = 0; i < 4; ++i) al[i] = __shfl(alpha, 4 * g + i);
+#pragma unroll
+            for (int blk = 0; blk < 16; ++blk)
+#pragma unroll
+                for (int i = 0; i < 4; ++i) o[blk][i] *= al[i];
+        }
+
+        if constexpr (HALF == 0) {
+            pv_chunks<0, 4>(pa4, vx, sc_cur, o);
+        } else {
+            pv_chunks<4, 3>(pa4, vx, sc_cur, o);
+#pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                const uint32_t sel = (k & 1) ? 0x07060302u : 0x05040100u;
+                const i16x4 vb = bf16x4(__builtin_amdgcn_perm(r[1][k / 2], r[0][k / 2], sel),
+                                        __builtin_amdgcn_perm(r[3][k / 2], r[2][k / 2], sel));
+                o[12 + k] = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(pa4, vb, o[12 + k], 0, 0, 0);
+            }
+        }
+    }
+
+    float l_tot = l_run + __shfl_xor(l_run, 16);
+    l_tot += __shfl_xor(l_tot, 32);
+    float* po = a.po + (size_t)split * a.po_s + (size_t)t * a.po_t;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const int h = 4 * g + i;
+        const float lh = __shfl(l_tot, h);
+        const float inv = lh > 0.f ? 1.f / lh : 0.f;
+        if (h < a.h_q) {
+            float* row = po + (size_t)h * a.po_h;
+#pragma unroll
+            for (int c = 0; c < 4; ++c) {
+                const int blk = 4 * c;
+                const int dim = HALF == 0 ? 64 * c + 4 * n : (c < 3 ? 64 * (c + 4) + 4 * n : 448 + 4 * n);
+                *(f32x4*)(row + dim) = f32x4{o[blk][i] * inv, o[blk + 1][i] * inv, o[blk + 2][i] * inv, o[blk + 3][i] * inv};
+            }
+        }
+    }
+    if (HALF == 0 && g == 0 && n < a.h_q) {
+        const float lse = l_tot > 0.f ? (m_run + log2f(l_tot)) * 0.6931471805599453f : INFINITY;
+        a.plse[(size_t)split * a.plse_s + (size_t)t * a.plse_t + (size_t)n * a.plse_h] = lse;
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(256) __attribute__((amdgpu_waves_per_eu(2)))
+sparse_mla_prefill_gfx942(Args a) {
+    __shared__ QOps s_q;
+    __shared__ float s_c[2][16];
+    __shared__ f32x4 s_x[2][4][64];  // partial scores, by tile parity, wave and lane
+    const int lane = threadIdx.x & 63;
+    const int wave = __builtin_amdgcn_readfirstlane(threadIdx.x >> 6);
+    const int half = wave & 1;
+    const int n = lane & 15, g = lane >> 4;
+    const int t = blockIdx.x / a.cta_splits;
+    const int split = (blockIdx.x - t * a.cta_splits) * 2 + (wave >> 1);
+    const int b = t / a.s_q;
+    const int total = a.topk_main + a.topk_extra;
+    const int k0 = split * a.per_split;
+    const int k1 = min(k0 + a.per_split, total);
+    const int n_iter = a.per_split / 16;
+    constexpr float LOG2E = 1.4426950408889634f;
+
+    if (wave == 0) {
+        const bool head_ok = n < a.h_q;
+        const uint16_t* qh = a.q + (size_t)t * a.q_t + (size_t)min(n, a.h_q - 1) * a.q_h;
+        u32x4 qraw[16];
+#pragma unroll
+        for (int c = 0; c < 7; ++c) {
+            qraw[2 * c] = head_ok ? *(const u32x4*)(qh + 64 * c + 16 * g) : u32x4{0, 0, 0, 0};
+            qraw[2 * c + 1] = head_ok ? *(const u32x4*)(qh + 64 * c + 16 * g + 8) : u32x4{0, 0, 0, 0};
+        }
+        qraw[14] = head_ok ? *(const u32x4*)(qh + 448 + 16 * g) : u32x4{0, 0, 0, 0};
+        qraw[15] = head_ok ? *(const u32x4*)(qh + 448 + 16 * g + 8) : u32x4{0, 0, 0, 0};
+        u16x2 mx = {0, 0};
+#pragma unroll
+        for (int i = 0; i < 14; ++i)
+#pragma unroll
+            for (int w = 0; w < 4; ++w)
+                mx = __builtin_elementwise_max(mx, __builtin_bit_cast(u16x2, (uint32_t)(qraw[i][w] & 0x7fff7fffu)));
+        uint32_t amax = max((uint32_t)mx[0], (uint32_t)mx[1]);
+        amax = max(amax, (uint32_t)__shfl_xor((int)amax, 16));
+        amax = max(amax, (uint32_t)__shfl_xor((int)amax, 32));
+        const int ef = (int)(amax >> 7);
+        const float qs = __uint_as_float((uint32_t)min(max(260 - ef, 1), 254) << 23);
+        const float qinv = __uint_as_float((uint32_t)min(max(ef - 6, 1), 254) << 23);
+#pragma unroll
+        for (int c = 0; c < 7; ++c) {
+            uint64_t hi0, lo0, hi1, lo1;
+            q_split(qraw[2 * c], qs, hi0, lo0);
+            q_split(qraw[2 * c + 1], qs, hi1, lo1);
+            s_q.v[2 * c][lane] = u32x4{(uint32_t)hi0, (uint32_t)(hi0 >> 32), (uint32_t)hi1, (uint32_t)(hi1 >> 32)};
+            s_q.v[2 * c + 1][lane] = u32x4{(uint32_t)lo0, (uint32_t)(lo0 >> 32), (uint32_t)lo1, (uint32_t)(lo1 >> 32)};
+        }
+        s_q.v[14][lane] = qraw[14];
+        s_q.v[15][lane] = qraw[15];
+        if (g == 0) {
+            s_c[0][n] = a.sm_scale * LOG2E * (ef > 0 ? qinv : 0.f);
+            s_c[1][n] = a.sm_scale * LOG2E;
+        }
+    }
+    __syncthreads();
+    const float c_nope = s_c[0][n], c_rope = s_c[1][n];
+
+    if (half == 0)
+        run_split<0>(a, s_q, s_x, lane, wave, n, g, t, split, b, k0, k1, n_iter, c_nope, c_rope);
+    else
+        run_split<1>(a, s_q, s_x, lane, wave, n, g, t, split, b, k0, k1, n_iter, c_nope, c_rope);
+}
