@@ -324,12 +324,19 @@ class ServerArgs:
         attention-DP groups when it is read back.
         """
 
+        memo = getattr(self, "_resolved_dict_memo", None)
+        if memo is not None:
+            return dict(memo)
         resolved = {
             field.name: _plain(resolution_result(self, field.name))
             for field in record_fields(type(self))
         }
         # TODO: drop together with `--enable-dp-attention` after 2026-12-31.
         resolved["enable_dp_attention"] = resolving_view(self).attn_dp_size > 1
+        # read-only after resolution; callers only replace top-level keys, so a shallow copy is enough
+        if getattr(self, "_resolution_finished", False):
+            self._resolved_dict_memo = resolved
+            return dict(resolved)
         return resolved
 
     LANGUAGE_MODEL_ONLY_ARCHITECTURES = (
