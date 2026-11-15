@@ -3205,9 +3205,10 @@ def _hip_splits(total_tokens: int, total_topk: int, device: torch.device) -> int
 
 def _hip_dual_scope(
     q, kv_main, idx_main, block_main, kv_extra, idx_extra, block_extra, sm_scale,
-    len_main, len_extra, attn_sink, s_q, inv_rope,
+    len_main, len_extra, attn_sink, s_q, inv_rope, pooled=True,
 ):
-    """(output, lse) from the HIP kernel and the par combine, or None where it does not apply."""
+    """(output, lse) from the HIP kernel and the par combine, or None where it does not apply. pooled keeps the
+    partials in SplitKBufferPool (fixed decode shapes, graph capture); prefill row counts change every batch."""
     total_tokens, h_q, d_qk = q.shape
     topk_main, topk_extra = idx_main.shape[1], idx_extra.shape[1]
     if (
@@ -3243,8 +3244,12 @@ def _hip_dual_scope(
     cs = _hip_splits(total_tokens, topk_main + topk_extra, device)
     splits = 2 * cs
     per_split = triton.cdiv(triton.cdiv(topk_main + topk_extra, splits), 16) * 16
-    bufs = SplitKBufferPool.get_buffers(splits, total_tokens, h_q, DSV4_D_V, device)
-    po, plse = bufs["partial_output"], bufs["partial_lse"]
+    if pooled:
+        bufs = SplitKBufferPool.get_buffers(splits, total_tokens, h_q, DSV4_D_V, device)
+        po, plse = bufs["partial_output"], bufs["partial_lse"]
+    else:
+        po = torch.empty(splits, total_tokens, h_q, DSV4_D_V, dtype=torch.float32, device=device)
+        plse = torch.empty(splits, total_tokens, h_q, dtype=torch.float32, device=device)
     output = torch.empty(total_tokens, h_q, DSV4_D_V, dtype=torch.bfloat16, device=device)
     lse = torch.empty(total_tokens, h_q, dtype=torch.float32, device=device)
     args = _HipArgs(
@@ -3259,6 +3264,50 @@ def _hip_dual_scope(
     kernel.launch(total_tokens * cs, args, torch.cuda.current_stream().cuda_stream, 256, 0)
     _launch_par_combine(po, plse, attn_sink, output, lse, splits, h_q, inv_rope)
     return output, lse
+
+
+def hip_dual_scope_prefill(
+    q, kv_main, idx_main, block_main, kv_extra, idx_extra, block_extra, sm_scale,
+    len_main, len_extra, attn_sink, s_q, inv_rope,
+):
+    """Extend / prefill rows on the HIP kernel (SGLANG_GFX942_HIP_SPARSE_PREFILL), or None where it does not apply."""
+    if not envs.SGLANG_GFX942_HIP_SPARSE_PREFILL.get():
+        return None
+    args = (
+        q, kv_main, idx_main, block_main, kv_extra, idx_extra, block_extra, sm_scale,
+        len_main, len_extra, attn_sink, s_q, inv_rope,
+    )
+    hip = _hip_dual_scope(*args, pooled=False)
+    if hip is not None and _HIP_CHECK:
+        _check_hip_prefill(hip[0], hip[1], args)
+    return hip
+
+
+def _check_hip_prefill(hip_out, hip_lse, args):
+    """Log how the HIP prefill output compares with the Triton prefill path on the same inputs."""
+    global _hip_checked
+    if _hip_checked >= _HIP_CHECK or torch.cuda.is_current_stream_capturing():
+        return
+    _hip_checked += 1
+    (q, kv_main, idx_main, block_main, kv_extra, idx_extra, block_extra, sm_scale,
+     len_main, len_extra, attn_sink, s_q, inv_rope) = args
+    ref_out, ref_lse = fused_gather_attn_decode_dsv4_dual_scope(
+        q, kv_main, idx_main, block_main, kv_extra, idx_extra, block_extra, sm_scale,
+        topk_length_main=len_main, topk_length_extra=len_extra, attn_sink=attn_sink, s_q=s_q,
+        force_no_splitk=not (SMALL_HEAD_PREFILL_SPLITK and q.shape[1] <= 16),
+    )
+    if inv_rope is not None:
+        _apply_inv_rope_standalone(ref_out, inv_rope)
+    d = (hip_out.float() - ref_out.float()).abs()
+    logger.info(
+        "gfx942 HIP sparse prefill check %d: tokens=%d heads=%d max|dO|=%.3g (max|O| %.3g) max|dlse|=%.3g",
+        _hip_checked,
+        hip_out.shape[0],
+        hip_out.shape[1],
+        float(d.max()),
+        float(ref_out.float().abs().max()),
+        float((hip_lse.float() - ref_lse.float().view_as(hip_lse)).abs().max()),
+    )
 
 
 def _check_hip_dual_scope(hip_out, hip_lse, triton_args):

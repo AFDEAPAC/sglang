@@ -23,6 +23,7 @@ from .triton_mla_kernels_decode_fused import (
     fused_gather_attn_decode_dsv4_dual_scope,
     fused_gather_attn_decode_dsv4_dual_scope_low_overhead,
     _apply_inv_rope_standalone,
+    hip_dual_scope_prefill,
 )
 
 
@@ -150,8 +151,8 @@ def _triton_sparse_attn_decode_dsv4(
             inv_rope=inv_rope,
         )
     else:
-        # Large batch / extend / prefill: fused no-splitk kernel
-        output, lse = fused_gather_attn_decode_dsv4_dual_scope(
+        # Large batch / extend / prefill: the gfx942 HIP kernel where it applies, else the fused no-splitk kernel
+        hip = hip_dual_scope_prefill(
             q_reshaped,
             kv_quantized_main,
             indices_main,
@@ -160,13 +161,31 @@ def _triton_sparse_attn_decode_dsv4(
             indices_extra,
             block_size_extra,
             sm_scale,
-            topk_length_main=kv_scope.topk_length,
-            topk_length_extra=extra_kv_scope.topk_length,
-            attn_sink=attn_sink,
-            s_q=s_q,
-            force_no_splitk=not (SMALL_HEAD_PREFILL_SPLITK and h_q <= 16),
+            kv_scope.topk_length,
+            extra_kv_scope.topk_length,
+            attn_sink,
+            s_q,
+            inv_rope,
         )
-        if inv_rope is not None:
-            _apply_inv_rope_standalone(output, inv_rope)
+        if hip is not None:
+            output, lse = hip
+        else:
+            output, lse = fused_gather_attn_decode_dsv4_dual_scope(
+                q_reshaped,
+                kv_quantized_main,
+                indices_main,
+                block_size_main,
+                extra_kv_scope.blocked_k_quantized,
+                indices_extra,
+                block_size_extra,
+                sm_scale,
+                topk_length_main=kv_scope.topk_length,
+                topk_length_extra=extra_kv_scope.topk_length,
+                attn_sink=attn_sink,
+                s_q=s_q,
+                force_no_splitk=not (SMALL_HEAD_PREFILL_SPLITK and h_q <= 16),
+            )
+            if inv_rope is not None:
+                _apply_inv_rope_standalone(output, inv_rope)
 
     return output.view(b, s_q, h_q, d_v), lse.view(b, s_q, h_q).transpose(1, 2)

@@ -1930,6 +1930,9 @@ class Envs:
     # fp8 MFMA from the cached e4m3fnuz keys and a hi + lo fp8 split of q, PV on the bf16 MFMA with bf16 p, partials
     # merged by the par combine. MI308X, 32 requests x 6 verify rows, 8 heads: 125 us vs 256 us for the Triton path.
     SGLANG_GFX942_HIP_SPARSE_DECODE = EnvBool(_default_gfx942)
+    # Extend / prefill rows of the same kernel instead of the Triton split-K prefill path. MI308X, 640 keys per row:
+    # 4096 rows x 8 heads 1847 us vs 2702 us, 16384 x 16 7951 us vs 12463 us.
+    SGLANG_GFX942_HIP_SPARSE_PREFILL = EnvBool(_default_gfx942)
 
     # Fused kernels: fewer launches and fewer round trips through memory.
     SGLANG_GFX942_FUSED_DSV41_RMS = EnvBool(_default_gfx942)
