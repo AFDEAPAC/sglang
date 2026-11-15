@@ -10,7 +10,8 @@ tokenizers (rayon) thread pool.
 A single message is often most of the prompt, so long gaps between added
 tokens are also cut at pre-token boundaries, but only for the exact
 Split-regex + ByteLevel + BPE pipeline of GLM / Llama-3 style tokenizers
-(``_INTRA_SPLIT_REGEX``). For that regex, a match containing a letter ends at
+(``_INTRA_SPLIT_REGEX``) and of DeepSeek-V3 / V4 (``_DEEPSEEK_SPLITS``, see
+there). For that regex, a match containing a letter ends at
 the last letter of a run (only the ``'s``-style and ``?\p{L}+`` alternatives
 contain letters) and a match containing ``\n`` never continues into a letter,
 so "letter|space letter" and "\n|letter" are always pre-token boundaries.
@@ -31,6 +32,10 @@ the prompt is not scanned and no length threshold applies, and the ids of the
 text between them are cached per tokenizer: text that recurs across requests,
 like the system prompt, the tool list and earlier turns, is encoded once.
 
+Where rayon runs serially (TOKENIZERS_PARALLELISM off, as the multimodal
+tokenizer manager sets it), the chunks go to a thread pool instead, one
+single-input encode_batch per task: it releases the GIL.
+
 Gated by SGLANG_PARALLEL_PROMPT_ENCODE and SGLANG_PARALLEL_PROMPT_ENCODE_MIN_CHARS.
 """
 
@@ -42,6 +47,7 @@ import threading
 import time
 import weakref
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from itertools import chain
 
 from sglang.srt.environ import envs
@@ -84,6 +90,22 @@ _INTRA_SPLIT_REGEX = (
 )
 # ASCII letters only: Python and Oniguruma agree on them for \p{L}.
 _INTRA_CUT = re.compile(r"(?<=[A-Za-z])(?= [A-Za-z])|(?<=\n)(?=[A-Za-z])")
+# DeepSeek-V3 / V4: digits in threes, CJK runs, then the third split (as
+# decoded from tokenizer.json: real CR / LF), each Isolated, then ByteLevel.
+# A letter run ends at the punctuation after it, which begins the next
+# pre-token (alone, after a space or before ASCII letters), so "ASCII letter |
+# ASCII punctuation" is always a pre-token boundary; no whitespace sits on
+# either side, so \s+(?!\S) is unaffected, and nothing looks behind. Checked
+# against the single encode on random-token, source, document, added-token
+# and fuzzed texts.
+_DEEPSEEK_SPLITS = (
+    "\\p{N}{1,3}",
+    "[\u4e00-\u9fa5\u3040-\u309f\u30a0-\u30ff]+",
+    "[!\"#$%&'()*+,\\-./:;<=>?@\\[\\\\\\]^_`{|}~][A-Za-z]+|[^\r\n\\p{L}\\p{P}\\p{S}]?[\\p{L}\\p{M}]+|"
+    " ?[\\p{P}\\p{S}]+[\r\n]*|\\s*[\r\n]+|\\s+(?!\\S)|\\s+",
+)
+_DEEPSEEK_INTRA_CUT = re.compile(r"(?<=[A-Za-z])(?=[!-/:-@\[-`{-~])")
+_THREADS = min(8, os.cpu_count() or 1)
 
 _plans = weakref.WeakKeyDictionary()
 _segment_encoders = weakref.WeakKeyDictionary()
@@ -91,6 +113,7 @@ _segment_encoders = weakref.WeakKeyDictionary()
 # disabled, e.g. after a fork). The PID prevents inheriting the parent's result.
 _parallel_pid = os.getpid()
 _parallel_ok = None
+_pool = None
 
 
 def _pre_tokenizer_safe(cfg):
@@ -126,25 +149,36 @@ def _post_processor_safe(cfg):
     return processor_type in _ID_PRESERVING_POST_PROCESSORS
 
 
-def _intra_cut_safe(cfg):
+def _normalizer_noop(cfg):
+    return cfg is None or (cfg.get("type") == "Sequence" and not cfg.get("normalizers"))
+
+
+def _intra_cut_for(cfg):
+    """The cut regex verified for this pre-tokenizer, or None."""
     pre = cfg.get("pre_tokenizer") or {}
     subs = pre.get("pretokenizers") if pre.get("type") == "Sequence" else None
-    if not subs or len(subs) != 2:
-        return False
-    split, bl = subs
     model = cfg.get("model") or {}
-    return (
-        cfg.get("normalizer") is None
-        and split.get("type") == "Split"
-        and split.get("pattern") == {"Regex": _INTRA_SPLIT_REGEX}
-        and split.get("behavior") == "Isolated"
-        and not split.get("invert")
-        and bl.get("type") == "ByteLevel"
-        and not bl.get("add_prefix_space")
-        and not bl.get("use_regex")
-        and model.get("type") == "BPE"
-        and model.get("dropout") is None
-    )
+    if (
+        not subs
+        or not _normalizer_noop(cfg.get("normalizer"))
+        or model.get("type") != "BPE"
+        or model.get("dropout") is not None
+    ):
+        return None
+    *splits, bl = subs
+    if bl.get("type") != "ByteLevel" or bl.get("add_prefix_space") or bl.get("use_regex"):
+        return None
+    if any(
+        s.get("type") != "Split" or s.get("behavior") != "Isolated" or s.get("invert")
+        for s in splits
+    ):
+        return None
+    patterns = tuple((s.get("pattern") or {}).get("Regex") for s in splits)
+    if patterns == (_INTRA_SPLIT_REGEX,):
+        return _INTRA_CUT
+    if patterns == _DEEPSEEK_SPLITS:
+        return _DEEPSEEK_INTRA_CUT
+    return None
 
 
 def _alternation(tokens):
@@ -195,8 +229,8 @@ def _build_plan(tokenizer):
     # Normalized added tokens are matched on normalized text in a second pass.
     # Without a normalizer that text is the original, so their ends are cut
     # points too; with one, only the first-pass (raw) tokens are used.
-    npattern = _alternation(normed) if backend.normalizer is None else None
-    intra = _INTRA_CUT if _intra_cut_safe(cfg) else None
+    npattern = _alternation(normed) if _normalizer_noop(cfg.get("normalizer")) else None
+    intra = _intra_cut_for(cfg)
     if pattern is None and npattern is None and intra is None:
         return None
     pp = backend.post_processor
@@ -256,17 +290,28 @@ def split_prompt(text, pattern, npattern, intra=None, max_chunks=_MAX_CHUNKS):
     return chunks
 
 
+def _thread_encode(backend, chunks):
+    global _pool
+    if _pool is None:
+        _pool = ThreadPoolExecutor(max_workers=_THREADS, thread_name_prefix="prompt-encode")
+    return list(
+        chain.from_iterable(
+            _pool.map(lambda c: backend.encode_batch([c], add_special_tokens=False)[0].ids, chunks)
+        )
+    )
+
+
 def parallel_prompt_encode(tokenizer, text, encode_kwargs=None):
     """Drop-in for ``tokenizer.encode(text, **encode_kwargs)``."""
-    global _parallel_ok, _parallel_pid
+    global _parallel_ok, _parallel_pid, _pool
     pid = os.getpid()
     if pid != _parallel_pid:
         _parallel_pid = pid
         _parallel_ok = None
+        _pool = None
     encode_kwargs = encode_kwargs or {}
     if (
-        _parallel_ok is False
-        or not envs.SGLANG_PARALLEL_PROMPT_ENCODE.get()
+        not envs.SGLANG_PARALLEL_PROMPT_ENCODE.get()
         or not isinstance(text, str)
         or len(text) < envs.SGLANG_PARALLEL_PROMPT_ENCODE_MIN_CHARS.get()
         or set(encode_kwargs) - {"add_special_tokens"}
@@ -285,8 +330,10 @@ def parallel_prompt_encode(tokenizer, text, encode_kwargs=None):
     ):
         return tokenizer.encode(text, **encode_kwargs)
     chunks = split_prompt(text, pattern, npattern, intra)
-    if len(chunks) < 2:
+    if len(chunks) < 2 or (_parallel_ok is False and _THREADS < 2):
         return tokenizer.encode(text, **encode_kwargs)
+    if _parallel_ok is False:
+        return _thread_encode(backend, chunks)
 
     check = _parallel_ok is None
     if check:
@@ -295,14 +342,17 @@ def parallel_prompt_encode(tokenizer, text, encode_kwargs=None):
     if check:
         wall, cpu = time.perf_counter() - w0, time.process_time() - c0
         # Rayon worker CPU adds up well beyond wall time. Serial stays near 1.0;
-        # 1.5 leaves headroom for scheduler and measurement noise.
-        _parallel_ok = not (wall > 0.005 and cpu < 1.5 * wall)
-        if not _parallel_ok:
-            logger.warning(
-                "parallel_prompt_encode: tokenizers encode_batch runs serially in "
-                "this process (TOKENIZERS_PARALLELISM off or process forked after "
-                "tokenizers used its pool); using the original encode."
-            )
+        # 1.5 leaves headroom for scheduler and measurement noise. A call under
+        # 5 ms is too short to tell, so the next one checks again.
+        if wall > 0.005:
+            _parallel_ok = cpu >= 1.5 * wall
+            if not _parallel_ok:
+                logger.warning(
+                    "parallel_prompt_encode: tokenizers encode_batch runs serially in "
+                    "this process (TOKENIZERS_PARALLELISM off or process forked after "
+                    "tokenizers used its pool); encoding the chunks on %d threads.",
+                    _THREADS,
+                )
     return list(chain.from_iterable(e.ids for e in encodings))
 
 

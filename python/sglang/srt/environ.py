@@ -1722,8 +1722,9 @@ class Envs:
     # Encode long rendered chat prompts as chunks on the tokenizers thread pool.
     SGLANG_PARALLEL_PROMPT_ENCODE = EnvBool(True)
     # Shorter prompts use the single-call encode; below this the gain is eaten
-    # by rayon dispatch and the id merge.
-    SGLANG_PARALLEL_PROMPT_ENCODE_MIN_CHARS = EnvInt(32768)
+    # by the dispatch and the id merge. DeepSeek-V4.1 tokenizer, MI308X host:
+    # a 29 K character prompt (6144 random tokens) 14 -> 3 ms.
+    SGLANG_PARALLEL_PROMPT_ENCODE_MIN_CHARS = EnvInt(8192)
     SGLANG_REQUEST_STATE_WAIT_TIMEOUT = EnvInt(4)
     SGLANG_DEFAULT_THINKING = EnvBool(False)
 

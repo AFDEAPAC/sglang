@@ -74,6 +74,7 @@ from sglang.srt.layers.joint_schema_head import (
     parse_decision_layout,
 )
 from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
+from sglang.srt.entrypoints.openai.parallel_prompt_encode import parallel_prompt_encode
 from sglang.srt.managers.async_dynamic_batch_tokenizer import AsyncDynamicbatchTokenizer
 from sglang.srt.managers.disagg_service import start_disagg_service
 from sglang.srt.managers.embed_types import PositionalEmbeds
@@ -1063,6 +1064,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
             if not is_cross_encoder and (not getattr(self.tokenizer, "is_fast", False)):
                 input_ids = [self.tokenizer.encode(t) for t in tokenizer_input]
+                token_type_ids = None
+            elif not is_cross_encoder and input_format == InputFormat.SINGLE_STRING:
+                input_ids = [parallel_prompt_encode(self.tokenizer, tokenizer_input[0])]
                 token_type_ids = None
             else:
                 encoded = self.tokenizer(tokenizer_input, **tokenizer_kwargs)
