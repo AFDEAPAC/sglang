@@ -4110,6 +4110,11 @@ def require_mlp_tp_gather(*, moe_a2a_backend=None):
             # bucket on every EP rank. As for FlashInfer A2A above, this only
             # enables DP-count bookkeeping; expert inputs remain local.
             return True
+        elif moe_a2a_backend.is_megamoe() and envs.SGLANG_AMD_USE_FLYDSL_MEGA_MOE.get():
+            # Aiter MegaMoEv2 is rank-synchronous, so it needs the same
+            # bookkeeping; it also gives graph capture the global DP buffer
+            # length that DP-sharded lookups (DSV4.1 engram) gather into.
+            return True
         elif moe_a2a_backend.is_mori() and envs.SGLANG_MORI_RECV_BOUND.get():
             # Same bookkeeping, for the same reason. Bounding mori's receive
             # buffer means baking a fan-in size into a captured graph, and the
