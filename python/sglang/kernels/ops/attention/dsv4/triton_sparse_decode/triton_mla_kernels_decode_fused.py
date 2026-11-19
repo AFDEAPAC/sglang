@@ -3207,23 +3207,24 @@ def _hip_splits(total_tokens: int, total_topk: int, device: torch.device) -> int
 
 def _hip_dual_scope(
     q, kv_main, idx_main, block_main, kv_extra, idx_extra, block_extra, sm_scale,
-    len_main, len_extra, attn_sink, s_q, inv_rope, pooled=True,
+    len_main, len_extra, attn_sink, s_q, inv_rope, pooled=True, out=None,
 ):
     """(output, lse) from the HIP kernel and the par combine, or None where it does not apply. pooled keeps the
-    partials in SplitKBufferPool (fixed decode shapes, graph capture); prefill row counts change every batch."""
+    partials in SplitKBufferPool (fixed decode shapes, graph capture); prefill row counts change every batch.
+    out: (output, lse) views to write into instead of allocating."""
     total_tokens, h_q, d_qk = q.shape
     if h_q > 16 and h_q % 16 == 0 and envs.SGLANG_GFX942_HIP_SPARSE_HEAD_SPLIT.get():
-        parts = []
+        output = torch.empty(total_tokens, h_q, DSV4_D_V, dtype=torch.bfloat16, device=q.device)
+        lse = torch.empty(total_tokens, h_q, dtype=torch.float32, device=q.device)
         for h0 in range(0, h_q, 16):
             part = _hip_dual_scope(
                 q[:, h0:h0 + 16], kv_main, idx_main, block_main, kv_extra, idx_extra, block_extra, sm_scale,
                 len_main, len_extra, None if attn_sink is None else attn_sink[h0:h0 + 16], s_q, inv_rope,
-                pooled=pooled,
+                pooled=pooled, out=(output[:, h0:h0 + 16], lse[:, h0:h0 + 16]),
             )
             if part is None:
                 return None
-            parts.append(part)
-        return torch.cat([p[0] for p in parts], dim=1), torch.cat([p[1] for p in parts], dim=1)
+        return output, lse
     topk_main, topk_extra = idx_main.shape[1], idx_extra.shape[1]
     if (
         h_q > 16
@@ -3251,7 +3252,7 @@ def _hip_dual_scope(
     zero = _hip_zero.get(device)
     if zero is None:
         zero = _hip_zero[device] = torch.zeros(640, dtype=torch.uint8, device=device)
-    if q.dtype != torch.bfloat16 or not q.is_contiguous():
+    if q.dtype != torch.bfloat16 or q.stride(2) != 1:
         q = q.to(torch.bfloat16).contiguous()
     kv_m = kv_main.view(torch.uint8)
     kv_e = kv_extra.view(torch.uint8)
@@ -3266,8 +3267,11 @@ def _hip_dual_scope(
     else:
         po = torch.empty(splits, total_tokens, h_q, DSV4_D_V, dtype=torch.float32, device=device)
         plse = torch.empty(splits, total_tokens, h_q, dtype=torch.float32, device=device)
-    output = torch.empty(total_tokens, h_q, DSV4_D_V, dtype=torch.bfloat16, device=device)
-    lse = torch.empty(total_tokens, h_q, dtype=torch.float32, device=device)
+    if out is None:
+        output = torch.empty(total_tokens, h_q, DSV4_D_V, dtype=torch.bfloat16, device=device)
+        lse = torch.empty(total_tokens, h_q, dtype=torch.float32, device=device)
+    else:
+        output, lse = out
     args = _HipArgs(
         q.data_ptr(), kv_m.data_ptr(), idx_main.data_ptr(), len_main.data_ptr(),
         kv_e.data_ptr(), idx_extra.data_ptr(), len_extra.data_ptr(), po.data_ptr(),
