@@ -3579,6 +3579,10 @@ class DeepseekV4DecoderLayerBase(nn.Module):
                 from aiter.ops.mhc import mhc_post as _aiter_mhc_post
 
                 result = torch.empty_like(residual)
+                # An idle DP-attention rank has no rows; aiter's kernel would
+                # launch an empty grid (hipErrorInvalidConfiguration).
+                if residual.shape[0] == 0:
+                    return result
                 _aiter_mhc_post(result, x, residual, post, comb)
                 return result
             except Exception as err:  # noqa: BLE001 - degrade, do not kill the server
