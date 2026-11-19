@@ -3212,6 +3212,18 @@ def _hip_dual_scope(
     """(output, lse) from the HIP kernel and the par combine, or None where it does not apply. pooled keeps the
     partials in SplitKBufferPool (fixed decode shapes, graph capture); prefill row counts change every batch."""
     total_tokens, h_q, d_qk = q.shape
+    if h_q > 16 and h_q % 16 == 0 and envs.SGLANG_GFX942_HIP_SPARSE_HEAD_SPLIT.get():
+        parts = []
+        for h0 in range(0, h_q, 16):
+            part = _hip_dual_scope(
+                q[:, h0:h0 + 16], kv_main, idx_main, block_main, kv_extra, idx_extra, block_extra, sm_scale,
+                len_main, len_extra, None if attn_sink is None else attn_sink[h0:h0 + 16], s_q, inv_rope,
+                pooled=pooled,
+            )
+            if part is None:
+                return None
+            parts.append(part)
+        return torch.cat([p[0] for p in parts], dim=1), torch.cat([p[1] for p in parts], dim=1)
     topk_main, topk_extra = idx_main.shape[1], idx_extra.shape[1]
     if (
         h_q > 16

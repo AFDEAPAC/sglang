@@ -1937,6 +1937,9 @@ class Envs:
     # Those rows on sparse_mla_prefill_gfx942: the two waves of a token range split QK^T (chunks 0-3 / chunks 4-6 and
     # rope) and exchange partial scores through LDS instead of both computing all of it.
     SGLANG_GFX942_HIP_SPARSE_PREFILL_SPLIT_QK = EnvBool(_default_gfx942)
+    # More than 16 heads per rank (DP attention keeps all 64): run the HIP kernel per 16-head slice instead of
+    # falling back to Triton. The heads share the latent KV, so the slices are independent.
+    SGLANG_GFX942_HIP_SPARSE_HEAD_SPLIT = EnvBool(_default_gfx942)
 
     # Fused kernels: fewer launches and fewer round trips through memory.
     SGLANG_GFX942_FUSED_DSV41_RMS = EnvBool(_default_gfx942)
