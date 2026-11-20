@@ -3102,12 +3102,15 @@ class SplitKBufferPool:
 
 
 # gfx942: sparse_mla_decode_gfx942.hip writes the split-K partials (fp8 MFMA scores, bf16 PV) that the par combine
-# merges. Waves per SIMD of the kernel and the extra cost of a split, relative to one split's work, for _hip_splits.
+# merges. Waves per SIMD of the kernel, the extra cost of a split relative to one split's work, and the most CTA
+# splits for _hip_splits: the cost model has no term for a split's fixed work, and above 5 it picks splits that
+# measure slower (MI308X, 4 rows x 64 heads x 640 keys: 41.3 us at its 10 vs 30.5 us at 5).
 _HIP_SRC = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "sparse_mla_decode_gfx942.hip"
 )
 _HIP_WAVES_PER_SIMD = 2
 _HIP_SPLIT_COST = 0.2
+_HIP_MAX_CTA_SPLITS = 5
 # Eager calls also run the Triton split-K path and log how the outputs compare.
 _HIP_CHECK = int(os.environ.get("SGLANG_GFX942_HIP_SPARSE_DECODE_CHECK", "0"))
 _hip_kernel = None
@@ -3196,7 +3199,7 @@ def _hip_splits(total_tokens: int, total_topk: int, device: torch.device) -> int
     """CTA splits (2 token ranges each) minimizing resident-wave rounds x per-wave work plus a per-split cost."""
     slots = torch.cuda.get_device_properties(device).multi_processor_count * 4 * _HIP_WAVES_PER_SIMD
     best, best_cost = 1, float("inf")
-    for cs in range(1, 11):
+    for cs in range(1, _HIP_MAX_CTA_SPLITS + 1):
         if triton.cdiv(total_topk, 2 * cs) < 16:
             break
         cost = triton.cdiv(4 * total_tokens * cs, slots) * (1.0 / cs + _HIP_SPLIT_COST)
@@ -3207,27 +3210,15 @@ def _hip_splits(total_tokens: int, total_topk: int, device: torch.device) -> int
 
 def _hip_dual_scope(
     q, kv_main, idx_main, block_main, kv_extra, idx_extra, block_extra, sm_scale,
-    len_main, len_extra, attn_sink, s_q, inv_rope, pooled=True, out=None,
+    len_main, len_extra, attn_sink, s_q, inv_rope, pooled=True,
 ):
     """(output, lse) from the HIP kernel and the par combine, or None where it does not apply. pooled keeps the
-    partials in SplitKBufferPool (fixed decode shapes, graph capture); prefill row counts change every batch.
-    out: (output, lse) views to write into instead of allocating."""
+    partials in SplitKBufferPool (fixed decode shapes, graph capture); prefill row counts change every batch."""
     total_tokens, h_q, d_qk = q.shape
-    if h_q > 16 and h_q % 16 == 0 and envs.SGLANG_GFX942_HIP_SPARSE_HEAD_SPLIT.get():
-        output = torch.empty(total_tokens, h_q, DSV4_D_V, dtype=torch.bfloat16, device=q.device)
-        lse = torch.empty(total_tokens, h_q, dtype=torch.float32, device=q.device)
-        for h0 in range(0, h_q, 16):
-            part = _hip_dual_scope(
-                q[:, h0:h0 + 16], kv_main, idx_main, block_main, kv_extra, idx_extra, block_extra, sm_scale,
-                len_main, len_extra, None if attn_sink is None else attn_sink[h0:h0 + 16], s_q, inv_rope,
-                pooled=pooled, out=(output[:, h0:h0 + 16], lse[:, h0:h0 + 16]),
-            )
-            if part is None:
-                return None
-        return output, lse
+    head_groups = triton.cdiv(h_q, 16)
     topk_main, topk_extra = idx_main.shape[1], idx_extra.shape[1]
     if (
-        h_q > 16
+        (h_q > 16 and (h_q % 16 or not envs.SGLANG_GFX942_HIP_SPARSE_HEAD_SPLIT.get()))
         or d_qk != 512
         or topk_main % 16
         or topk_extra % 16
@@ -3258,7 +3249,7 @@ def _hip_dual_scope(
     kv_e = kv_extra.view(torch.uint8)
     len_main = len_main.to(torch.int32)
     len_extra = len_extra.to(torch.int32)
-    cs = _hip_splits(total_tokens, topk_main + topk_extra, device)
+    cs = _hip_splits(total_tokens * head_groups, topk_main + topk_extra, device)
     splits = 2 * cs
     per_split = triton.cdiv(triton.cdiv(topk_main + topk_extra, splits), 16) * 16
     if pooled:
@@ -3267,11 +3258,8 @@ def _hip_dual_scope(
     else:
         po = torch.empty(splits, total_tokens, h_q, DSV4_D_V, dtype=torch.float32, device=device)
         plse = torch.empty(splits, total_tokens, h_q, dtype=torch.float32, device=device)
-    if out is None:
-        output = torch.empty(total_tokens, h_q, DSV4_D_V, dtype=torch.bfloat16, device=device)
-        lse = torch.empty(total_tokens, h_q, dtype=torch.float32, device=device)
-    else:
-        output, lse = out
+    output = torch.empty(total_tokens, h_q, DSV4_D_V, dtype=torch.bfloat16, device=device)
+    lse = torch.empty(total_tokens, h_q, dtype=torch.float32, device=device)
     args = _HipArgs(
         q.data_ptr(), kv_m.data_ptr(), idx_main.data_ptr(), len_main.data_ptr(),
         kv_e.data_ptr(), idx_extra.data_ptr(), len_extra.data_ptr(), po.data_ptr(),
@@ -3281,7 +3269,7 @@ def _hip_dual_scope(
         po.stride(0), po.stride(1), po.stride(2), plse.stride(0), plse.stride(1), plse.stride(2),
         total_tokens, h_q, s_q, topk_main, topk_extra, per_split, cs,
     )
-    kernel.launch(total_tokens * cs, args, torch.cuda.current_stream().cuda_stream, 256, 0)
+    kernel.launch(total_tokens * head_groups * cs, args, torch.cuda.current_stream().cuda_stream, 256, 0)
     _launch_par_combine(po, plse, attn_sink, output, lse, splits, h_q, inv_rope)
     return output, lse
 

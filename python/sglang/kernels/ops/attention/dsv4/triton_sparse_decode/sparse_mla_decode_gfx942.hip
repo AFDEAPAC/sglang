@@ -170,16 +170,32 @@ template <int HALF>
 __device__ __forceinline__ void run(const Args& a, const QOps& s_q, int lane, int n, int g, int t, int split, int b,
                                     int k0, int k1, float c_nope, float c_rope);
 
+// CTAs are (token, 16-head group, CTA split) in that order. The Args of group hg see heads 16hg .. 16hg + 15 as
+// heads 0 .. 15, so one launch covers all h_q heads.
+__device__ __forceinline__ Args head_group(const Args& a, int th, int& t) {
+    const int groups = (a.h_q + 15) >> 4;
+    t = th / groups;
+    const int h0 = 16 * (th - t * groups);
+    Args r = a;
+    r.q += (size_t)h0 * a.q_h;
+    r.po += (size_t)h0 * a.po_h;
+    r.plse += (size_t)h0 * a.plse_h;
+    r.h_q = min(16, a.h_q - h0);
+    return r;
+}
+
 extern "C" __global__ void __launch_bounds__(256) __attribute__((amdgpu_waves_per_eu(2)))
-sparse_mla_decode_gfx942(Args a) {
+sparse_mla_decode_gfx942(Args args) {
     __shared__ QOps s_q;
     __shared__ float s_c[2][16];  // per head: nope and rope multipliers of the raw MFMA sums (log2 units)
     const int lane = threadIdx.x & 63;
     const int wave = __builtin_amdgcn_readfirstlane(threadIdx.x >> 6);
     const int half = wave & 1;
     const int n = lane & 15, g = lane >> 4;
-    const int t = blockIdx.x / a.cta_splits;
-    const int split = (blockIdx.x - t * a.cta_splits) * 2 + (wave >> 1);
+    const int th = blockIdx.x / args.cta_splits;
+    int t;
+    const Args a = head_group(args, th, t);
+    const int split = (blockIdx.x - th * a.cta_splits) * 2 + (wave >> 1);
     const int b = t / a.s_q;
     const int total = a.topk_main + a.topk_extra;
     const int k0 = split * a.per_split;
@@ -609,7 +625,7 @@ __device__ __forceinline__ void run_split(const Args& a, const QOps& s_q, f32x4 
 }
 
 extern "C" __global__ void __launch_bounds__(256) __attribute__((amdgpu_waves_per_eu(2)))
-sparse_mla_prefill_gfx942(Args a) {
+sparse_mla_prefill_gfx942(Args args) {
     __shared__ QOps s_q;
     __shared__ float s_c[2][16];
     __shared__ f32x4 s_x[2][4][64];  // partial scores, by tile parity, wave and lane
@@ -617,8 +633,10 @@ sparse_mla_prefill_gfx942(Args a) {
     const int wave = __builtin_amdgcn_readfirstlane(threadIdx.x >> 6);
     const int half = wave & 1;
     const int n = lane & 15, g = lane >> 4;
-    const int t = blockIdx.x / a.cta_splits;
-    const int split = (blockIdx.x - t * a.cta_splits) * 2 + (wave >> 1);
+    const int th = blockIdx.x / args.cta_splits;
+    int t;
+    const Args a = head_group(args, th, t);
+    const int split = (blockIdx.x - th * a.cta_splits) * 2 + (wave >> 1);
     const int b = t / a.s_q;
     const int total = a.topk_main + a.topk_extra;
     const int k0 = split * a.per_split;
