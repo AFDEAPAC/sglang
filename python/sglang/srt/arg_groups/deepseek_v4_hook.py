@@ -22,7 +22,7 @@ from sglang.srt.runtime_context import (
     derive_attn_tp_size,
     get_platform,
 )
-from sglang.srt.utils.common import is_gfx95_supported, is_npu
+from sglang.srt.utils.common import is_gfx95_supported, is_gfx942_supported, is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
@@ -395,6 +395,11 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
                 and cfg.attn_cp_size == 1
                 and (
                     (get_platform().is_hip and cfg.moe_a2a_backend == "none")
+                    or (
+                        get_platform().is_hip
+                        and cfg.moe_a2a_backend == "megamoe"
+                        and is_gfx942_supported()
+                    )
                     or (
                         get_platform().is_cuda
                         and cfg.moe_a2a_backend in ("none", "megamoe")
