@@ -73,7 +73,6 @@ def megamoe_prefill_only_recorder_enabled() -> bool:
     return (
         get_platform().is_hip
         and envs.SGLANG_AITER_MEGA_EPLB_PREFILL_ONLY.get()
-        and envs.SGLANG_AITER_MEGA_RANK_SYNC.get()
         and get_moe_a2a_backend().is_megamoe()
     )
 

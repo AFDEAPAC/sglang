@@ -2662,7 +2662,6 @@ def _post_process_topk_ids(
         if (
             envs.SGLANG_AITER_MEGA_EPLB_PREFILL_ONLY.get()
             and envs.SGLANG_AITER_MEGA_EPLB_FUSED_MAP_RECORD.get()
-            and envs.SGLANG_AITER_MEGA_RANK_SYNC.get()
             and layer_id is not None
         ):
             from sglang.srt.eplb.eplb_map_record_fused import (

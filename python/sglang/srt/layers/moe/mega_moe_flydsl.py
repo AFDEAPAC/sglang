@@ -235,6 +235,14 @@ def _swap_layer_weights(mega, layer) -> None:
     mega.w2_scale = layer._mega_w2_scale
 
 
+def refresh_after_expert_update(routed_experts_weights) -> None:
+    """EPLB rewrote expert rows of these tensors in place; rebuild the tables aiter
+    MegaMoE derived from their scales, which captured graphs read by address."""
+    data_ptrs = {tensor.data_ptr() for tensor in routed_experts_weights}
+    for mega in _MEGA_MOE_INSTANCE.values():
+        mega.refresh_sref(data_ptrs)
+
+
 def should_use_mega_moe(moe: DeepseekV2MoE, hidden_states: torch.Tensor) -> bool:
     if not get_moe_a2a_backend().is_megamoe():
         return False

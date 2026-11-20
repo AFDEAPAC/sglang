@@ -41,11 +41,6 @@ class TestMegaMoEPrefillRecorder(unittest.TestCase):
                 "SGLANG_AITER_MEGA_EPLB_PREFILL_ONLY.get",
                 return_value=True,
             ),
-            patch(
-                "sglang.srt.eplb.expert_distribution.envs."
-                "SGLANG_AITER_MEGA_RANK_SYNC.get",
-                return_value=True,
-            ),
         )
         for env_patch in self.env_patches:
             env_patch.start()

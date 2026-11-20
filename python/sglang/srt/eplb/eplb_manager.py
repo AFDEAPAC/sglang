@@ -18,7 +18,7 @@ from sglang.srt.eplb.expert_location import (
     get_global_expert_location_metadata,
 )
 from sglang.srt.eplb.expert_location_updater import ExpertLocationUpdater
-from sglang.srt.runtime_context import get_exec, get_model, get_parallel
+from sglang.srt.runtime_context import get_exec, get_model, get_parallel, get_platform
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -342,6 +342,19 @@ def update_expert_location_with_recovery(
                 get_model().load_format,
                 weight_name_filter=weight_name_filter,
             )
+
+    if get_platform().is_hip and envs.SGLANG_AMD_USE_FLYDSL_MEGA_MOE.get():
+        from sglang.srt.layers.moe import get_moe_a2a_backend
+
+        if get_moe_a2a_backend().is_megamoe():
+            from sglang.srt.layers.moe.mega_moe_flydsl import (
+                refresh_after_expert_update,
+            )
+
+            for layer_id in update_layer_ids:
+                refresh_after_expert_update(
+                    model.routed_experts_weights_of_layer[layer_id]
+                )
 
     # Re-init LPLB solvers after expert location update
     if ep_dispatch_algorithm == "lp":
