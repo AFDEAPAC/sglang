@@ -41,6 +41,14 @@ struct __attribute__((packed)) Args {
     int32_t kv_extra_block, extra_shift, idx_extra_t;
     int32_t po_s, po_t, po_h, plse_s, plse_t, plse_h;
     int32_t T, h_q, s_q, topk_main, topk_extra, per_split, cta_splits;
+    // sparse_mla_prefill_gfx942 with one CTA split: out != nullptr merges the two token ranges in the CTA and writes
+    // the bf16 output and lse instead of po / plse.
+    uint16_t* out;              // bf16 [T, h_q, 512]
+    float* lse;                 // [T, h_q]
+    const float* sink;          // [h_q] or nullptr
+    const float* freqs;         // inverse RoPE (cos, sin) pairs [positions, 64] or nullptr
+    const void* pos;            // [T] int32 or int64 (pos_i64)
+    int32_t out_t, out_h, lse_t, lse_h, fr_pos, pos_i64;
 };
 
 __device__ __forceinline__ float bf16_lo(uint32_t d) { return __uint_as_float(d << 16); }
@@ -180,6 +188,11 @@ __device__ __forceinline__ Args head_group(const Args& a, int th, int& t) {
     r.q += (size_t)h0 * a.q_h;
     r.po += (size_t)h0 * a.po_h;
     r.plse += (size_t)h0 * a.plse_h;
+    if (a.out) {
+        r.out += (size_t)h0 * a.out_h;
+        r.lse += (size_t)h0 * a.lse_h;
+        if (a.sink) r.sink += h0;
+    }
     r.h_q = min(16, a.h_q - h0);
     return r;
 }
@@ -486,10 +499,101 @@ __device__ __forceinline__ void qk_half(const QOps& s_q, int lane, const u32x4 (
     }
 }
 
+__device__ __forceinline__ float bf16_round(float x) { return __uint_as_float(rne_bf16_bits(x) << 16); }
+
+// One CTA split: range 1 (waves 2, 3) hands its normalized partial and lse to range 0 through LDS (the query
+// operands are dead after the last tile) in two 8-block phases, and range 0 merges them with the par combine's
+// arithmetic (split weights, sink, inverse RoPE on the bf16 value) and stores the bf16 output and lse.
 template <int HALF>
-__device__ __forceinline__ void run_split(const Args& a, const QOps& s_q, f32x4 (*s_x)[4][64], int lane, int wave,
-                                          int n, int g, int t, int split, int b, int k0, int k1, int n_iter,
-                                          float c_nope, float c_rope) {
+__device__ __forceinline__ void merge_store(const Args& a, const f32x4 (&o)[16], const float (&inv)[4], float lse_n,
+                                            float* s_m, float* s_lse, int lane, int n, int g, int t, int split) {
+    constexpr float LOG2E = 1.4426950408889634f;
+    float* buf = s_m + HALF * 2048;
+    if (split == 1 && HALF == 0 && g == 0) s_lse[n] = lse_n;
+    float w0[4], w1[4], lse_c[4];
+    uint16_t* orow = a.out + (size_t)t * a.out_t;
+#pragma unroll
+    for (int ph = 0; ph < 2; ++ph) {
+        if (split == 1) {
+#pragma unroll
+            for (int bl = 0; bl < 8; ++bl)
+#pragma unroll
+                for (int i = 0; i < 4; ++i) buf[(4 * bl + i) * 64 + lane] = o[8 * ph + bl][i] * inv[i];
+        }
+        __syncthreads();
+        if (split == 0) {
+            if (ph == 0) {
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    const int h = 4 * g + i;
+                    const float l0 = __shfl(lse_n, h), l1 = s_lse[h];
+                    const bool v0 = fabsf(l0) < 1e30f, v1 = fabsf(l1) < 1e30f;
+                    const float mx = fmaxf(fmaxf(-INFINITY, v0 ? l0 : -INFINITY), v1 ? l1 : -INFINITY);
+                    const float e0 = v0 ? exp2f((l0 - mx) * LOG2E) : 0.f;
+                    const float e1 = v1 ? exp2f((l1 - mx) * LOG2E) : 0.f;
+                    const float sum = e0 + e1;
+                    const bool none = sum == 0.f;
+                    const float sum_safe = none ? 1.f : sum;
+                    lse_c[i] = none ? INFINITY : mx + log2f(sum_safe) / LOG2E;
+                    float sink_scale = 1.f;
+                    if (a.sink) {
+                        const bool lonely = lse_c[i] > 1e30f;
+                        const float sk = h < a.h_q ? a.sink[h] : 0.f;
+                        const float d = fminf(fmaxf(sk - (lonely ? 0.f : lse_c[i]), -100.f), 100.f);
+                        sink_scale = lonely ? 1.f : 1.f / (1.f + exp2f(d * LOG2E));
+                    }
+                    w0[i] = none ? 0.f : (e0 / sum_safe) * sink_scale;
+                    w1[i] = none ? 0.f : (e1 / sum_safe) * sink_scale;
+                }
+            }
+#pragma unroll
+            for (int cq = 0; cq < 2; ++cq) {
+                const int c = 2 * ph + cq;
+                const int dim = HALF == 0 ? 64 * c + 4 * n : (c < 3 ? 64 * (c + 4) + 4 * n : 448 + 4 * n);
+                float x[4][4];
+#pragma unroll
+                for (int i = 0; i < 4; ++i)
+#pragma unroll
+                    for (int j = 0; j < 4; ++j)
+                        x[i][j] = __builtin_fmaf(w1[i], buf[(4 * (4 * cq + j) + i) * 64 + lane],
+                                                 w0[i] * (o[4 * c + j][i] * inv[i]));
+                if (HALF == 1 && c == 3 && a.freqs) {
+                    const long p = a.pos_i64 ? (long)((const int64_t*)a.pos)[t] : (long)((const int32_t*)a.pos)[t];
+                    const float* fr = a.freqs + (size_t)p * a.fr_pos + 4 * n;
+                    const float ca = fr[0], sa = fr[1], cb = fr[2], sb = fr[3];
+#pragma unroll
+                    for (int i = 0; i < 4; ++i) {
+                        const float y0 = bf16_round(x[i][0]), y1 = bf16_round(x[i][1]);
+                        const float y2 = bf16_round(x[i][2]), y3 = bf16_round(x[i][3]);
+                        x[i][0] = __builtin_fmaf(y0, ca, y1 * sa);
+                        x[i][1] = __builtin_fmaf(y1, ca, -(y0 * sa));
+                        x[i][2] = __builtin_fmaf(y2, cb, y3 * sb);
+                        x[i][3] = __builtin_fmaf(y3, cb, -(y2 * sb));
+                    }
+                }
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    const int h = 4 * g + i;
+                    if (h < a.h_q)
+                        *(u32x2*)(orow + (size_t)h * a.out_h + dim) =
+                            u32x2{rne_bf16_bits(x[i][0]) | (rne_bf16_bits(x[i][1]) << 16),
+                                  rne_bf16_bits(x[i][2]) | (rne_bf16_bits(x[i][3]) << 16)};
+                }
+            }
+            if (ph == 1 && HALF == 0 && n == 0) {
+#pragma unroll
+                for (int i = 0; i < 4; ++i)
+                    if (4 * g + i < a.h_q) a.lse[(size_t)t * a.lse_t + (size_t)(4 * g + i) * a.lse_h] = lse_c[i];
+            }
+        }
+        if (ph == 0) __syncthreads();
+    }
+}
+
+template <int HALF>
+__device__ __forceinline__ void run_split(const Args& a, const QOps& s_q, f32x4 (*s_x)[4][64], float* s_m,
+                                          float* s_lse, int lane, int wave, int n, int g, int t, int split, int b,
+                                          int k0, int k1, int n_iter, float c_nope, float c_rope) {
     const int32_t* idx_main_row = a.idx_main + (size_t)t * a.idx_main_t;
     const int32_t* idx_extra_row = a.idx_extra + (size_t)t * a.idx_extra_t;
     const int len_main = a.len_main[b], len_extra = a.len_extra[b];
@@ -602,6 +706,17 @@ __device__ __forceinline__ void run_split(const Args& a, const QOps& s_q, f32x4 
 
     float l_tot = l_run + __shfl_xor(l_run, 16);
     l_tot += __shfl_xor(l_tot, 32);
+    if (a.out) {
+        float inv[4];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const float lh = __shfl(l_tot, 4 * g + i);
+            inv[i] = lh > 0.f ? 1.f / lh : 0.f;
+        }
+        const float lse_n = l_tot > 0.f ? (m_run + log2f(l_tot)) * 0.6931471805599453f : INFINITY;
+        merge_store<HALF>(a, o, inv, lse_n, s_m, s_lse, lane, n, g, t, split);
+        return;
+    }
     float* po = a.po + (size_t)split * a.po_s + (size_t)t * a.po_t;
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
@@ -629,6 +744,7 @@ sparse_mla_prefill_gfx942(Args args) {
     __shared__ QOps s_q;
     __shared__ float s_c[2][16];
     __shared__ f32x4 s_x[2][4][64];  // partial scores, by tile parity, wave and lane
+    __shared__ float s_lse[16];
     const int lane = threadIdx.x & 63;
     const int wave = __builtin_amdgcn_readfirstlane(threadIdx.x >> 6);
     const int half = wave & 1;
@@ -685,8 +801,9 @@ sparse_mla_prefill_gfx942(Args args) {
     __syncthreads();
     const float c_nope = s_c[0][n], c_rope = s_c[1][n];
 
+    float* s_m = reinterpret_cast<float*>(&s_q);
     if (half == 0)
-        run_split<0>(a, s_q, s_x, lane, wave, n, g, t, split, b, k0, k1, n_iter, c_nope, c_rope);
+        run_split<0>(a, s_q, s_x, s_m, s_lse, lane, wave, n, g, t, split, b, k0, k1, n_iter, c_nope, c_rope);
     else
-        run_split<1>(a, s_q, s_x, lane, wave, n, g, t, split, b, k0, k1, n_iter, c_nope, c_rope);
+        run_split<1>(a, s_q, s_x, s_m, s_lse, lane, wave, n, g, t, split, b, k0, k1, n_iter, c_nope, c_rope);
 }

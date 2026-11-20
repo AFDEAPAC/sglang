@@ -3164,6 +3164,8 @@ class _HipArgs(ctypes.Structure):
                 "cta_splits",
             )
         ]
+        + [(n, ctypes.c_void_p) for n in ("out", "lse", "sink", "freqs", "pos")]
+        + [(n, ctypes.c_int32) for n in ("out_t", "out_h", "lse_t", "lse_h", "fr_pos", "pos_i64")]
     )
 
 
@@ -3252,14 +3254,30 @@ def _hip_dual_scope(
     cs = _hip_splits(total_tokens * head_groups, topk_main + topk_extra, device)
     splits = 2 * cs
     per_split = triton.cdiv(triton.cdiv(topk_main + topk_extra, splits), 16) * 16
-    if pooled:
+    output = torch.empty(total_tokens, h_q, DSV4_D_V, dtype=torch.bfloat16, device=device)
+    lse = torch.empty(total_tokens, h_q, dtype=torch.float32, device=device)
+    # One CTA split on the prefill kernel: it merges the two token ranges itself (no partials, no combine).
+    merge = (
+        kernel is _hip_kernel_prefill
+        and cs == 1
+        and (attn_sink is None or attn_sink.dtype == torch.float32)
+        and (
+            inv_rope is None
+            or (
+                inv_rope[0].dtype == torch.float32
+                and inv_rope[0].stride(1) == 1
+                and inv_rope[1].dtype in (torch.int32, torch.int64)
+            )
+        )
+    )
+    if merge:
+        po = plse = torch.empty(0, 0, 0, dtype=torch.float32, device=device)
+    elif pooled:
         bufs = SplitKBufferPool.get_buffers(splits, total_tokens, h_q, DSV4_D_V, device)
         po, plse = bufs["partial_output"], bufs["partial_lse"]
     else:
         po = torch.empty(splits, total_tokens, h_q, DSV4_D_V, dtype=torch.float32, device=device)
         plse = torch.empty(splits, total_tokens, h_q, dtype=torch.float32, device=device)
-    output = torch.empty(total_tokens, h_q, DSV4_D_V, dtype=torch.bfloat16, device=device)
-    lse = torch.empty(total_tokens, h_q, dtype=torch.float32, device=device)
     args = _HipArgs(
         q.data_ptr(), kv_m.data_ptr(), idx_main.data_ptr(), len_main.data_ptr(),
         kv_e.data_ptr(), idx_extra.data_ptr(), len_extra.data_ptr(), po.data_ptr(),
@@ -3269,8 +3287,19 @@ def _hip_dual_scope(
         po.stride(0), po.stride(1), po.stride(2), plse.stride(0), plse.stride(1), plse.stride(2),
         total_tokens, h_q, s_q, topk_main, topk_extra, per_split, cs,
     )
+    if merge:
+        args.out, args.lse = output.data_ptr(), lse.data_ptr()
+        args.out_t, args.out_h, args.lse_t, args.lse_h = output.stride(0), output.stride(1), lse.stride(0), lse.stride(1)
+        if attn_sink is not None:
+            attn_sink = attn_sink.contiguous()
+            args.sink = attn_sink.data_ptr()
+        if inv_rope is not None:
+            freqs_real, positions = inv_rope[0], inv_rope[1].reshape(-1)
+            args.freqs, args.pos, args.fr_pos = freqs_real.data_ptr(), positions.data_ptr(), freqs_real.stride(0)
+            args.pos_i64 = int(positions.dtype == torch.int64)
     kernel.launch(total_tokens * head_groups * cs, args, torch.cuda.current_stream().cuda_stream, 256, 0)
-    _launch_par_combine(po, plse, attn_sink, output, lse, splits, h_q, inv_rope)
+    if not merge:
+        _launch_par_combine(po, plse, attn_sink, output, lse, splits, h_q, inv_rope)
     return output, lse
 
 
