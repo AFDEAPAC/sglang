@@ -126,7 +126,13 @@ SGL_DEVICE uint8_t cvt_float_to_fp8_e4m3(float val) {
       mant3 = 0;
       exp8++;
     }
-    if (exp8 >= kMaxExp) return sign | kSaturate;
+#if HIP_FP8_TYPE_FNUZ
+    // E4M3FNUZ uses the whole top exponent (0_1111_xxx = 128..240).
+    if (exp8 > kMaxExp) return sign | kSaturate;
+#else
+    // E4M3FN: only 0_1111_111 is NaN; 0_1111_000..110 = 256..448 are finite.
+    if (exp8 > kMaxExp || (exp8 == kMaxExp && mant3 == 7)) return sign | kSaturate;
+#endif
   }
   return sign | (static_cast<uint8_t>(exp8) << 3) | mant3;
 }
