@@ -2808,7 +2808,14 @@ def _post_process_topk_ids(
                 (rows >= num_token_non_padded)[:, None], -1
             )
 
-    if _is_hip and not _skip_hip_pad_mask and not _fold_pad_weights_into_append:
+    # MegaMoE reads a routing weight only for an in-range expert id, and
+    # _run_mega_routed sets padded rows' ids to num_experts.
+    if (
+        _is_hip
+        and not _skip_hip_pad_mask
+        and not _fold_pad_weights_into_append
+        and not get_moe_a2a_backend().is_megamoe()
+    ):
         # Shared-expert append/remap can introduce non-zero weights after the
         # initial HIP padding mask above. Ensure padded tokens leave this helper
         # with all expert weights zeroed.
