@@ -32,6 +32,7 @@ if _HAS_TRITON:
         BLOCK: tl.constexpr,
         NUM_BINS: tl.constexpr,
         TOP_K: tl.constexpr,
+        RECORD: tl.constexpr,
     ):
         offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
         mask = offs < numel
@@ -49,28 +50,31 @@ if _HAS_TRITON:
         output_id = tl.where(valid_logical, physical_id, logical_id)
         tl.store(out_ids_ptr + offs, output_id, mask=mask)
 
-        valid_row = mask
-        if HAS_VALID_COUNT:
-            num_valid_tokens = tl.load(num_valid_tokens_ptr).to(tl.int64)
-            valid_row &= (offs // TOP_K) < num_valid_tokens
-        in_range = (
-            valid_row
-            & valid_logical
-            & (physical_id >= 0)
-            & (physical_id < num_physical)
-        )
-        bin_idx = tl.where(in_range, physical_id, num_physical).to(tl.int32)
-        histogram = tl.histogram(bin_idx, NUM_BINS)
-        bins = tl.arange(0, NUM_BINS)
-        tl.atomic_add(load_ptr + bins, histogram, mask=bins < num_physical)
+        if RECORD:
+            valid_row = mask
+            if HAS_VALID_COUNT:
+                num_valid_tokens = tl.load(num_valid_tokens_ptr).to(tl.int64)
+                valid_row &= (offs // TOP_K) < num_valid_tokens
+            in_range = (
+                valid_row
+                & valid_logical
+                & (physical_id >= 0)
+                & (physical_id < num_physical)
+            )
+            bin_idx = tl.where(in_range, physical_id, num_physical).to(tl.int32)
+            histogram = tl.histogram(bin_idx, NUM_BINS)
+            bins = tl.arange(0, NUM_BINS)
+            tl.atomic_add(load_ptr + bins, histogram, mask=bins < num_physical)
 
 
 def eplb_map_and_record_fused(
     topk_ids: torch.Tensor,
     dispatch_info: Optional[ExpertLocationDispatchInfo],
-    load_buffer: torch.Tensor,
+    load_buffer: Optional[torch.Tensor],
     num_token_non_padded: Optional[torch.Tensor],
 ) -> Optional[torch.Tensor]:
+    """load_buffer=None maps without recording (one launch for the static
+    logical->physical gather and its dtype cast)."""
     if not _HAS_TRITON or not topk_ids.is_cuda or topk_ids.numel() == 0:
         return None
     if dispatch_info is not None and dispatch_info.ep_dispatch_algorithm != "static":
@@ -83,7 +87,10 @@ def eplb_map_and_record_fused(
     )
     if dispatch_info is not None and dispatch is None:
         return None
-    num_physical = int(load_buffer.numel())
+    record = load_buffer is not None
+    if not record and dispatch is None:
+        return None
+    num_physical = int(load_buffer.numel()) if record else 0
     num_logical = int(dispatch.numel()) if dispatch is not None else num_physical
     top_k = int(topk_ids.shape[-1])
     numel = topk_ids.numel()
@@ -97,7 +104,7 @@ def eplb_map_and_record_fused(
         topk_ids.contiguous(),
         dispatch_ptr,
         output,
-        load_buffer,
+        load_buffer if record else topk_ids,
         valid_count_ptr,
         num_logical,
         num_physical,
@@ -107,6 +114,7 @@ def eplb_map_and_record_fused(
         BLOCK=256,
         NUM_BINS=1 << num_physical.bit_length(),
         TOP_K=top_k,
+        RECORD=record,
     )
     return output
 

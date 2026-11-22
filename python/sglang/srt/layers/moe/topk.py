@@ -2659,6 +2659,7 @@ def _post_process_topk_ids(
         )
         if not _fold_pad_into_append:
             _mask_topk_ids_padded_region(topk_ids, num_token_non_padded, fill_value=0)
+        remapped = False
         if (
             envs.SGLANG_AITER_MEGA_EPLB_PREFILL_ONLY.get()
             and envs.SGLANG_AITER_MEGA_EPLB_FUSED_MAP_RECORD.get()
@@ -2671,7 +2672,7 @@ def _post_process_topk_ids(
             if get_moe_a2a_backend().is_megamoe():
                 recorder = get_global_expert_distribution_recorder()
                 load_buffer = recorder.get_current_pass_count_buffer(layer_id)
-                if load_buffer is not None:
+                if load_buffer is not None or eplb_remap_enabled:
                     fused_topk_ids = eplb_map_and_record_fused(
                         topk_ids,
                         expert_location_dispatch_info,
@@ -2680,11 +2681,12 @@ def _post_process_topk_ids(
                     )
                     if fused_topk_ids is not None:
                         topk_ids = fused_topk_ids
-                        recorder_was_fused = True
+                        recorder_was_fused = load_buffer is not None
+                        remapped = True
         # The logical->physical remap is only meaningful when a real
         # expert-location mapping exists. With a trivial placement and EPLB off
         # the map is identity so the remap can be skipped safely.
-        if not recorder_was_fused and eplb_remap_enabled:
+        if not remapped and eplb_remap_enabled:
             topk_ids = topk_ids_logical_to_physical(
                 topk_ids, expert_location_dispatch_info
             )
