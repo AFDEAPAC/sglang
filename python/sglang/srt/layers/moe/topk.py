@@ -2657,7 +2657,10 @@ def _post_process_topk_ids(
         _fold_pad_weights_into_append = (
             _fold_pad_into_append and not use_per_rank_shared_slots
         )
-        if not _fold_pad_into_append:
+        # MegaMoE sets padded rows' ids to num_experts in _run_mega_routed, and the
+        # fused map passes out-of-range ids through; only the gather below indexes.
+        _megamoe = get_moe_a2a_backend().is_megamoe()
+        if not _fold_pad_into_append and not _megamoe:
             _mask_topk_ids_padded_region(topk_ids, num_token_non_padded, fill_value=0)
         remapped = False
         if (
@@ -2687,6 +2690,10 @@ def _post_process_topk_ids(
         # expert-location mapping exists. With a trivial placement and EPLB off
         # the map is identity so the remap can be skipped safely.
         if not remapped and eplb_remap_enabled:
+            if _megamoe and not _fold_pad_into_append:
+                _mask_topk_ids_padded_region(
+                    topk_ids, num_token_non_padded, fill_value=0
+                )
             topk_ids = topk_ids_logical_to_physical(
                 topk_ids, expert_location_dispatch_info
             )
