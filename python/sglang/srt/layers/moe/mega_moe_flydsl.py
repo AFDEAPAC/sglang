@@ -309,8 +309,16 @@ def _run_mega_routed(
     topk = moe.config.num_experts_per_tok + moe.num_fused_shared_experts
     experts = moe.experts.num_experts
     if num_tokens:
-        router_logits = moe.gate(hidden_states, forward_batch=forward_batch)
+        from sglang.srt.models.deepseek_common.amd.deepseek_v2_hip_moe import (
+            forward_gate,
+        )
+
+        router_logits, router_logits_partials = forward_gate(
+            moe, hidden_states, None, fused_gate=True
+        )
         topk_kwargs = {"input_ids": input_ids_global} if moe.is_hash else {}
+        if router_logits_partials is not None:
+            topk_kwargs["router_logits_partials"] = router_logits_partials
         topk_output = moe.topk(
             hidden_states,
             router_logits,

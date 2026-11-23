@@ -2884,7 +2884,12 @@ def select_experts(
         and custom_routing_function is None
         and not use_grouped_topk
         and not torch_native
-        and expert_location_dispatch_info is None
+        # the gate returns logical ids that the remap below maps; only "fake"
+        # dispatch rewrites router_logits (transform_select_experts_inputs)
+        and (
+            expert_location_dispatch_info is None
+            or expert_location_dispatch_info.ep_dispatch_algorithm != "fake"
+        )
         and (
             num_shared_topk_slots == 0
             or has_per_rank_fused_shared_slots(num_shared_topk_slots)
