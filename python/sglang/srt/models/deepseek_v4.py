@@ -548,6 +548,20 @@ def _apply_wo_a_bf16_matmul(
             return wo_a_bf16_gemv(o, wo_a)
         if _GFX942_WO_A_TRITON_VERIFY and is_target_verify and 2 <= o.shape[0] <= 8:
             return wo_a_bf16_small_batch(o, wo_a)
+    # DP attention keeps all 8 groups on a rank; at that group count only the one-token GEMV beats hipBLASLt
+    if (
+        _GFX942_WO_A_TRITON
+        and fast_path
+        and is_decode
+        and o.shape == (1, 8, 4096)
+        and wo_a.shape == (8, 1024, 4096)
+        and o.dtype == wo_a.dtype == torch.bfloat16
+        and o.is_contiguous()
+        and wo_a.is_contiguous()
+        and not fuse_mxfp8_quant
+        and _hip.wo_a_split_k_allowed()
+    ):
+        return wo_a_bf16_gemv(o, wo_a)
     if gfx942_shape and _GFX942_WO_A_PREFILL_BMM and is_prefill and 4096 <= o.shape[0] <= 65536:
         result = torch.empty(
             (o.shape[0], wo_a.shape[0], wo_a.shape[1]), dtype=o.dtype, device=o.device
