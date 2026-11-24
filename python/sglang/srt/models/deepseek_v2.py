@@ -534,13 +534,7 @@ class MoEGate(nn.Module):
             correction_bias_dtype = torch.float32
             # GLM-5.2's bias sits at an offset where its spread is only a few bf16 ULPs
             # wide, so bf16 collapses it and reorders top-k routing. HF stores it fp32.
-            # DeepSeek-V4's bias sits near +10 where a bf16 ULP (0.0625) exceeds the
-            # sqrtsoftplus score gaps, so bf16 reorders top-k routing as well.
-            if (
-                quant_config is not None
-                and not is_glm_moe_dsa(config)
-                and not str(getattr(config, "model_type", "")).startswith("deepseek_v4")
-            ):
+            if quant_config is not None and not is_glm_moe_dsa(config):
                 if _use_aiter and quant_config.get_name() in (
                     "fp8",
                     "compressed_tensors",
